@@ -29,6 +29,7 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 	e.packetIn.Add(1)
 	utils.Debugf("[TUNL] Inject inbound: %s", network.ParsePacketInfo(data))
 
+	fmt.Printf("<- %d bytes - %s\n", len(data), network.ParsePacketInfo(data))
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(append([]byte{}, data...)),
 	})
