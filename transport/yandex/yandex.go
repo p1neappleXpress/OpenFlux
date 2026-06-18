@@ -38,44 +38,21 @@ type DocSession struct {
 	Conn       *websocket.Conn
 	WriteQueue chan []byte
 	UserID     string
-	readMu     sync.Mutex
 	writeMu    sync.Mutex
-	closed     atomic.Int32
 }
 
-// safeWrite writes a message to the WebSocket connection in a thread-safe manner
+// safeWrite protects all writes to the websocket connection
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
-	if s.closed.Load() == 1 {
-		return fmt.Errorf("connection closed")
-	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed.Load() == 1 {
-		return fmt.Errorf("connection closed")
-	}
 	return s.Conn.WriteMessage(messageType, data)
-}
-
-// safeRead reads a message from the WebSocket connection in a thread-safe manner
-func (s *DocSession) safeRead() (int, []byte, error) {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-	return s.Conn.ReadMessage()
-}
-
-// close safely closes the WebSocket connection
-func (s *DocSession) close() {
-	s.closed.Store(1)
-	s.writeMu.Lock()
-	s.Conn.Close()
-	s.writeMu.Unlock()
 }
 
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url     string
-	session *DocSession
+	url      string
+	session  *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -97,7 +74,7 @@ func (t *YandexDocsTransport) Start() error {
 
 	t.baseUserID = randUserID()
 	go t.keepAliveLoop()
-	go t.connectLoop()
+	t.connectToDoc(0)
 
 	return nil
 }
@@ -124,13 +101,6 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	}
 }
 
-func (t *YandexDocsTransport) connectLoop() {
-	for t.IsRunning() {
-		t.connectToDoc(0)
-		time.Sleep(1 * time.Second)
-	}
-}
-
 func (t *YandexDocsTransport) connectToDoc(attempt int) {
 	if !t.IsRunning() {
 		return
@@ -142,11 +112,6 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		t.Mu.Lock()
 		existingSession := t.session
 		t.Mu.Unlock()
-
-		// Close old session if exists
-		if existingSession != nil {
-			existingSession.close()
-		}
 
 		var userID string
 		if existingSession != nil {
@@ -179,10 +144,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
-			// Drain old queue
-			for len(existingSession.WriteQueue) > 0 {
-				<-existingSession.WriteQueue
-			}
+			writeQueue = existingSession.WriteQueue
 		}
 
 		session := &DocSession{
@@ -197,16 +159,13 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		t.SetConnected(true)
 		t.Mu.Unlock()
 
-		go t.writerLoop()
-
-		// Authenticate (write operations are now thread-safe)
-		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		if err := session.safeWrite(websocket.TextMessage, []byte(auth1)); err != nil {
-			utils.Debugf("[YDOCS] Auth write failed: %v", err)
-			t.SetConnected(false)
-			t.scheduleReconnect(attempt)
-			return
+		if existingSession == nil {
+			go t.writerLoop()
 		}
+
+		// Auth - use safeWrite
+		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
+		session.safeWrite(websocket.TextMessage, []byte(auth1))
 
 		authData := map[string]interface{}{
 			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
@@ -215,25 +174,17 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
 		}
 		messagePart, _ := json.Marshal([]interface{}{"message", authData})
-		authMsg := fmt.Sprintf("42%s", string(messagePart))
-		if err := session.safeWrite(websocket.TextMessage, []byte(authMsg)); err != nil {
-			utils.Debugf("[YDOCS] Auth data write failed: %v", err)
-			t.SetConnected(false)
-			t.scheduleReconnect(attempt)
-			return
-		}
+		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
-		// Read loop
 		for t.IsRunning() {
-			_, message, err := session.safeRead()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				t.SetConnected(false)
-				session.close()
 				t.scheduleReconnect(attempt)
 				return
 			}
-			t.handleMessage(message)
+			t.handleMessage(session, message)
 		}
 	}()
 }
@@ -244,7 +195,7 @@ func (t *YandexDocsTransport) writerLoop() {
 		session := t.session
 		t.Mu.Unlock()
 
-		if session == nil || session.closed.Load() == 1 {
+		if session == nil || session.Conn == nil {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -274,7 +225,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 		session := t.session
 		t.Mu.Unlock()
 
-		if session != nil && session.closed.Load() == 0 {
+		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
 				t.SetConnected(false)
@@ -283,18 +234,16 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 	}
 }
 
-func (t *YandexDocsTransport) handleMessage(data []byte) {
+func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
 	if strings.Contains(text, "---KA---") {
 		return
 	}
 
+	// Socket.IO ping - respond with pong (use safeWrite)
 	if text == "2" {
-		t.Mu.Lock()
-		session := t.session
-		t.Mu.Unlock()
-		if session != nil && session.closed.Load() == 0 {
+		if session != nil && session.Conn != nil {
 			session.safeWrite(websocket.TextMessage, []byte("3"))
 		}
 		return
@@ -385,34 +334,17 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	}
 
 	var config map[string]interface{}
-	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
-		return YandexDocsInfo{}, fmt.Errorf("config parse: %w", err)
-	}
-
-	officeAction, ok := config["officeActionData"].(map[string]interface{})
-	if !ok {
-		return YandexDocsInfo{}, fmt.Errorf("officeActionData not found or invalid")
-	}
+	json.Unmarshal([]byte(matches[1]), &config)
+	officeAction := config["officeActionData"].(map[string]interface{})
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
 	if !ok || editorConfigRaw == nil {
-		utils.Debugf("[YDOCS] editor_config is nil/missing, will reconnect")
-		return YandexDocsInfo{}, fmt.Errorf("editor_config nil")
+		return YandexDocsInfo{}, fmt.Errorf("editor_config nil - will reconnect")
 	}
 
-	balancerURL, _ := officeAction["balancer_url"].(string)
+	balancerURL := officeAction["balancer_url"].(string)
 	host := strings.TrimPrefix(balancerURL, "https://")
-
-	document, ok := editorConfigRaw["document"].(map[string]interface{})
-	if !ok || document == nil {
-		return YandexDocsInfo{}, fmt.Errorf("document config missing")
-	}
-
-	token, _ := editorConfigRaw["token"].(string)
-	docID, _ := document["key"].(string)
-	fileType, _ := document["fileType"].(string)
-	docURL, _ := document["url"].(string)
-	title, _ := document["title"].(string)
+	document := editorConfigRaw["document"].(map[string]interface{})
 
 	perms, _ := document["permissions"].(map[string]interface{})
 	if perms == nil {
@@ -421,19 +353,19 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	return YandexDocsInfo{
 		CookieStr:   strings.Join(cookies, "; "),
-		Token:       token,
-		DocID:       docID,
+		Token:       editorConfigRaw["token"].(string),
+		DocID:       document["key"].(string),
 		Origin:      balancerURL,
 		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docID),
+		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, document["key"].(string)),
 		Permissions: perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
-			"id":     docID,
+			"id":     document["key"].(string),
 			"userid": userID,
-			"format": fileType,
-			"url":    docURL,
-			"title":  title,
+			"format": document["fileType"],
+			"url":    document["url"],
+			"title":  document["title"],
 			"lcid":   25,
 		},
 	}, nil
