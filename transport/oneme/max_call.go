@@ -91,15 +91,16 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 	credential, _ := turn["credential"].(string)
 	logInfo("[%s] STUN: %v  TURN: %v", h.tag, stunURLs, turnURLs)
 
-	config := webrtc.Configuration{}
-	if len(stunURLs) > 0 {
-		config.ICEServers = append(config.ICEServers, webrtc.ICEServer{URLs: stunURLs})
-	}
-	if len(turnURLs) > 0 {
-		config.ICEServers = append(config.ICEServers, webrtc.ICEServer{
-			URLs: turnURLs, Username: username, Credential: credential,
-			CredentialType: webrtc.ICECredentialTypePassword,
-		})
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs:           turnURLs,
+				Username:       username,
+				Credential:     credential,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			},
+		},
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 	}
 
 	pc, err := webrtc.NewPeerConnection(config)

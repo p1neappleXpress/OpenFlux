@@ -40,6 +40,15 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
+        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
+            &tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
+            utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
+        }
+        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
+            &tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
+            utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
+        }
+
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
 		utils.Debugf("[TUNNEL] Outgoing via transport: %d bytes", len(data))

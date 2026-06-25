@@ -299,8 +299,7 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	delay := time.Duration(float64(t.GetConfig().ReconnectDelay) *
 		math.Pow(t.GetConfig().ReconnectMultiplier, float64(attempt)))
 
-	utils.Debugf("[YDOCS] Reconnecting in %v...", delay)
-	time.Sleep(delay)
+        fmt.Println("[YDOCS] Reconnecting in %v...", delay)
 	t.connectToDoc(attempt + 1)
 }
 
