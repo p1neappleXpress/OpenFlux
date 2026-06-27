@@ -1,6 +1,7 @@
 package oneme
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -10,11 +11,19 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
+var (
+	useICEInjection = true
+)
+
 func (h *CallHandler) SetOnConnected(cb func()) { h.onConnected = cb }
 
 func (h *CallHandler) Send(data []byte) {
-	if h.dc != nil {
-		h.dc.Send(data)
+	if useICEInjection {
+		h.injectICE(data)
+	} else {
+		if h.dc != nil {
+			h.dc.Send(data)
+		}
 	}
 }
 
@@ -31,6 +40,7 @@ func (h *CallHandler) readLoop() {
 		if strings.Contains(text, "accepted-call") {
 			fmt.Println("call accepted")
 			h.callAccepted = true
+			continue
 		}
 
 		if text == "ping" {
@@ -181,7 +191,28 @@ func (h *CallHandler) sendSDP(sdp string, sdpType string) {
 	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
+func (h *CallHandler) injectICE(payload []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	type ice struct {
+		Candidate string `json:"candidate"`
+	}
+	structPayload := ice{Candidate: base64.StdEncoding.EncodeToString(payload)}
+	fmt.Println(structPayload)
+	escaped, _ := json.Marshal(structPayload.Candidate)
+	fmt.Println(escaped)
+	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"candidate":{"candidate":%s}},"participantType":"USER"}`,
+		h.seq, h.localID, string(escaped))
+	h.seq++
+	fmt.Println(msg)
+	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+}
+
 func (h *CallHandler) sendICE(candidateJSON string) {
+	if useICEInjection {
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var ice struct {
@@ -192,6 +223,9 @@ func (h *CallHandler) sendICE(candidateJSON string) {
 	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"candidate":{"candidate":%s}},"participantType":"USER"}`,
 		h.seq, h.localID, string(escaped))
 	h.seq++
+	fmt.Println("ICEe->" + string(escaped))
+	fmt.Println("ICEo->" + candidateJSON)
+	fmt.Println("ICE->" + msg)
 	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
@@ -302,6 +336,29 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			}
 		}
 
+		if h.localID == 0 {
+			if conv, ok := data["conversation"].(map[string]interface{}); ok {
+				if parts, ok := conv["participants"].([]interface{}); ok {
+					for _, p := range parts {
+						part := p.(map[string]interface{})
+						roles, _ := part["roles"].([]interface{})
+						isCreator := false
+						for _, r := range roles {
+							if r.(string) == "CREATOR" {
+								isCreator = true
+							}
+						}
+						if !isCreator {
+							h.localID = int64(part["id"].(float64))
+							logInfo("[%s] Local ID: %d", h.tag, h.localID)
+						}
+					}
+				}
+			}
+		}
+
+
+
 		if cp, ok := data["conversationParams"].(map[string]interface{}); ok {
 			logInfo("[%s] conversationParams - creating offer", h.tag)
 			for {
@@ -334,7 +391,14 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			return
 		}
 		if c, ok := d["candidate"].(map[string]interface{}); ok {
-			h.bufferOrAddICE(c)
+			if useICEInjection {
+				fmt.Println(c)
+				candidateStr, _ := c["candidate"].(string)
+				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
+				h.dcInbound(decode)
+			} else {
+				h.bufferOrAddICE(c)
+			}
 		}
 	}
 
@@ -402,7 +466,14 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			return
 		}
 		if c, ok := d["candidate"].(map[string]interface{}); ok {
-			h.bufferOrAddICE(c)
+
+			if useICEInjection {
+				candidateStr, _ := c["candidate"].(string)
+				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
+				h.dcInbound(decode)
+			} else {
+				h.bufferOrAddICE(c)
+			}
 		}
 	}
 
