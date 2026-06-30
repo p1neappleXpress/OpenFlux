@@ -27,8 +27,9 @@ func (h *CallHandler) Send(data []byte) {
 	}
 }
 
-func (h *CallHandler) readLoop() {
+func (h *CallHandler) readLoop(callback func()) {
 	logInfo("[%s] Signaling connected", h.tag)
+	defer callback()
 	for {
 		_, message, err := h.conn.ReadMessage()
 		if err != nil {
@@ -304,7 +305,6 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h := &CallHandler{tag: "CALLER"}
 	h.seq = 1
-	// h.localID = 910309237708
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -329,29 +329,6 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 				}
 			}
 		}
-
-		if h.localID == 0 {
-			if conv, ok := data["conversation"].(map[string]interface{}); ok {
-				if parts, ok := conv["participants"].([]interface{}); ok {
-					for _, p := range parts {
-						part := p.(map[string]interface{})
-						roles, _ := part["roles"].([]interface{})
-						isCreator := false
-						for _, r := range roles {
-							if r.(string) == "CREATOR" {
-								isCreator = true
-							}
-						}
-						if !isCreator {
-							h.localID = int64(part["id"].(float64))
-							logInfo("[%s] Local ID: %d", h.tag, h.localID)
-						}
-					}
-				}
-			}
-		}
-
-
 
 		if cp, ok := data["conversationParams"].(map[string]interface{}); ok {
 			logInfo("[%s] conversationParams - creating offer", h.tag)
@@ -411,15 +388,20 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
 	conn, _, _ := websocket.DefaultDialer.Dial(endpoint, nil)
 	h.conn = conn
-	go h.readLoop()
+	go h.readLoop(func() {
+		if !useICEInjection {
+			return
+		}
+
+		fmt.Println("Signalling is dead, calling again bc of injectICE turned on")
+		startOutgoingCall(client, calleeID)
+	})
 	return h
 }
 
-// --- Receiver ---
 func startIncomingListener(client *MaxClient) *CallHandler {
 	h := &CallHandler{tag: "RECEIVER"}
 	h.seq = 1
-	// h.localID = 910305521005
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -491,7 +473,14 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 				return
 			}
 			h.conn = conn
-			go h.readLoop()
+			go h.readLoop(func() {
+				if !useICEInjection {
+					return
+				}
+
+				fmt.Println("Signalling is dead. " +
+					"Gonna kill myself now")
+			})
 			// accept-call will be sent after reconnection (in readLoop) or after timeout
 			go func() {
 				time.Sleep(1 * time.Second)
