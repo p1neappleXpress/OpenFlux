@@ -1,4 +1,4 @@
 *.exe
 .DS_Store
 output*
-build*
+build/

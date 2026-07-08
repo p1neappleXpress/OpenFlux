@@ -35,6 +35,19 @@ go mod tidy
 go build -o universal-bypass-tool .
 ```
 
+## Build for Android
+```bash
+export ANDROID_NDK_HOME=<YOUR ANDROID NDK PATH>
+./build_android.sh
+```
+
+## Build for iOS
+```bash
+XCODE_PATH="/Applications/Xcode.app"  # or Xcode-beta path
+SDK_PATH="$XCODE_PATH/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
+./build_ios.sh
+```
+
 ## Usage
 
 Exit node (needs root):

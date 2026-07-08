@@ -78,22 +78,10 @@ func (t *YandexDocsTransport) Start() error {
 	return nil
 }
 
-func IsSYN(data []byte) bool {
-    if len(data) < 34 {
-        return false
-    }
-    flags := data[33]
-    return flags&0x02 != 0 && flags&0x10 == 0  // SYN set, ACK not set
-}
-
 func (t *YandexDocsTransport) Send(data []byte) error {
 	if !t.IsConnected() {
 		return fmt.Errorf("transport not connected")
 	}
-
-        if len(data) <= 52 && !isSYN(data) {
-            return nil
-        }
 
 	t.Mu.RLock()
 	session := t.session
