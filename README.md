@@ -1,4 +1,4 @@
-# Universal Bypass Tool
+# OpenFlux - Universal Bypass Tool
 
 Network stack research tool. TCP tunnel with pluggable transports.
 
