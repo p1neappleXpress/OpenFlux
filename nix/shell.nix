@@ -6,5 +6,10 @@
   nixfmt,
 }:
 mkShell {
-  packages = [ go_1_26 gopls delve nixfmt ];
+  packages = [
+    go_1_26
+    gopls
+    delve
+    nixfmt
+  ];
 }

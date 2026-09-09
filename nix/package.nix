@@ -9,7 +9,10 @@
   version = "0.1.0";
   src = self;
   vendorHash = "sha256-MITicQOVM8O22ZS2iO5Lx9pIqtXNTQ2MBzan4Q1PjDI=";
-  ldflags = [ "-s" "-w" ];
+  ldflags = [
+    "-s"
+    "-w"
+  ];
 
   meta.mainProgram = "universal-bypass-tool";
 }
