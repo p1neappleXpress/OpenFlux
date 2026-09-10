@@ -305,10 +305,18 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
 	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return nil },
-		Timeout:       30 * time.Second,
+		// Cap redirects so an auth/login redirect loop fails fast instead of
+		// hanging until the timeout (a private doc redirects to passport).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects (login required? doc not public?)")
+			}
+			return nil
+		},
+		Timeout: 15 * time.Second,
 	}
 
+	utils.Debugf("[YDOCS] fetchDocInfo GET %s", url)
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
@@ -319,6 +327,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	htmlBytes, _ := io.ReadAll(resp.Body)
 	html := string(htmlBytes)
+	utils.Debugf("[YDOCS] response status=%d finalURL=%s body=%dB", resp.StatusCode, resp.Request.URL.String(), len(html))
 
 	var cookies []string
 	for _, c := range resp.Cookies() {
@@ -328,7 +337,12 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 	matches := re.FindStringSubmatch(html)
 	if len(matches) < 2 {
-		return YandexDocsInfo{}, fmt.Errorf("config not found")
+		// Help diagnose: is this a login page, a new-editor page, etc.?
+		hint := "no client-config script"
+		if strings.Contains(html, "passport") || strings.Contains(strings.ToLower(html), "login") {
+			hint = "looks like a login page (doc not public?)"
+		}
+		return YandexDocsInfo{}, fmt.Errorf("config not found: %s (status %d, final %s)", hint, resp.StatusCode, resp.Request.URL.String())
 	}
 
 	var config map[string]interface{}
