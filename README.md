@@ -26,19 +26,25 @@ Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to 
 ## Structure
 
 ```
-universal-bypass-tool/
-├── main.go
+OpenFlux/
+├── main.go                     # CLI entry (client / exit-node)
+├── export_ios.go               # cgo bridge for the iOS static library (build tag: ios)
 ├── transport/
-│   ├── transport.go      # Transport interface
-│   └── yandex/           # Yandex Docs backend
-│   └── oneme/            # MAX Messenger backend
+│   ├── transport.go            # Transport interface
+│   ├── compressor.go           # Compression wrapper
+│   ├── yandex/                 # Yandex Docs backend
+│   └── oneme/                  # MAX Messenger backend
 ├── tunnel/
-│   ├── tunnel.go         # TCP tunnel core
-│   ├── endpoint.go       # Virtual NIC
-│   └── rawsocket.go      # Raw socket (exit node)
-├── socks5/               # SOCKS5 server
-├── network/              # Checksums, packet parsing
-└── utils/                # Debug logging
+│   ├── tunnel.go               # TCP tunnel core
+│   ├── endpoint.go             # Virtual NIC
+│   └── rawsocket_{linux,darwin,windows}.go  # Raw socket (exit node), per-OS
+├── socks5/                     # SOCKS5 server
+├── network/                    # Checksums, packet parsing
+├── utils/                      # Logging
+├── ios-app/                    # SwiftUI iOS client (XcodeGen), links liboflux.a
+├── build_ios.sh                # Build the iOS static library (liboflux.a)
+├── build_ios_app.sh            # Build + archive + export the iOS app IPA
+└── build_android.sh            # Build the Android client binary
 ```
 
 ## Build (desktop client / exit-node binary)
