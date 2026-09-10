@@ -10,8 +10,8 @@ mkdir -p "$OUTPUT_DIR"
 export GOARCH=arm64
 export GOOS=android
 export CGO_ENABLED=1
-export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang"
-export CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang++"
+export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+export CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang++"
 export CGO_CFLAGS="-march=armv8-a -O2"
 export CGO_CXXFLAGS="-march=armv8-a -O2"
 export CGO_LDFLAGS="-Wl,-rpath,/system/lib64 -Wl,-rpath,/vendor/lib64"
