@@ -9,11 +9,12 @@ import "C"
 
 import (
 	"fmt"
+	"net"
 	"strconv"
-	"unsafe"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
@@ -69,6 +70,16 @@ func init() {
 	utils.EnableDebug()
 }
 
+// Return codes for OpenFluxStartClient.
+const (
+	startOK             = 0
+	startAlreadyRunning = 1
+	startBadTransport   = 2
+	startTransportError = 3
+	startAddrInUse      = 4 // SOCKS5 port could not be bound (e.g. already in use)
+	startPanic          = 5
+)
+
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
 //
 // transportType: "yandex" or "oneme".
@@ -76,22 +87,39 @@ func init() {
 // socksAddr:     e.g. "127.0.0.1:1080".
 // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
 //
-// Returns 0 on success, non-zero on error (details go to the log).
+// Returns 0 on success, non-zero on error (see start* codes; details go to the log).
 //
 //export OpenFluxStartClient
-func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char) C.int {
+func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char) (rc C.int) {
 	tt := C.GoString(transportType)
 	docURL := C.GoString(url)
 	addr := C.GoString(socksAddr)
 	mToken := C.GoString(maxToken)
 	mUid := C.GoString(maxUid)
 
+	// Never let a panic unwind into the C/Swift caller and crash the app.
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Debugf("[BRIDGE] Recovered from panic in start: %v", r)
+			rc = C.int(startPanic)
+		}
+	}()
+
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	if running {
 		utils.Debugf("[BRIDGE] Start ignored: already running")
-		return C.int(1)
+		return C.int(startAlreadyRunning)
 	}
+
+	// Bind the SOCKS5 port up front so "address already in use" is reported
+	// cleanly to the UI instead of failing later in a background goroutine.
+	probe, err := net.Listen("tcp", addr)
+	if err != nil {
+		utils.Debugf("[BRIDGE] Cannot bind %s: %v", addr, err)
+		return C.int(startAddrInUse)
+	}
+	probe.Close()
 
 	config := transport.DefaultConfig()
 	var t transport.Transport
@@ -103,29 +131,39 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
-		return C.int(2)
+		return C.int(startBadTransport)
 	}
 
 	if err := t.Start(); err != nil {
 		utils.Debugf("[BRIDGE] Failed to start transport: %v", err)
-		return C.int(3)
+		return C.int(startTransportError)
 	}
 
 	tun := tunnel.NewTCPTunnel(t, false)
 	srv := socks5.NewSOCKS5Server(addr, tun)
+	if err := srv.Bind(); err != nil {
+		utils.Debugf("[BRIDGE] Cannot bind %s: %v", addr, err)
+		t.Stop()
+		return C.int(startAddrInUse)
+	}
 
 	trans = t
 	socks = srv
 	running = true
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				utils.Debugf("[BRIDGE] Recovered from panic in SOCKS5 loop: %v", r)
+			}
+		}()
 		utils.Debugf("[BRIDGE] Client running (SOCKS5 on %s, transport %s)", addr, tt)
 		if err := srv.Start(); err != nil {
 			utils.Debugf("[BRIDGE] SOCKS5 server stopped: %v", err)
 		}
 	}()
 
-	return C.int(0)
+	return C.int(startOK)
 }
 
 // OpenFluxStop stops the running client (transport + SOCKS5 listener).

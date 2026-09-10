@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -83,8 +82,14 @@ func (h *CallHandler) signalReconnect() {
 		default:
 		}
 	} else {
-		logError("[%s] Receiver connection died, exiting", h.tag)
-		os.Exit(1)
+		// Never kill the host process (this code runs inside the iOS/Android
+		// app as a library); just signal the reconnect channel and let the
+		// transport's reconnect logic handle it.
+		logError("[%s] Receiver connection died, signaling reconnect", h.tag)
+		select {
+		case h.reconnectCh <- struct{}{}:
+		default:
+		}
 	}
 }
 

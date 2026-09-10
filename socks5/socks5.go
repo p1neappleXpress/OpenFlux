@@ -26,19 +26,33 @@ func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
 	return &SOCKS5Server{listenAddr: addr, dialer: dialer}
 }
 
-func (s *SOCKS5Server) Start() error {
+// Bind reserves the listen address so callers can detect "address already in
+// use" synchronously, before serving. Safe to call once; Start binds lazily if
+// it wasn't called.
+func (s *SOCKS5Server) Bind() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return net.ErrClosed
+	}
+	if s.listener != nil {
+		return nil
+	}
 	listener, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return err
 	}
+	s.listener = listener
+	return nil
+}
+
+func (s *SOCKS5Server) Start() error {
+	if err := s.Bind(); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		listener.Close()
-		return net.ErrClosed
-	}
-	s.listener = listener
+	listener := s.listener
 	s.mu.Unlock()
 	defer listener.Close()
 
