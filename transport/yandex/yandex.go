@@ -71,7 +71,7 @@ func (t *YandexDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
-	go t.keepAliveLoop()
+	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
 	t.connectToDoc(0)
 
 	return nil
@@ -107,6 +107,11 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 	utils.Debugf("[YDOCS] connectToDoc attempt ...")
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				utils.Debugf("[PANIC] recovered in yandex.connect: %v", r)
+			}
+		}()
 		t.Mu.Lock()
 		existingSession := t.session
 		t.Mu.Unlock()
@@ -158,7 +163,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		t.Mu.Unlock()
 
 		if existingSession == nil {
-			go t.writerLoop()
+			utils.SafeGo("yandex.writer", t.writerLoop)
 		}
 
 		// Auth - use safeWrite

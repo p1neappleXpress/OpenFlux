@@ -70,7 +70,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		tunnelEP.InjectInbound(data)
 	})
 
-	go t.printStats()
+	utils.SafeGo("tunnel.printStats", t.printStats)
 	return t
 }
 
