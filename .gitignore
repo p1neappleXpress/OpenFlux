@@ -35,3 +35,14 @@ Thumbs.db
 
 .gradle/
 *.hprof
+
+# iOS build artifacts
+output/
+ios-app/build/
+ios-app/Lib/*.a
+ios-app/Lib/*.h
+ios-app/OpenFlux.xcodeproj/
+ios-app/DerivedData/
+
+# App Store Connect API private key — never commit
+*.p8

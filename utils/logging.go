@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 )
@@ -9,11 +10,23 @@ import (
 var (
 	debugLog *log.Logger
 	verbose  bool
+	output   io.Writer = os.Stderr
 )
+
+// SetOutput redirects all debug and standard log output to w.
+// Used by the mobile bridge to pipe logs into the app UI.
+func SetOutput(w io.Writer) {
+	output = w
+	log.SetOutput(w)
+	if debugLog != nil {
+		debugLog.SetOutput(w)
+	}
+}
 
 func EnableDebug() {
 	verbose = true
-	debugLog = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+	debugLog = log.New(output, "", log.LstdFlags|log.Lmicroseconds)
+	log.SetOutput(output)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 }
 

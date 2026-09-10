@@ -1,0 +1,57 @@
+name: OpenFlux
+options:
+  bundleIdPrefix: com.p1neapplexpress-saharev
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "2"
+    DEVELOPMENT_TEAM: "8GQH8GQ252"
+
+targets:
+  OpenFlux:
+    type: application
+    platform: iOS
+    sources:
+      - path: OpenFlux
+      - path: Lib
+        buildPhase: none
+    dependencies:
+      - framework: Lib/liboflux.a
+        embed: false
+    info:
+      path: OpenFlux/Info.plist
+      properties:
+        ITSAppUsesNonExemptEncryption: false
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux
+        PRODUCT_NAME: OpenFlux
+        INFOPLIST_KEY_CFBundleDisplayName: OpenFlux
+        SWIFT_OBJC_BRIDGING_HEADER: OpenFlux/OpenFlux-Bridging-Header.h
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/Lib"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/Lib"
+        OTHER_LDFLAGS:
+          - "-lresolv"
+          - "-framework"
+          - "CoreFoundation"
+          - "-framework"
+          - "Security"
+        CODE_SIGN_STYLE: Automatic
