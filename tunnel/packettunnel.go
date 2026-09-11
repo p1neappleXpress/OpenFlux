@@ -2,9 +2,11 @@ package tunnel
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -14,6 +16,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
 	"universal-bypass-tool/utils"
@@ -30,9 +33,9 @@ type TCPDialer interface {
 // TCP locally and forwards each flow through the given dialer. Outbound packets
 // (stack -> device) are read back with ReadOutbound.
 //
-// NOTE: only TCP is handled. The OpenFlux transport is TCP-only, so UDP
-// (including plain DNS) is not carried; DNS must be provided over TCP by the
-// extension.
+// The transport is TCP-only, so raw UDP is not carried; UDP port 53 is special
+// cased and proxied as DNS-over-TCP through the tunnel so name resolution works
+// (and bypasses local DNS poisoning). Other UDP is dropped.
 type PacketTunnel struct {
 	stack  *stack.Stack
 	ep     *channel.Endpoint
@@ -40,11 +43,11 @@ type PacketTunnel struct {
 	nicID  tcpip.NICID
 }
 
-// NewPacketTunnel builds the stack and installs a TCP forwarder.
+// NewPacketTunnel builds the stack and installs TCP + DNS forwarders.
 func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
 	ep := channel.New(1024, mtu, "")
@@ -60,8 +63,11 @@ func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 
 	pt := &PacketTunnel{stack: s, ep: ep, dialer: dialer, nicID: nicID}
 
-	fwd := tcp.NewForwarder(s, 0, 2048, pt.handleTCP)
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	tcpFwd := tcp.NewForwarder(s, 0, 2048, pt.handleTCP)
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+
+	udpFwd := udp.NewForwarder(s, pt.handleUDP)
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 	return pt
 }
 
@@ -98,6 +104,71 @@ func (pt *PacketTunnel) handleTCP(r *tcp.ForwarderRequest) {
 	})
 }
 
+// handleUDP only serves DNS (port 53): the query is proxied as DNS-over-TCP
+// through the tunnel. Any other UDP is dropped (TCP-only transport).
+func (pt *PacketTunnel) handleUDP(r *udp.ForwarderRequest) bool {
+	id := r.ID()
+	if id.LocalPort != 53 {
+		return false // not handled -> dropped (only DNS is supported)
+	}
+	var wq waiter.Queue
+	ep, err := r.CreateEndpoint(&wq)
+	if err != nil {
+		utils.Debugf("[PKT] UDP CreateEndpoint: %v", err)
+		return true
+	}
+	conn := gonet.NewUDPConn(&wq, ep)
+	dest := fmt.Sprintf("%s:53", id.LocalAddress.String())
+
+	utils.SafeGo("pkt.dns", func() {
+		defer conn.Close()
+		buf := make([]byte, 1500)
+		for {
+			conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+			n, err := conn.Read(buf)
+			if err != nil || n == 0 {
+				return
+			}
+			resp, err := pt.dnsOverTCP(dest, buf[:n])
+			if err != nil {
+				utils.Debugf("[PKT] DNS-over-TCP %s: %v", dest, err)
+				return
+			}
+			if _, err := conn.Write(resp); err != nil {
+				return
+			}
+		}
+	})
+	return true
+}
+
+// dnsOverTCP sends a DNS query to dest ("ip:53") over a TCP connection through
+// the tunnel (RFC 7766 length-prefixed framing) and returns the response.
+func (pt *PacketTunnel) dnsOverTCP(dest string, query []byte) ([]byte, error) {
+	c, err := pt.dialer.DialTCP(dest)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(8 * time.Second))
+
+	var lp [2]byte
+	binary.BigEndian.PutUint16(lp[:], uint16(len(query)))
+	if _, err := c.Write(append(lp[:], query...)); err != nil {
+		return nil, err
+	}
+
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, binary.BigEndian.Uint16(hdr))
+	if _, err := io.ReadFull(c, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 // WriteInbound injects one IPv4 packet coming from the device into the stack.
 func (pt *PacketTunnel) WriteInbound(ipPacket []byte) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -123,4 +194,3 @@ func (pt *PacketTunnel) Close() {
 	pt.ep.Close()
 	pt.stack.Close()
 }
-
