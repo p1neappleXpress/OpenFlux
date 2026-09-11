@@ -31,8 +31,8 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
-	flag.StringVar(&maxToken, "maxToken", "", "MAX call user id. If u use MAX transport")
-	flag.StringVar(&maxUid, "maxUid", "", "MAX Web token. If u use MAX transport")
+	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
+	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	flag.Parse()
 
 	if !*exitNode && !*client {
