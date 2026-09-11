@@ -195,12 +195,20 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		messagePart, _ := json.Marshal([]interface{}{"message", authData})
 		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
+		connectedAt := time.Now()
 		for t.IsRunning() {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				t.SetConnected(false)
-				t.scheduleReconnect(attempt)
+				// If the session was healthy for a while, treat the next
+				// connect as fresh (attempt -1 -> next attempt 0) so backoff
+				// doesn't keep growing across normal long-lived reconnects.
+				next := attempt
+				if time.Since(connectedAt) > 15*time.Second {
+					next = -1
+				}
+				t.scheduleReconnect(next)
 				return
 			}
 			t.handleMessage(session, message)
@@ -311,12 +319,40 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 }
 
 func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
-	if !t.IsRunning() || attempt >= t.GetConfig().MaxReconnectAttempts {
+	next := attempt + 1
+	if !t.IsRunning() || next >= t.GetConfig().MaxReconnectAttempts {
+		return
+	}
+
+	// Back off before retrying so a server that closes us immediately doesn't
+	// turn into a tight connect/close loop (previously reconnect was instant).
+	d := reconnectBackoff(next)
+	utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, next)
+	time.Sleep(d)
+	if !t.IsRunning() {
 		return
 	}
 
 	t.RecordReconnect()
-	t.connectToDoc(attempt + 1)
+	t.connectToDoc(next)
+}
+
+// reconnectBackoff returns an exponential backoff with jitter, capped at 15s.
+func reconnectBackoff(n int) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	shift := n - 1
+	if shift > 5 {
+		shift = 5
+	}
+	d := 500 * time.Millisecond * time.Duration(1<<uint(shift))
+	if d > 15*time.Second {
+		d = 15 * time.Second
+	}
+	// add up to +50% jitter
+	d += time.Duration(rand.Int63n(int64(d/2) + 1))
+	return d
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
