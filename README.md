@@ -22,7 +22,16 @@ The author **is not responsible** for:
 
 The original code is provided **as is**, **without any warranties**.
 
+## Clients
 
+| Platform | Download | Notes |
+|----------|----------|-------|
+| **Android** | [OpenFluxAndroid releases](https://github.com/p1neappleXpress/OpenFluxAndroid) | Standalone APK |
+| **iOS** | [TestFlight beta](https://testflight.apple.com/join/BwnAcdus) | System-wide VPN via Network Extension |
+
+> **iOS app** built by [@saharev1](https://github.com/saharev1) — full iOS client, TestFlight pipeline, system VPN support, DNS-over-TLS, and many stability fixes. HUGE thanks! 🙏
+>
+> **Android app** — [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid).
 
 ## Overview
 ```

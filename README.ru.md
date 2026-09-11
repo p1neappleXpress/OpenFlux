@@ -21,6 +21,17 @@
 
 Оригинальный код предоставляется **как есть** («as is»), **без каких-либо гарантий**.
 
+## Клиенты
+
+| Платформа | Скачать | Примечания |
+|-----------|---------|------------|
+| **Android** | [Релизы OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid) | Отдельный APK |
+| **iOS** | [TestFlight бета](https://testflight.apple.com/join/BwnAcdus) | Системный VPN через Network Extension |
+
+> **iOS-приложение** сделано [@saharev1](https://github.com/saharev1) — полноценный iOS-клиент, пайплайн TestFlight, системный VPN, DNS-over-TLS и множество фиксов стабильности. ОГРОМНОЕ спасибо! 🙏
+>
+> **Android-приложение** — [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid).
+
 ---
 
 ## Обзор
