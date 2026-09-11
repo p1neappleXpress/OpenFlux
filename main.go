@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"strconv"
 
         _ "github.com/wlynxg/anet"
@@ -39,6 +40,12 @@ func main() {
 
 	if *localIP != "" {
 		tunnel.SetLocalIP(*localIP)
+	}
+
+	// The exit node often runs on a tiny VPS; keep the heap tight under load
+	// (GC aggressively). Set GOMEMLIMIT in the environment for a hard soft-cap.
+	if *exitNode {
+		debug.SetGCPercent(20)
 	}
 
 	if !*exitNode && !*client {
