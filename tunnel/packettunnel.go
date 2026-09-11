@@ -50,7 +50,9 @@ func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
-	ep := channel.New(1024, mtu, "")
+	SetTCPBuffers(s)
+
+	ep := channel.New(256, mtu, "")
 	nicID := tcpip.NICID(1)
 	if err := s.CreateNIC(nicID, ep); err != nil {
 		utils.Debugf("[PKT] CreateNIC: %v", err)
