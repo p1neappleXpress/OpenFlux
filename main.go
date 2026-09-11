@@ -34,7 +34,12 @@ func main() {
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX call user id. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX Web token. If u use MAX transport")
+	localIP := flag.String("local-ip", "", "Exit node egress IP (use a dedicated alias IP so the RST-drop rule can be scoped with -s)")
 	flag.Parse()
+
+	if *localIP != "" {
+		tunnel.SetLocalIP(*localIP)
+	}
 
 	if !*exitNode && !*client {
 		flag.Usage()
@@ -70,7 +75,18 @@ func main() {
 
 	if *exitNode {
 		log.Printf("Running as EXIT NODE (needs root for raw socket)")
-		log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+		if *localIP != "" {
+			// Scoped: only drop kernel RSTs originating from the tunnel's
+			// egress IP, leaving the host's other services (and their
+			// closed-port RSTs) untouched.
+			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", *localIP)
+		} else {
+			log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
+			log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
+			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s <ip> -j DROP")
+			log.Printf("! Host-wide fallback (drops ALL outbound RST; makes closed ports look filtered):")
+			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+		}
 		select {}
 	} else {
 		log.Printf("Running as CLIENT (SOCKS5 on %s)", *socksAddr)

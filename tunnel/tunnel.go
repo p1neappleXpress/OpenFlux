@@ -201,7 +201,19 @@ func (t *TCPTunnel) printStats() {
 	}
 }
 
+// localIPOverride, when set, is the address the exit node uses as its egress
+// IP (both for source rewriting and the return-packet filter). Point it at a
+// dedicated alias IP so the RST-drop iptables rule can be scoped with
+// `-s <ip>` instead of dropping RSTs host-wide.
+var localIPOverride string
+
+// SetLocalIP overrides the auto-detected egress IP for the exit node.
+func SetLocalIP(ip string) { localIPOverride = ip }
+
 func getLocalIP() string {
+	if localIPOverride != "" {
+		return localIPOverride
+	}
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return "192.168.1.100"
