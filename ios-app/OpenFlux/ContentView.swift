@@ -10,6 +10,7 @@ struct ContentView: View {
     @AppStorage("maxUid") private var maxUid: String = ""
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
+    @AppStorage("debugLog") private var debugLog: Bool = false
 
     private var transport: TransportKind {
         TransportKind(rawValue: transportRaw) ?? .yandex
@@ -50,6 +51,7 @@ struct ContentView: View {
                 .padding()
             }
             .navigationTitle("OpenFlux")
+            .onAppear { OpenFluxSetDebug(debugLog ? 1 : 0) }
         }
         .navigationViewStyle(.stack)
     }
@@ -166,6 +168,10 @@ struct ContentView: View {
 
     private var logView: some View {
         VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: $debugLog) {
+                Text("Verbose log").font(.caption).foregroundColor(.secondary)
+            }
+            .onChange(of: debugLog) { on in OpenFluxSetDebug(on ? 1 : 0) }
             Text("Log").font(.caption).foregroundColor(.secondary)
             ScrollViewReader { proxy in
                 ScrollView {
