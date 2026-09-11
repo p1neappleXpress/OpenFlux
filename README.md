@@ -1,8 +1,14 @@
-# OpenFlux
+<h1 align="center">
+  <img src="logo.png" alt="OpenFlux" width="560">
+</h1>
 
-**English** | [Русский](README.ru.md)
+<p align="center">
+  <b>English</b> | <a href="README.ru.md">Русский</a>
+</p>
 
-Network stack research tool. TCP tunnel with pluggable transports.
+<p align="center">
+  Network stack research tool. TCP tunnel with pluggable transports.
+</p>
 
 
 # Disclaimer
