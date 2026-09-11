@@ -135,3 +135,10 @@ Third-party licenses are listed in [NOTICE](NOTICE).
 
 Educational use only. Test on your own machines and networks.
 
+## Support the project
+
+**USDT · TRC20**
+
+```
+TXyTj5DqJNcQpd2yWwdVuXdabvQibXgLKC
+```
