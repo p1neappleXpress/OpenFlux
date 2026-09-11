@@ -4,6 +4,32 @@ import NetworkExtension
 /// tun2socks stack (TCP forwarded through the transport; DNS proxied over TCP).
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
+    /// Networks that must NOT go through the tunnel: the Yandex backend the
+    /// transport talks to, plus the DoT DNS resolvers. Otherwise the
+    /// extension's own traffic loops back into itself.
+    static let bypassRoutes: [NEIPv4Route] = {
+        let cidrs: [(String, String)] = [
+            ("5.45.192.0", "255.255.192.0"),
+            ("5.255.192.0", "255.255.192.0"),
+            ("37.9.64.0", "255.255.192.0"),
+            ("37.140.128.0", "255.255.192.0"),
+            ("77.88.0.0", "255.255.192.0"),
+            ("84.201.128.0", "255.255.192.0"),
+            ("87.250.224.0", "255.255.224.0"),
+            ("90.156.176.0", "255.255.252.0"),
+            ("93.158.128.0", "255.255.192.0"),
+            ("95.108.128.0", "255.255.128.0"),
+            ("100.43.64.0", "255.255.224.0"),
+            ("178.154.128.0", "255.255.128.0"),
+            ("213.180.192.0", "255.255.224.0"),
+            // DoT DNS resolvers used by the Go client.
+            ("8.8.8.8", "255.255.255.255"),
+            ("1.1.1.1", "255.255.255.255"),
+        ]
+        return cidrs.map { NEIPv4Route(destinationAddress: $0.0, subnetMask: $0.1) }
+    }()
+
+
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
         let transport = (conf["transport"] as? String) ?? "yandex"
@@ -15,6 +41,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         let ipv4 = NEIPv4Settings(addresses: ["10.10.0.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
+        // Exclude the transport's own backend (Yandex ranges) and the DoT DNS
+        // servers so the extension's own connections bypass the tunnel instead
+        // of looping back into it.
+        ipv4.excludedRoutes = Self.bypassRoutes
         settings.ipv4Settings = ipv4
         settings.mtu = 1500
         let dns = NEDNSSettings(servers: ["8.8.8.8"])

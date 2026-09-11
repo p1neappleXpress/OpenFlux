@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"unsafe"
@@ -56,6 +57,11 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	if ptOn {
 		return C.int(startAlreadyRunning)
 	}
+
+	// The Network Extension has a hard memory cap (~50MB). Keep the Go heap
+	// small: soft-limit memory and GC aggressively so we don't get killed.
+	debug.SetMemoryLimit(45 << 20)
+	debug.SetGCPercent(20)
 
 	config := transport.DefaultConfig()
 	var t transport.Transport
