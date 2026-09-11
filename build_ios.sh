@@ -38,7 +38,7 @@ echo "Building for iOS (arm64)..."
 # Build static library
 if go build \
     -buildmode=c-archive \
-    -ldflags="-s -w" \
+    -ldflags="-w" \
     -trimpath \
     -o "$OUTPUT_DIR/$LIBRARY_NAME.a" \
     . ; then

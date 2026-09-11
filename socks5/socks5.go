@@ -87,6 +87,13 @@ func (s *SOCKS5Server) Close() error {
 }
 
 func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
+	// A malformed request must never crash the host process; contain any
+	// panic to this connection.
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Debugf("[SOCKS5] Recovered from panic in handler: %v", r)
+		}
+	}()
 	defer clientConn.Close()
 
 	buf := make([]byte, 256)
@@ -110,6 +117,12 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 			uint16(buf[8])<<8|uint16(buf[9]))
 	case 0x03:
 		domainLen := int(buf[4])
+		// Bounds-check against what was actually read: address (domainLen
+		// bytes) starts at index 5 and is followed by a 2-byte port.
+		if domainLen == 0 || 5+domainLen+2 > n {
+			utils.Debugf("[SOCKS5] Bad domain request (len=%d, n=%d)", domainLen, n)
+			return
+		}
 		targetAddr = fmt.Sprintf("%s:%d",
 			string(buf[5:5+domainLen]),
 			uint16(buf[5+domainLen])<<8|uint16(buf[6+domainLen]))
