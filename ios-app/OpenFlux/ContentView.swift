@@ -11,6 +11,7 @@ struct ContentView: View {
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
+    @State private var showInfo = false
 
     private var transport: TransportKind {
         TransportKind(rawValue: transportRaw) ?? .yandex
@@ -52,6 +53,14 @@ struct ContentView: View {
             }
             .navigationTitle("OpenFlux")
             .onAppear { OpenFluxSetDebug(debugLog ? 1 : 0) }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { showInfo = true } label: {
+                        Image(systemName: "info.circle")
+                    }
+                }
+            }
+            .sheet(isPresented: $showInfo) { InfoView() }
         }
         .navigationViewStyle(.stack)
     }
