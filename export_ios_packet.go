@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -67,6 +68,10 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		return C.int(startAlreadyRunning)
 	}
 
+	// Keep the extension well under the NE memory cap.
+	debug.SetMemoryLimit(40 << 20)
+	debug.SetGCPercent(20)
+
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
@@ -106,6 +111,7 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 //
 //export OpenFluxTunWritePacket
 func OpenFluxTunWritePacket(buf *C.char, length C.int) {
+	defer func() { _ = recover() }() // never let a bad packet crash the extension
 	if buf == nil || length < 20 {
 		return
 	}
@@ -130,10 +136,19 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 		}
 		dstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
 		if dstPort == 53 {
-			go handleDNSPacket(pkt, outQ)
+			// Bound concurrent DNS resolutions so a burst can't spawn an
+			// unbounded pile of goroutines + TLS handshakes (memory).
+			select {
+			case dnsSem <- struct{}{}:
+				go func() { defer func() { <-dnsSem }(); handleDNSPacket(pkt, outQ) }()
+			default: // too many in flight: drop, the client retries
+			}
 		}
 	}
 }
+
+// dnsSem caps concurrent DNS-over-TLS resolutions.
+var dnsSem = make(chan struct{}, 16)
 
 // OpenFluxTunReadPacket blocks for the next packet destined to the device.
 //
