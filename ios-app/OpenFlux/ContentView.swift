@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var tunnel = TunnelController()
+    @StateObject private var vpn = VPNController()
 
     @AppStorage("transportKind") private var transportRaw: String = TransportKind.yandex.rawValue
     @AppStorage("docURL") private var docURL: String = ""
@@ -41,6 +42,8 @@ struct ContentView: View {
                     portField
 
                     controls
+
+                    vpnSection
 
                     logView
                 }
@@ -106,6 +109,34 @@ struct ContentView: View {
                 Text("SOCKS5 proxy: \(tunnel.socksAddr)")
                     .font(.footnote).foregroundColor(.secondary)
             }
+        }
+    }
+
+    private var vpnSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            HStack {
+                Text("System VPN (all traffic)").font(.subheadline).bold()
+                Spacer()
+                Text(vpn.status).font(.caption).foregroundColor(.secondary)
+            }
+            if vpn.active {
+                Button(role: .destructive) { vpn.stop() } label: {
+                    Label("Stop VPN", systemImage: "bolt.slash.fill").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Button {
+                    vpn.start(transport: transport.rawValue, url: docURL,
+                              maxToken: maxToken, maxUid: maxUid)
+                } label: {
+                    Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canStart)
+            }
+            Text("Routes the whole device through the exit node (TCP + DNS-over-TCP).")
+                .font(.caption2).foregroundColor(.secondary)
         }
     }
 

@@ -8,7 +8,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "1.0.0"
-    CURRENT_PROJECT_VERSION: "9"
+    CURRENT_PROJECT_VERSION: "10"
     DEVELOPMENT_TEAM: "8GQH8GQ252"
 
 targets:
@@ -22,6 +22,7 @@ targets:
     dependencies:
       - framework: Lib/liboflux.a
         embed: false
+      - target: OpenFluxTunnel
     info:
       path: OpenFlux/Info.plist
       properties:
@@ -34,6 +35,11 @@ targets:
           - UIInterfaceOrientationPortrait
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+    entitlements:
+      path: OpenFlux/OpenFlux.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux
@@ -44,6 +50,45 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/Lib"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/Lib"
+        OTHER_LDFLAGS:
+          - "-lresolv"
+          - "-framework"
+          - "CoreFoundation"
+          - "-framework"
+          - "Security"
+        CODE_SIGN_STYLE: Automatic
+
+  OpenFluxTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: OpenFluxTunnel
+      - path: Lib
+        buildPhase: none
+    dependencies:
+      - framework: Lib/liboflux.a
+        embed: false
+    info:
+      path: OpenFluxTunnel/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+    entitlements:
+      path: OpenFluxTunnel/OpenFluxTunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux.tunnel
+        PRODUCT_NAME: OpenFluxTunnel
+        SWIFT_OBJC_BRIDGING_HEADER: OpenFluxTunnel/Tunnel-Bridging-Header.h
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
         HEADER_SEARCH_PATHS:
           - "$(SRCROOT)/Lib"
         LIBRARY_SEARCH_PATHS:
