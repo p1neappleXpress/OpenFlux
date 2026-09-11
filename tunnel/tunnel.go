@@ -27,6 +27,27 @@ type TCPTunnel struct {
 	packetCount atomic.Uint64
 }
 
+// TCP buffer size range for gvisor stacks. Big by default (exit node on a VPS);
+// the memory-constrained iOS Network Extension shrinks these before building
+// its stacks (see the packet-tunnel bridge).
+var (
+	TCPBufMin     = 65536
+	TCPBufDefault = 262144
+	TCPBufMax     = 1048576
+)
+
+// SetTCPBuffers applies the configured TCP send/receive buffer ranges to s.
+func SetTCPBuffers(s *stack.Stack) {
+	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
+		utils.Debugf("[TUNNEL] set recv buffer: %v", err)
+	}
+	snd := tcpip.TCPSendBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
+		utils.Debugf("[TUNNEL] set send buffer: %v", err)
+	}
+}
+
 func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 	t := &TCPTunnel{
 		transport:  trans,
@@ -40,14 +61,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
-        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-            &tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-            utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
-        }
-        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-            &tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-            utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
-        }
+        SetTCPBuffers(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {

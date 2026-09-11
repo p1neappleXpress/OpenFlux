@@ -58,10 +58,14 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		return C.int(startAlreadyRunning)
 	}
 
-	// The Network Extension has a hard memory cap (~50MB). Keep the Go heap
-	// small: soft-limit memory and GC aggressively so we don't get killed.
-	debug.SetMemoryLimit(45 << 20)
-	debug.SetGCPercent(20)
+	// The Network Extension has a hard memory cap (~50MB). Keep the footprint
+	// small: shrink gvisor's per-connection TCP buffers (the biggest hog),
+	// soft-limit the Go heap and GC aggressively.
+	tunnel.TCPBufMin = 8192
+	tunnel.TCPBufDefault = 32768
+	tunnel.TCPBufMax = 262144
+	debug.SetMemoryLimit(40 << 20)
+	debug.SetGCPercent(10)
 
 	config := transport.DefaultConfig()
 	var t transport.Transport
