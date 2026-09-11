@@ -20,6 +20,7 @@ var (
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
+	localIP      string 
 )
 
 func main() {
@@ -34,10 +35,11 @@ func main() {
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
+	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (scoped RST drop)")
 	flag.Parse()
 
-	if *localIP != "" {
-		tunnel.SetLocalIP(*localIP)
+	if localIP != "" {
+		tunnel.SetLocalIP(localIP)
 	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
@@ -82,11 +84,11 @@ func main() {
 
 	if *exitNode {
 		log.Printf("Running as EXIT NODE (needs root for raw socket)")
-		if *localIP != "" {
+		if localIP != "" {
 			// Scoped: only drop kernel RSTs originating from the tunnel's
 			// egress IP, leaving the host's other services (and their
 			// closed-port RSTs) untouched.
-			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", *localIP)
+			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
 		} else {
 			log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
 			log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
