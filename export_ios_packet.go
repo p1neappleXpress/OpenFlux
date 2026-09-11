@@ -143,7 +143,48 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 				go func() { defer func() { <-dnsSem }(); handleDNSPacket(pkt, outQ) }()
 			default: // too many in flight: drop, the client retries
 			}
+		} else {
+			// We can't carry UDP (TCP-only transport). Instead of silently
+			// dropping it (which makes apps stall on QUIC/UDP:443 before
+			// falling back to TCP), reply ICMP port-unreachable so they switch
+			// to TCP immediately.
+			sendICMPPortUnreachable(pkt, outQ)
 		}
+	}
+}
+
+// sendICMPPortUnreachable enqueues an ICMP "destination/port unreachable" for a
+// UDP datagram we won't forward, so the sender falls back to TCP fast.
+func sendICMPPortUnreachable(orig []byte, outQ chan []byte) {
+	ihl := int(orig[0]&0x0f) * 4
+	if len(orig) < ihl+8 {
+		return
+	}
+	quote := orig[:ihl+8] // original IP header + 8 bytes (per RFC 792)
+	icmp := make([]byte, 8+len(quote))
+	icmp[0] = 3 // Destination Unreachable
+	icmp[1] = 3 // Port Unreachable
+	copy(icmp[8:], quote)
+	ck := network.IPChecksum(icmp)
+	icmp[2] = byte(ck >> 8)
+	icmp[3] = byte(ck & 0xFF)
+
+	total := 20 + len(icmp)
+	ip := make([]byte, total)
+	ip[0] = 0x45
+	binary.BigEndian.PutUint16(ip[2:4], uint16(total))
+	ip[8] = 64 // TTL
+	ip[9] = 1  // ICMP
+	copy(ip[12:16], orig[16:20]) // src = original destination
+	copy(ip[16:20], orig[12:16]) // dst = original source (the device)
+	ck2 := network.IPChecksum(ip[:20])
+	ip[10] = byte(ck2 >> 8)
+	ip[11] = byte(ck2 & 0xFF)
+	copy(ip[20:], icmp)
+
+	select {
+	case outQ <- ip:
+	default:
 	}
 }
 
