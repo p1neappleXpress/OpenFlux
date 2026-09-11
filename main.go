@@ -52,6 +52,8 @@ func main() {
 	var trans transport.Transport
 
 	switch *transportType {
+	case "vyandex":
+		trans = transport.NewCompressedTransport(yandex.NewYandexVolgaTransport(globalDocUrl, config))
 	case "yandex":
 		trans = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(globalDocUrl, config))
 	case "oneme":
