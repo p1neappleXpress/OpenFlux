@@ -36,6 +36,15 @@ func Debugf(format string, args ...interface{}) {
 	}
 }
 
+// SetDebug toggles verbose logging at runtime (off = Debugf becomes a no-op).
+func SetDebug(on bool) {
+	if on {
+		EnableDebug()
+		return
+	}
+	verbose = false
+}
+
 func IsVerbose() bool {
 	return verbose
 }

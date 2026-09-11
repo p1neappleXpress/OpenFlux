@@ -66,10 +66,10 @@ var (
 )
 
 func init() {
-	// Route all log output into the ring buffer and enable verbose logging
-	// so the app can display connection progress.
+	// Route log output into the ring buffer, but leave verbose logging OFF by
+	// default (production). The app can turn it on via OpenFluxSetDebug; the
+	// per-packet logging is expensive.
 	utils.SetOutput(logbuf)
-	utils.EnableDebug()
 
 	// The client's local (mobile) DNS may be poisoned for censored hosts
 	// (observed: ifconfig.me -> 240.0.1.72, a reserved address). Resolve names
@@ -285,4 +285,12 @@ func OpenFluxReadLog() *C.char {
 //export OpenFluxFreeString
 func OpenFluxFreeString(s *C.char) {
 	C.free(unsafe.Pointer(s))
+}
+
+// OpenFluxSetDebug toggles verbose (per-packet) logging at runtime. Off by
+// default; enabling it costs CPU, so only turn it on while debugging.
+//
+//export OpenFluxSetDebug
+func OpenFluxSetDebug(on C.int) {
+	utils.SetDebug(on != 0)
 }
