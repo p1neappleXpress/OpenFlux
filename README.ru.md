@@ -51,19 +51,25 @@ TCP-пакеты передаются через Transport. На данный м
 ## Структура
 
 ```
-universal-bypass-tool/
-├── main.go
+OpenFlux/
+├── main.go                     # Точка входа CLI (клиент / выходная нода)
+├── export_ios.go               # cgo-мост для статической библиотеки iOS (build tag: ios)
 ├── transport/
-│   ├── transport.go      # Transport interface
-│   └── yandex/           # Yandex Docs backend
-│   └── oneme/            # MAX Messenger backend
+│   ├── transport.go            # Интерфейс Transport
+│   ├── compressor.go           # Обёртка сжатия
+│   ├── yandex/                 # Бэкенд Yandex Docs
+│   └── oneme/                  # Бэкенд MAX Messenger
 ├── tunnel/
-│   ├── tunnel.go         # TCP tunnel core
-│   ├── endpoint.go       # Virtual NIC
-│   └── rawsocket.go      # Raw socket (exit node)
-├── socks5/               # SOCKS5 server
-├── network/              # Checksums, packet parsing
-└── utils/                # Debug logging
+│   ├── tunnel.go               # Ядро TCP-тоннеля
+│   ├── endpoint.go             # Виртуальный NIC
+│   └── rawsocket_{linux,darwin,windows}.go  # Raw-сокет (выходная нода), по ОС
+├── socks5/                     # SOCKS5-сервер
+├── network/                    # Контрольные суммы, разбор пакетов
+├── utils/                      # Логирование
+├── ios-app/                    # iOS-клиент на SwiftUI (XcodeGen), линкует liboflux.a
+├── build_ios.sh                # Сборка статической библиотеки iOS (liboflux.a)
+├── build_ios_app.sh            # Сборка + архив + экспорт IPA приложения iOS
+└── build_android.sh            # Сборка клиентского бинарника Android
 ```
 
 ## Сборка (бинарник десктоп-клиента / выходной ноды)
@@ -91,7 +97,27 @@ export XCODE_PATH="<путь до вашего Xcode.app>" # опциональ�
 1. У вас должен быть root-доступ выходной ноде;
 2. Поддерживается только устаревший редактор документов Yandex (переключается в настройках интерфейса).
 
-Команды для настройки выходной ноды:
+TCP-соединения выходной ноды живут в userspace-стеке (gvisor), у ядра нет для
+них сокета, и оно слало бы RST на каждый ответный пакет — туннель бы рвался.
+Этот RST надо подавить, но **точечно**, не на весь хост. Глухое
+`-j DROP` на все исходящие RST превращает закрытые порты в «молчащие»
+(сканер видит `filtered` вместо `closed`) и мешает хосту нормально сбрасывать
+посторонние соединения.
+
+Рекомендуется (сужение по выделенному egress-IP):
+```bash
+# повесьте на машину второй/алиас IP под туннель, напр. 203.0.113.10
+sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s 203.0.113.10 -j DROP
+sudo ./universal-bypass-tool --exit-node --local-ip 203.0.113.10 \
+    --url "YOUR_YANDEX_DOC_URL" --debug
+```
+Ещё чище — запускать ноду в отдельном network namespace / контейнере, тогда
+правило вообще не трогает сервисы хоста. `-m owner --uid-owner` тут **не
+работает**: рвущие туннель RST генерит ядро без сокета-владельца, и owner-матч
+не срабатывает.
+
+Запасной вариант на весь хост (только на однозадачной машине, с пониманием
+последствий):
 ```bash
 sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
 sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
