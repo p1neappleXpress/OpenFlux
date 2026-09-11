@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -131,19 +132,34 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
-		dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+		// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
+		// can't hang the whole transport (HandshakeTimeout alone proved
+		// insufficient on iOS).
+		dialer := websocket.Dialer{
+			HandshakeTimeout: 15 * time.Second,
+			NetDialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		}
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
 		headers.Set("Origin", info.Origin)
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
 
-		conn, _, err := dialer.Dial(info.WsURL, headers)
+		utils.Debugf("[YDOCS] WebSocket dial %s", info.WsURL)
+		conn, resp, err := dialer.Dial(info.WsURL, headers)
 		if err != nil {
-			utils.Debugf("[YDOCS] WebSocket dial failed: %v", err)
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			utils.Debugf("[YDOCS] WebSocket dial failed (http %d): %v", status, err)
 			t.scheduleReconnect(attempt)
 			return
 		}
+		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
