@@ -2,53 +2,124 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var tunnel = TunnelController()
+
+    @AppStorage("transportKind") private var transportRaw: String = TransportKind.yandex.rawValue
     @AppStorage("docURL") private var docURL: String = ""
+    @AppStorage("maxToken") private var maxToken: String = ""
+    @AppStorage("maxUid") private var maxUid: String = ""
+    // Uncommon default port to avoid clashing with other local proxies.
+    @AppStorage("socksPort") private var socksPort: String = "10808"
+
+    private var transport: TransportKind {
+        TransportKind(rawValue: transportRaw) ?? .yandex
+    }
+
+    private var canStart: Bool {
+        guard (Int(socksPort) ?? 0) > 0 else { return false }
+        switch transport {
+        case .yandex: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .max:    return !maxToken.isEmpty && !maxUid.isEmpty
+        }
+    }
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 16) {
-                statusHeader
+            ScrollView {
+                VStack(spacing: 16) {
+                    statusHeader
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Yandex.Docs URL").font(.caption).foregroundColor(.secondary)
-                    TextField("https://docs.yandex.ru/docs/view?url=...", text: $docURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(tunnel.running)
-                }
-
-                HStack(spacing: 12) {
-                    if tunnel.running {
-                        Button(role: .destructive) { tunnel.stop() } label: {
-                            Label("Stop", systemImage: "stop.fill").frame(maxWidth: .infinity)
+                    Picker("Transport", selection: $transportRaw) {
+                        ForEach(TransportKind.allCases) { t in
+                            Text(t.title).tag(t.rawValue)
                         }
-                        .buttonStyle(.borderedProminent)
-                    } else {
-                        Button { tunnel.start(url: docURL) } label: {
-                            Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(docURL.isEmpty)
                     }
-                    Button { tunnel.testThroughProxy() } label: {
-                        Label("Test", systemImage: "network").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!tunnel.running)
+                    .pickerStyle(.segmented)
+                    .disabled(tunnel.running)
+
+                    connectionFields
+
+                    portField
+
+                    controls
+
+                    logView
                 }
-
-                Text("SOCKS5 proxy: \(tunnel.socksAddr)")
-                    .font(.footnote).foregroundColor(.secondary)
-
-                logView
-
-                Spacer(minLength: 0)
+                .padding()
             }
-            .padding()
             .navigationTitle("OpenFlux")
         }
         .navigationViewStyle(.stack)
+    }
+
+    @ViewBuilder
+    private var connectionFields: some View {
+        switch transport {
+        case .yandex:
+            field(title: "Yandex Docs URL",
+                  placeholder: "https://docs.yandex.ru/docs/view?url=...",
+                  text: $docURL)
+        case .max:
+            field(title: "MAX token", placeholder: "auth token", text: $maxToken)
+            field(title: "MAX user ID", placeholder: "numeric id", text: $maxUid,
+                  keyboard: .numberPad)
+        }
+    }
+
+    private var portField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Local SOCKS5 port").font(.caption).foregroundColor(.secondary)
+            TextField("10808", text: $socksPort)
+                .keyboardType(.numberPad)
+                .textFieldStyle(.roundedBorder)
+                .disabled(tunnel.running)
+        }
+    }
+
+    private var controls: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 12) {
+                if tunnel.running {
+                    Button(role: .destructive) { tunnel.stop() } label: {
+                        Label("Stop", systemImage: "stop.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    Button {
+                        tunnel.start(transport: transport,
+                                     url: docURL,
+                                     maxToken: maxToken,
+                                     maxUid: maxUid,
+                                     port: Int(socksPort) ?? 10808)
+                    } label: {
+                        Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canStart)
+                }
+                Button { tunnel.testThroughProxy() } label: {
+                    Label("Test", systemImage: "network").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!tunnel.running)
+            }
+            if tunnel.running {
+                Text("SOCKS5 proxy: \(tunnel.socksAddr)")
+                    .font(.footnote).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private func field(title: String, placeholder: String, text: Binding<String>,
+                       keyboard: UIKeyboardType = .default) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundColor(.secondary)
+            TextField(placeholder, text: text)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .keyboardType(keyboard)
+                .textFieldStyle(.roundedBorder)
+                .disabled(tunnel.running)
+        }
     }
 
     private var statusHeader: some View {
@@ -77,7 +148,7 @@ struct ContentView: View {
                     withAnimation { proxy.scrollTo("logtail", anchor: .bottom) }
                 }
             }
-            .frame(maxHeight: 260)
+            .frame(height: 240)
             .background(Color(.secondarySystemBackground))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
