@@ -399,15 +399,12 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	var config map[string]interface{}
 	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
-		return YandexDocsInfo{}, fmt.Errorf("client-config parse: %w", err)
+		return YandexDocsInfo{}, fmt.Errorf("client-config is not valid JSON: %w", err)
 	}
 
-	// Every field below is looked up defensively: a wrong URL or a doc that
-	// isn't the legacy Yandex editor yields a missing field, which must be a
-	// clean error, not a panic.
 	officeAction, ok := config["officeActionData"].(map[string]interface{})
-	if !ok {
-		return YandexDocsInfo{}, fmt.Errorf("officeActionData missing (not a legacy Yandex Docs URL?)")
+	if !ok || officeAction == nil {
+		return YandexDocsInfo{}, fmt.Errorf("officeActionData missing - will reconnect")
 	}
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
@@ -417,20 +414,24 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	balancerURL, ok := officeAction["balancer_url"].(string)
 	if !ok || balancerURL == "" {
-		return YandexDocsInfo{}, fmt.Errorf("balancer_url missing")
+		return YandexDocsInfo{}, fmt.Errorf("officeActionData.balancer_url missing - will reconnect")
 	}
 	host := strings.TrimPrefix(balancerURL, "https://")
 
 	document, ok := editorConfigRaw["document"].(map[string]interface{})
-	if !ok {
-		return YandexDocsInfo{}, fmt.Errorf("document missing")
+	if !ok || document == nil {
+		return YandexDocsInfo{}, fmt.Errorf("editor_config.document missing - will reconnect")
+	}
+
+	token, ok := editorConfigRaw["token"].(string)
+	if !ok || token == "" {
+		return YandexDocsInfo{}, fmt.Errorf("editor_config.token missing - will reconnect")
 	}
 
 	docKey, ok := document["key"].(string)
 	if !ok || docKey == "" {
-		return YandexDocsInfo{}, fmt.Errorf("document.key missing")
+		return YandexDocsInfo{}, fmt.Errorf("editor_config.document.key missing - will reconnect")
 	}
-	token, _ := editorConfigRaw["token"].(string)
 
 	perms, _ := document["permissions"].(map[string]interface{})
 	if perms == nil {

@@ -7,7 +7,6 @@ import (
 	"os"
 	godebug "runtime/debug"
 	"strconv"
-
         _ "github.com/wlynxg/anet"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
@@ -33,9 +32,8 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
-	flag.StringVar(&maxToken, "maxToken", "", "MAX call user id. If u use MAX transport")
-	flag.StringVar(&maxUid, "maxUid", "", "MAX Web token. If u use MAX transport")
-	localIP := flag.String("local-ip", "", "Exit node egress IP (use a dedicated alias IP so the RST-drop rule can be scoped with -s)")
+	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
+	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	flag.Parse()
 
 	if *localIP != "" {
@@ -65,6 +63,8 @@ func main() {
 	var trans transport.Transport
 
 	switch *transportType {
+	case "vyandex":
+		trans = transport.NewCompressedTransport(yandex.NewYandexVolgaTransport(globalDocUrl, config))
 	case "yandex":
 		trans = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(globalDocUrl, config))
 	case "oneme":

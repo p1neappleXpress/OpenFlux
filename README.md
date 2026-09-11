@@ -4,6 +4,26 @@
 
 Network stack research tool. TCP tunnel with pluggable transports.
 
+
+# Disclaimer
+
+The author of OpenFlux **does not encourage** the use of this project to bypass restrictions or violate the rules of any platform, and **is not responsible** for the final scenarios of how users apply this tool in real life or on the Internet. Any specific technical features of the application are nothing more than an **architectural coincidence**, created **without any intent**.
+
+The project is **entirely non-commercial**, contains **no paid features, hidden subscriptions, or commercial benefit**.
+
+The author **is not responsible** for forks, modifications, or derivative versions of OpenFlux created by third parties. Any changes added to a fork are the responsibility of its author.
+
+The author **is not responsible** for:
+
+- Any use of OpenFlux by third parties
+- Consequences caused by the use of forks and modifications
+- Damage resulting from derivative versions
+- Violations committed using forks
+
+The original code is provided **as is**, **without any warranties**.
+
+
+
 ## Overview
 ```
 Client (SOCKS5) --> Transport --> Exit Node --> Internet
@@ -19,7 +39,13 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 TCP packets are sent via Transport. Currently, there are two transports available:
 1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets via WebRTC DataChannel.
+2. Max - sends packets via WebRTC DataChannel
+    WARNING:
+   - **Do not use** your primary or important MAX account.
+   - **Do not use** an account whose deletion or loss of access would be critical.   
+   - Usage via an **external VPS** may lead to **account restrictions**.
+   - The **restriction may persist** after stopping OpenFlux.
+   - MAX transport should be considered **experimental** until the blocking mechanism is understood. 
 
 Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to destination point.
 
@@ -134,3 +160,10 @@ Third-party licenses are listed in [NOTICE](NOTICE).
 
 Educational use only. Test on your own machines and networks.
 
+## Support the project
+
+**USDT · TRC20**
+
+```
+TXyTj5DqJNcQpd2yWwdVuXdabvQibXgLKC
+```
