@@ -327,17 +327,40 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	}
 
 	var config map[string]interface{}
-	json.Unmarshal([]byte(matches[1]), &config)
-	officeAction := config["officeActionData"].(map[string]interface{})
+	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("client-config is not valid JSON: %w", err)
+	}
+
+	officeAction, ok := config["officeActionData"].(map[string]interface{})
+	if !ok || officeAction == nil {
+		return YandexDocsInfo{}, fmt.Errorf("officeActionData missing - will reconnect")
+	}
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
 	if !ok || editorConfigRaw == nil {
 		return YandexDocsInfo{}, fmt.Errorf("editor_config nil - will reconnect")
 	}
 
-	balancerURL := officeAction["balancer_url"].(string)
+	balancerURL, ok := officeAction["balancer_url"].(string)
+	if !ok || balancerURL == "" {
+		return YandexDocsInfo{}, fmt.Errorf("officeActionData.balancer_url missing - will reconnect")
+	}
 	host := strings.TrimPrefix(balancerURL, "https://")
-	document := editorConfigRaw["document"].(map[string]interface{})
+
+	document, ok := editorConfigRaw["document"].(map[string]interface{})
+	if !ok || document == nil {
+		return YandexDocsInfo{}, fmt.Errorf("editor_config.document missing - will reconnect")
+	}
+
+	token, ok := editorConfigRaw["token"].(string)
+	if !ok || token == "" {
+		return YandexDocsInfo{}, fmt.Errorf("editor_config.token missing - will reconnect")
+	}
+
+	docKey, ok := document["key"].(string)
+	if !ok || docKey == "" {
+		return YandexDocsInfo{}, fmt.Errorf("editor_config.document.key missing - will reconnect")
+	}
 
 	perms, _ := document["permissions"].(map[string]interface{})
 	if perms == nil {
@@ -346,15 +369,15 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	return YandexDocsInfo{
 		CookieStr:   strings.Join(cookies, "; "),
-		Token:       editorConfigRaw["token"].(string),
-		DocID:       document["key"].(string),
+		Token:       token,
+		DocID:       docKey,
 		Origin:      balancerURL,
 		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, document["key"].(string)),
+		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docKey),
 		Permissions: perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
-			"id":     document["key"].(string),
+			"id":     docKey,
 			"userid": userID,
 			"format": document["fileType"],
 			"url":    document["url"],
