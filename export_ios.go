@@ -8,6 +8,8 @@ package main
 import "C"
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
@@ -68,6 +70,46 @@ func init() {
 	// so the app can display connection progress.
 	utils.SetOutput(logbuf)
 	utils.EnableDebug()
+
+	// The client's local (mobile) DNS may be poisoned for censored hosts
+	// (observed: ifconfig.me -> 240.0.1.72, a reserved address). Resolve names
+	// over DNS-over-TLS instead so DialTCP gets real IPs to hand the exit node.
+	net.DefaultResolver = &net.Resolver{
+		PreferGo:     true,
+		StrictErrors: false,
+		Dial:         dialSecureDNS,
+	}
+}
+
+// dotServer is a DNS-over-TLS endpoint (addr:853 + TLS SNI).
+type dotServer struct {
+	addr string
+	sni  string
+}
+
+var dotServers = []dotServer{
+	{"77.88.8.8:853", "common.dot.dns.yandex.net"}, // Yandex, reachable in-region
+	{"8.8.8.8:853", "dns.google"},
+	{"1.1.1.1:853", "cloudflare-dns.com"},
+}
+
+// dialSecureDNS opens a DNS-over-TLS connection for net.Resolver, trying the
+// configured servers in order.
+func dialSecureDNS(ctx context.Context, _, _ string) (net.Conn, error) {
+	var lastErr error
+	for _, s := range dotServers {
+		d := tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: 6 * time.Second},
+			Config:    &tls.Config{ServerName: s.sni, MinVersion: tls.VersionTLS12},
+		}
+		conn, err := d.DialContext(ctx, "tcp", s.addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		utils.Debugf("[DNS] DoT %s failed: %v", s.addr, err)
+	}
+	return nil, lastErr
 }
 
 // Return codes for OpenFluxStartClient.

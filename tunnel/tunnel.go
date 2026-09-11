@@ -148,6 +148,7 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 	if ip == nil {
 		return nil, fmt.Errorf("IPv6 not supported")
 	}
+	utils.Debugf("[TUNNEL] DialTCP %s -> %s:%d", address, ip.String(), tcpAddr.Port)
 
 	nic := tcpip.NICID(1)
 	if t.isExitNode {
