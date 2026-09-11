@@ -39,7 +39,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
-        let ipv4 = NEIPv4Settings(addresses: ["10.10.0.2"], subnetMasks: ["255.255.255.0"])
+        // 10.10.10.2 is the address the exit node expects the client to use
+        // (it hardcodes return packets to 10.10.10.2), enabling pure L3
+        // forwarding with no gvisor stack in the extension.
+        let ipv4 = NEIPv4Settings(addresses: ["10.10.10.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
         // Exclude the transport's own backend (Yandex ranges) and the DoT DNS
         // servers so the extension's own connections bypass the tunnel instead
@@ -47,7 +50,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.excludedRoutes = Self.bypassRoutes
         settings.ipv4Settings = ipv4
         settings.mtu = 1500
-        let dns = NEDNSSettings(servers: ["8.8.8.8"])
+        // A benign in-tunnel DNS address: queries to it are captured and
+        // answered locally over DoT (the real resolvers are excluded above).
+        let dns = NEDNSSettings(servers: ["198.18.0.1"])
         dns.matchDomains = [""]
         settings.dnsSettings = dns
 
