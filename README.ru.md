@@ -26,19 +26,25 @@ TCP-пакеты передаются через Transport. На данный м
 ## Структура
 
 ```
-universal-bypass-tool/
-├── main.go
+OpenFlux/
+├── main.go                     # Точка входа CLI (клиент / выходная нода)
+├── export_ios.go               # cgo-мост для статической библиотеки iOS (build tag: ios)
 ├── transport/
-│   ├── transport.go      # Transport interface
-│   └── yandex/           # Yandex Docs backend
-│   └── oneme/            # MAX Messenger backend
+│   ├── transport.go            # Интерфейс Transport
+│   ├── compressor.go           # Обёртка сжатия
+│   ├── yandex/                 # Бэкенд Yandex Docs
+│   └── oneme/                  # Бэкенд MAX Messenger
 ├── tunnel/
-│   ├── tunnel.go         # TCP tunnel core
-│   ├── endpoint.go       # Virtual NIC
-│   └── rawsocket.go      # Raw socket (exit node)
-├── socks5/               # SOCKS5 server
-├── network/              # Checksums, packet parsing
-└── utils/                # Debug logging
+│   ├── tunnel.go               # Ядро TCP-тоннеля
+│   ├── endpoint.go             # Виртуальный NIC
+│   └── rawsocket_{linux,darwin,windows}.go  # Raw-сокет (выходная нода), по ОС
+├── socks5/                     # SOCKS5-сервер
+├── network/                    # Контрольные суммы, разбор пакетов
+├── utils/                      # Логирование
+├── ios-app/                    # iOS-клиент на SwiftUI (XcodeGen), линкует liboflux.a
+├── build_ios.sh                # Сборка статической библиотеки iOS (liboflux.a)
+├── build_ios_app.sh            # Сборка + архив + экспорт IPA приложения iOS
+└── build_android.sh            # Сборка клиентского бинарника Android
 ```
 
 ## Сборка (бинарник десктоп-клиента / выходной ноды)
