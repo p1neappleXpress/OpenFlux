@@ -8,9 +8,10 @@ import (
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
-        _ "github.com/wlynxg/anet"
+
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/cupsonline"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
@@ -25,24 +26,29 @@ var (
 )
 
 func main() {
-	//os.Setenv("GODEBUG", "netdns=go")
-        fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress\n")
 
-	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
+	exitNode := flag.Bool("exit-node", false, "Run as exit node")
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline)")
+	mode := flag.String("mode", "proxy", "Exit-node mode: proxy (default, works everywhere) or raw (Linux only, needs root)")
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
-	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (scoped RST drop)")
+	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (raw mode only, scoped RST drop)")
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
 	flag.Parse()
 
-	if localIP != "" {
+	exitMode, err := tunnel.ParseExitMode(*mode)
+	if err != nil {
+		log.Fatalf("--mode: %v", err)
+	}
+
+	if *exitNode && exitMode == tunnel.ExitModeRaw && localIP != "" {
 		tunnel.SetLocalIP(localIP)
 	}
 
@@ -64,6 +70,9 @@ func main() {
 	log.Printf("=== Universal Bypass Tool ===")
 	log.Printf("Mode: %s", map[bool]string{true: "EXIT NODE", false: "CLIENT"}[*exitNode])
 	log.Printf("Transport: %s", *transportType)
+	if *exitNode {
+		log.Printf("Exit mode: %s", exitMode.String())
+	}
 
 	config := transport.DefaultConfig()
 	var inner transport.Transport
@@ -76,6 +85,8 @@ func main() {
 	case "oneme":
 		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
 		inner = oneme.NewOneMeTransport(*exitNode, maxToken, uidint, config)
+	case "cupsonline":
+		inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, !*exitNode)
 	default:
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
@@ -85,9 +96,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("Read encryption key file: %v", err)
 		}
-		// The context is just a public KDF salt (domain separation between
-		// unrelated sessions using the same secret), not a secret itself -
-		// the document URL is a convenient, already-shared identifier.
 		context := *transportType
 		if globalDocUrl != "" {
 			context = globalDocUrl
@@ -106,21 +114,22 @@ func main() {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
 
-	tun := tunnel.NewTCPTunnel(trans, *exitNode)
+	tun := tunnel.NewTCPTunnelMode(trans, *exitNode, exitMode)
 
 	if *exitNode {
-		log.Printf("Running as EXIT NODE (needs root for raw socket)")
-		if localIP != "" {
-			// Scoped: only drop kernel RSTs originating from the tunnel's
-			// egress IP, leaving the host's other services (and their
-			// closed-port RSTs) untouched.
-			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
+		if exitMode == tunnel.ExitModeRaw {
+			log.Printf("Running as EXIT NODE (raw mode)")
+			if localIP != "" {
+				log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
+			} else {
+				log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
+				log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
+				log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s <ip> -j DROP")
+				log.Printf("! Host-wide fallback (drops ALL outbound RST; makes closed ports look filtered):")
+				log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+			}
 		} else {
-			log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
-			log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
-			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s <ip> -j DROP")
-			log.Printf("! Host-wide fallback (drops ALL outbound RST; makes closed ports look filtered):")
-			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+			log.Printf("Running as EXIT NODE (proxy mode)")
 		}
 		select {}
 	} else {

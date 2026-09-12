@@ -46,3 +46,8 @@ ios-app/DerivedData/
 
 # App Store Connect API private key — never commit
 *.p8
+app-linux
+app-darwin
+app.exe
+universal-bypass-tool
+universal-bypass-tool.exe
