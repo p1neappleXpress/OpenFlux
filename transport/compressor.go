@@ -71,5 +71,5 @@ func decompress(data []byte) ([]byte, error) {
 	}
 
 	r := lz4.NewReader(bytes.NewReader(data[1:]))
-	return io.ReadAll(r)
+	return io.ReadAll(io.LimitReader(r, 10*1024*1024))
 }
