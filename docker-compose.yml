@@ -1,0 +1,49 @@
+# OpenFlux local runner. One image, two mutually independent services —
+# the two ends never talk to each other directly; they meet on the transport
+# channel (the Yandex doc / the MAX call). Start only the end you need:
+#
+#   docker compose --profile client     up -d --build   # SOCKS5 on 127.0.0.1:1080
+#   docker compose --profile exit-node  up -d --build
+#
+# Configure via .env (see .env.example) or inline env vars:
+#   DOC_URL=... MAX_TOKEN=... MAX_UID=... TRANSPORT=vyandex docker compose --profile client up -d
+#
+# Privileges, deliberately asymmetric:
+#   client     — none. It dials out like a browser and serves SOCKS5 locally.
+#   exit-node  — NET_RAW (raw sockets) + NET_ADMIN (the RST-drop rule), confined
+#                to this container's netns; the rule can never touch the host.
+
+services:
+  client:
+    build: .
+    image: openflux:local
+    restart: unless-stopped
+    profiles: [client]
+    environment:
+      ROLE: client
+      TRANSPORT: ${TRANSPORT:-yandex}
+      URL: ${DOC_URL:-}
+      MAX_TOKEN: ${MAX_TOKEN:-}
+      MAX_UID: ${MAX_UID:-}
+      SOCKS5_LISTEN: ${SOCKS5_LISTEN:-:1080}
+      DEBUG: ${DEBUG:-0}
+    # No auth on the SOCKS5 server — keep it bound to the host loopback only.
+    ports:
+      - "127.0.0.1:1080:1080"
+
+  exit-node:
+    build: .
+    image: openflux:local
+    restart: unless-stopped
+    profiles: [exit-node]
+    environment:
+      ROLE: exit-node
+      TRANSPORT: ${TRANSPORT:-yandex}
+      URL: ${DOC_URL:-}
+      MAX_TOKEN: ${MAX_TOKEN:-}
+      MAX_UID: ${MAX_UID:-}
+      LOCAL_IP: ${EXIT_LOCAL_IP:-}
+      DEBUG: ${DEBUG:-0}
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
