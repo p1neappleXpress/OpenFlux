@@ -291,7 +291,7 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 // and returns the raw DNS answer, trying each server in turn.
 func dnsOverTLS(query []byte) ([]byte, error) {
 	var lastErr error
-	for _, s := range dotServers {
+	for _, s := range getDoTServers() {
 		ans, err := dotQueryOne(s, query)
 		if err == nil {
 			return ans, nil

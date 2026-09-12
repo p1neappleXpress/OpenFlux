@@ -87,17 +87,78 @@ type dotServer struct {
 	sni  string
 }
 
-var dotServers = []dotServer{
-	{"77.88.8.8:853", "common.dot.dns.yandex.net"}, // Yandex, reachable in-region
-	{"8.8.8.8:853", "dns.google"},
-	{"1.1.1.1:853", "cloudflare-dns.com"},
+func defaultDoTServers() []dotServer {
+	return []dotServer{
+		{"77.88.8.8:853", "common.dot.dns.yandex.net"}, // Yandex, reachable in-region
+		{"8.8.8.8:853", "dns.google"},
+		{"1.1.1.1:853", "cloudflare-dns.com"},
+	}
+}
+
+var (
+	dotMu      sync.RWMutex
+	dotServers = defaultDoTServers()
+)
+
+// getDoTServers returns a snapshot of the configured DoT resolvers. Callers must
+// not mutate the result; it is safe to read concurrently with OpenFluxSetDoTResolver.
+func getDoTServers() []dotServer {
+	dotMu.RLock()
+	defer dotMu.RUnlock()
+	out := make([]dotServer, len(dotServers))
+	copy(out, dotServers)
+	return out
+}
+
+// OpenFluxSetDoTResolver overrides the DNS-over-TLS upstreams used to resolve
+// names (defeating local DNS poisoning). spec is a ";"-separated list of
+// "addr[:port]@sni" entries, e.g. "1.1.1.1@cloudflare-dns.com". Port defaults to
+// 853 and SNI defaults to the host if omitted. An empty spec restores the
+// built-in defaults (Yandex/Google/Cloudflare). Call before starting a tunnel.
+//
+//export OpenFluxSetDoTResolver
+func OpenFluxSetDoTResolver(spec *C.char) {
+	s := strings.TrimSpace(C.GoString(spec))
+	dotMu.Lock()
+	defer dotMu.Unlock()
+	if s == "" {
+		dotServers = defaultDoTServers()
+		utils.Debugf("[DNS] resolver reset to defaults")
+		return
+	}
+	var servers []dotServer
+	for _, part := range strings.Split(s, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		addr, sni := part, ""
+		if i := strings.LastIndex(part, "@"); i >= 0 {
+			addr, sni = strings.TrimSpace(part[:i]), strings.TrimSpace(part[i+1:])
+		}
+		if !strings.Contains(addr, ":") {
+			addr += ":853"
+		}
+		if sni == "" {
+			if host, _, err := net.SplitHostPort(addr); err == nil {
+				sni = host
+			} else {
+				sni = addr
+			}
+		}
+		servers = append(servers, dotServer{addr: addr, sni: sni})
+	}
+	if len(servers) > 0 {
+		dotServers = servers
+		utils.Debugf("[DNS] resolver set: %v", servers)
+	}
 }
 
 // dialSecureDNS opens a DNS-over-TLS connection for net.Resolver, trying the
 // configured servers in order.
 func dialSecureDNS(ctx context.Context, _, _ string) (net.Conn, error) {
 	var lastErr error
-	for _, s := range dotServers {
+	for _, s := range getDoTServers() {
 		d := tls.Dialer{
 			NetDialer: &net.Dialer{Timeout: 6 * time.Second},
 			Config:    &tls.Config{ServerName: s.sni, MinVersion: tls.VersionTLS12},

@@ -11,10 +11,30 @@ struct ContentView: View {
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
+    @AppStorage("dnsPreset") private var dnsPreset: String = "default"
+    @AppStorage("dnsCustom") private var dnsCustom: String = ""
     @State private var showInfo = false
 
     private var transport: TransportKind {
         TransportKind(rawValue: transportRaw) ?? .yandex
+    }
+
+    /// DoT resolver spec passed to the Go core ("" = built-in defaults).
+    private var dnsSpec: String {
+        switch dnsPreset {
+        case "cloudflare": return "1.1.1.1@cloudflare-dns.com"
+        case "google":     return "8.8.8.8@dns.google"
+        case "quad9":      return "9.9.9.9@dns.quad9.net"
+        case "adguard":    return "94.140.14.14@dns.adguard-dns.com"
+        case "custom":     return dnsCustom.trimmingCharacters(in: .whitespaces)
+        default:           return ""
+        }
+    }
+
+    /// Push the current DoT resolver into the in-app Go core (the SOCKS/test
+    /// path). The VPN extension gets it separately via providerConfiguration.
+    private func applyDNS() {
+        dnsSpec.withCString { OpenFluxSetDoTResolver(UnsafeMutablePointer(mutating: $0)) }
     }
 
     private var canStart: Bool {
@@ -43,6 +63,8 @@ struct ContentView: View {
 
                     portField
 
+                    dnsSection
+
                     controls
 
                     vpnSection
@@ -52,7 +74,12 @@ struct ContentView: View {
                 .padding()
             }
             .navigationTitle("OpenFlux")
-            .onAppear { OpenFluxSetDebug(debugLog ? 1 : 0) }
+            .onAppear {
+                OpenFluxSetDebug(debugLog ? 1 : 0)
+                applyDNS()
+            }
+            .onChange(of: dnsPreset) { _ in applyDNS() }
+            .onChange(of: dnsCustom) { _ in applyDNS() }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showInfo = true } label: {
@@ -123,6 +150,32 @@ struct ContentView: View {
         }
     }
 
+    private var dnsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("DNS (DNS-over-TLS)").font(.caption).foregroundColor(.secondary)
+            Picker("DNS", selection: $dnsPreset) {
+                Text("Default (Yandex/Google/CF)").tag("default")
+                Text("Cloudflare").tag("cloudflare")
+                Text("Google").tag("google")
+                Text("Quad9").tag("quad9")
+                Text("AdGuard").tag("adguard")
+                Text("Custom…").tag("custom")
+            }
+            .pickerStyle(.menu)
+            .disabled(tunnel.running)
+            if dnsPreset == "custom" {
+                TextField("1.1.1.1@cloudflare-dns.com", text: $dnsCustom)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(tunnel.running)
+                Text("Format: address[:port]@tls-hostname")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+        }
+    }
+
     private var vpnSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Divider()
@@ -139,7 +192,7 @@ struct ContentView: View {
             } else {
                 Button {
                     vpn.start(transport: transport.rawValue, url: docURL,
-                              maxToken: maxToken, maxUid: maxUid)
+                              maxToken: maxToken, maxUid: maxUid, dns: dnsSpec)
                 } label: {
                     Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
                 }

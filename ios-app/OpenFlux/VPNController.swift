@@ -26,7 +26,7 @@ final class VPNController: ObservableObject {
         refreshStatus()
     }
 
-    func start(transport: String, url: String, maxToken: String, maxUid: String) {
+    func start(transport: String, url: String, maxToken: String, maxUid: String, dns: String) {
         Task {
             let m = manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
@@ -35,10 +35,16 @@ final class VPNController: ObservableObject {
             proto.providerConfiguration = [
                 "transport": transport, "url": url,
                 "maxToken": maxToken, "maxUid": maxUid,
+                "dns": dns,
             ]
             m.protocolConfiguration = proto
             m.localizedDescription = "OpenFlux"
             m.isEnabled = true
+            // Auto-reconnect: with on-demand enabled, iOS relaunches the tunnel
+            // whenever it drops (extension killed, network change, etc.) instead
+            // of leaving the user to toggle it back on manually.
+            m.isOnDemandEnabled = true
+            m.onDemandRules = [NEOnDemandRuleConnect()]
             do {
                 try await m.saveToPreferences()
                 try await m.loadFromPreferences()   // required before starting
@@ -51,7 +57,16 @@ final class VPNController: ObservableObject {
     }
 
     func stop() {
-        manager?.connection.stopVPNTunnel()
+        Task {
+            // Disable on-demand first, otherwise iOS would immediately reconnect
+            // the tunnel we're trying to stop.
+            if let m = manager {
+                m.isOnDemandEnabled = false
+                try? await m.saveToPreferences()
+                try? await m.loadFromPreferences()
+            }
+            manager?.connection.stopVPNTunnel()
+        }
     }
 
     @objc private func statusChanged() { refreshStatus() }
