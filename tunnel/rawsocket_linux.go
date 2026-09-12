@@ -120,6 +120,9 @@ func (e *RawSocketEndpoint) readLoop() {
 			pktCopy[11] = byte(ipChecksumVal & 0xFF)
 
 			ipHeaderLen := int(pktCopy[0]&0x0F) * 4
+			if ipHeaderLen+20 > len(pktCopy) {
+				continue
+			}
 			tcpHeader := pktCopy[ipHeaderLen:]
 			srcIPBytes := [4]byte{pktCopy[12], pktCopy[13], pktCopy[14], pktCopy[15]}
 			dstIPBytes := [4]byte{pktCopy[16], pktCopy[17], pktCopy[18], pktCopy[19]}
@@ -159,6 +162,9 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 		pktCopy[11] = byte(ipChecksumVal & 0xFF)
 
 		ipHeaderLen := int(pktCopy[0]&0x0F) * 4
+		if ipHeaderLen+20 > len(pktCopy) {
+			continue
+		}
 		tcpHeader := pktCopy[ipHeaderLen:]
 		srcIPBytes := [4]byte{pktCopy[12], pktCopy[13], pktCopy[14], pktCopy[15]}
 		dstIPBytes := [4]byte{pktCopy[16], pktCopy[17], pktCopy[18], pktCopy[19]}
