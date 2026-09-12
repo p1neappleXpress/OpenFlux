@@ -18,6 +18,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/pion/webrtc/v3 v3.3.6
 	github.com/wlynxg/anet v0.0.5
+	golang.org/x/crypto v0.51.0
 )
 
 require (
@@ -41,7 +42,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/testify v1.9.0 // indirect
 	github.com/xjasonlyu/windivert-go v0.0.0-20201010013527-4239d0afa76f // indirect
-	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
