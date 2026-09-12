@@ -1,0 +1,28 @@
+# Keep the build context lean: only Go sources + go.mod/go.sum are needed
+# (export_ios*.go compile out via //go:build ios; mobile app dirs are inert).
+.git
+.gitignore
+.idea
+.claude
+
+# Prebuilt binaries — never belong in the image.
+universal-bypass-tool
+universal-bypass-tool-*
+output/
+
+# Mobile client sources & scripts — not part of the linux binary.
+ios-app/
+build_android.sh
+build_ios.sh
+build_ios_app.sh
+
+# Local config & docs
+.env
+.env.local
+README.md
+README.ru.md
+
+# Captures / artifacts
+*.pcap
+*.pcapng
+capture.txt
