@@ -47,9 +47,16 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 ## Обзор
 
-TCP-пакеты передаются через Transport. На данный момент доступны два транспорта:
+TCP-пакеты передаются через Transport. На данный момент доступны три транспорта:
 1. Yandex — отправляет пакеты через курсорные сообщения Yandex Docs;
-2. Max — отправляет пакеты через WebRTC DataChannel.
+2. Max — отправляет пакеты через WebRTC DataChannel;
+3. Cups.online — отправляет пакеты через комнаты live-coding интервью (каналы Centrifugo).
+   - Cups.online — публичный сервис интервью; созданные комнаты открыты
+     любому, кто знает их UUID.
+   - Используйте --encryption-key-file, если важна конфиденциальность.
+   - Не злоупотребляйте эндпоинтом создания комнат; выходная нода создаёт
+     небольшое фиксированное число комнат (по умолчанию 4) на старте и держит
+     их всю сессию.
    - **Не использовать** основной или важный MAX-аккаунт.
    - **Не использовать** аккаунт, удаление или потеря доступа к которому критичны.
    - Использование через **внешний VPS** может привести к **ограничению аккаунта**.
@@ -69,7 +76,8 @@ OpenFlux/
 │   ├── transport.go            # Интерфейс Transport
 │   ├── compressor.go           # Обёртка сжатия
 │   ├── yandex/                 # Бэкенд Yandex Docs
-│   └── oneme/                  # Бэкенд MAX Messenger
+│   ├── oneme/                  # Бэкенд MAX Messenger
+│   └── cupsonline/             # Бэкенд Cups.online (комнаты интервью)
 ├── tunnel/
 │   ├── tunnel.go               # Ядро TCP-тоннеля
 │   ├── endpoint.go             # Виртуальный NIC
@@ -150,11 +158,11 @@ sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 | `--client`    |                     | Запуск в режиме клиента        |
 | `--exit-node` |                     | Запуск в режиме ноды           |
 | `--socks5`    | `:1080`             | Адрес SOCKS5 прокси            |
-| `--url`       | `https://localhost` | URL документа (Yandex Docs)    |
+| `--url`       | `https://localhost` | URL Yandex Docs, или base64-список комнат (`cupsonline`) на клиенте |
 | `--maxToken`  | ``                  | Токен авторизации (Max)        |
 | `--maxUid`    | ``                  | ID пользователя (Max)          |
 | `--debug`     | `false`             | Включить подробное логирование |
-| `--transport` | `yandex`            | Выбор транспорта               |
+| `--transport` | `yandex`            | `yandex`, `vyandex`, `oneme`, `cupsonline` |
 
 ## Реализация собственных транспортов
 

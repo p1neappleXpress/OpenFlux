@@ -46,9 +46,16 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 ## Overview
 
-TCP packets are sent via Transport. Currently, there are two transports available:
+TCP packets are sent via Transport. Currently, there are three transports available:
 1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets via WebRTC DataChannel
+2. Max - sends packets via WebRTC DataChannel;
+3. Cups.online - sends packets via live-coding interview rooms (Centrifugo channels)
+    WARNING:
+   - Cups.online is a public interview service; the rooms you create are open to
+     anyone who knows their UUID.
+   - Use --encryption-key-file if you care about confidentiality.
+   - Do not abuse the room-creation endpoint; the exit node creates a small
+     fixed number of rooms (default 4) at startup and keeps them for the session.
     WARNING:
    - **Do not use** your primary or important MAX account.
    - **Do not use** an account whose deletion or loss of access would be critical.   
@@ -68,7 +75,8 @@ OpenFlux/
 │   ├── transport.go            # Transport interface
 │   ├── compressor.go           # Compression wrapper
 │   ├── yandex/                 # Yandex Docs backend
-│   └── oneme/                  # MAX Messenger backend
+│   ├── oneme/                  # MAX Messenger backend
+│   └── cupsonline/             # Cups.online interview-room backend
 ├── tunnel/
 │   ├── tunnel.go               # TCP tunnel core
 │   ├── endpoint.go             # Virtual NIC
@@ -148,11 +156,11 @@ Then set up SOCKS5 proxy in your browser at localhost:1080.
 | `--client`    |                     | Run as client              |
 | `--exit-node` |                     | Run as exit node           |
 | `--socks5`    | `:1080`             | SOCKS5 listen address      |
-| `--url`       | `https://localhost` | Document URL (Yandex Docs) |
+| `--url`       | `https://localhost` | Yandex Docs URL, or `cupsonline` room list (base64) on the client |
 | `--maxToken`  | ``                  | Auth token (Max)           |
 | `--maxUid`    | ``                  | User ID (Max)              |
 | `--debug`     | `false`             | Enable verbose logging     |
-| `--transport` | `yandex`            | Select transport backend   |
+| `--transport` | `yandex`            | `yandex`, `vyandex`, `oneme`, `cupsonline` |
 
 ## Implementing custom transports
 
