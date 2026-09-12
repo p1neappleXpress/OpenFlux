@@ -132,6 +132,14 @@ func (e *RawSocketEndpoint) readLoop() {
 			if e.sendToTransport != nil {
 				e.sendToTransport(pktCopy)
 			}
+
+			// RST tears the connection down: relay this one so the client
+			// closes, then stop tracking the port. Otherwise a server RST
+			// storm keeps getting forwarded and floods the low-bandwidth
+			// transport channel instead of real data.
+			if flags&0x04 != 0 {
+				e.activePorts.Delete(dstPort)
+			}
 		}
 	}
 }
