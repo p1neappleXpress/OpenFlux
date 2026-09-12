@@ -47,7 +47,7 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 ## Обзор
 
-TCP-пакеты передаются через Transport. На данный момент доступны два транспорта:
+TCP-пакеты передаются через Transport. На данный момент доступны три транспорта:
 1. Yandex — отправляет пакеты через курсорные сообщения Yandex Docs;
 2. Max — отправляет пакеты через WebRTC DataChannel.
    - **Не использовать** основной или важный MAX-аккаунт.
@@ -55,6 +55,10 @@ TCP-пакеты передаются через Transport. На данный м
    - Использование через **внешний VPS** может привести к **ограничению аккаунта**.
    - **Ограничение может сохраняться** после остановки OpenFlux.
    - MAX transport следует считать **экспериментальным** до выяснения механизма блокировки.
+3. Cups.online — отправляет пакеты через комнаты live-coding интервью (каналы Centrifugo).
+   - Cups.online — публичный сервис интервью; созданные комнаты открыты любому, кто знает их UUID.
+   - Используйте --encryption-key-file, если важна конфиденциальность.
+   - Не злоупотребляйте эндпоинтом создания комнат; выходная нода создаёт небольшое фиксированное число комнат (по умолчанию 4) на старте и держит их всю сессию.
 
 
 Клиентская часть запускает SOCKS5-прокси, выходная нода декапсулирует и пересылает пакеты в пункт назначения.
@@ -69,11 +73,13 @@ OpenFlux/
 │   ├── transport.go            # Интерфейс Transport
 │   ├── compressor.go           # Обёртка сжатия
 │   ├── yandex/                 # Бэкенд Yandex Docs
-│   └── oneme/                  # Бэкенд MAX Messenger
+│   ├── oneme/                  # Бэкенд MAX Messenger
+│   └── cupsonline/             # Бэкенд Cups.online (комнаты интервью)
 ├── tunnel/
-│   ├── tunnel.go               # Ядро TCP-тоннеля
+│   ├── tunnel.go               # Ядро TCP-тоннеля (proxy + raw режимы)
 │   ├── endpoint.go             # Виртуальный NIC
-│   └── rawsocket_{linux,darwin,windows}.go  # Raw-сокет (выходная нода), по ОС
+│   ├── rawsocket_linux.go      # Raw-сокет (Linux, root)
+│   └── rawsocket_{darwin,windows}.go  # stubs (raw не поддерживается)
 ├── socks5/                     # SOCKS5-сервер
 ├── network/                    # Контрольные суммы, разбор пакетов
 ├── utils/                      # Логирование
@@ -105,33 +111,21 @@ export XCODE_PATH="<путь до вашего Xcode.app>" # опциональ�
 ## Использование
 
 ### 1. Настройка выходной ноды
-1. У вас должен быть root-доступ выходной ноде;
-2. Поддерживается только устаревший редактор документов Yandex (переключается в настройках интерфейса).
 
-TCP-соединения выходной ноды живут в userspace-стеке (gvisor), у ядра нет для
-них сокета, и оно слало бы RST на каждый ответный пакет — туннель бы рвался.
-Этот RST надо подавить, но **точечно**, не на весь хост. Глухое
-`-j DROP` на все исходящие RST превращает закрытые порты в «молчащие»
-(сканер видит `filtered` вместо `closed`) и мешает хосту нормально сбрасывать
-посторонние соединения.
+Выходная нода запускает userspace TCP/IP-стек (gvisor) в одном из двух режимов:
 
-Рекомендуется (сужение по выделенному egress-IP):
+- **proxy** (по умолчанию, рекомендуется) — каждое TCP-соединение от клиента терминируется локально и переоткрывается обычным `net.Dial` к настоящему адресату. **Без root, без raw-сокетов, без iptables** — обычный процесс. Работает на Linux, Windows, macOS.
+- **raw** — gVisor форвардит сырые IP-пакеты через raw-сокет (только Linux, нужен root + точечное правило iptables на дроп RST). Чуть быстрее end-to-end, но требует привилегий.
+
+Запуск в proxy-режиме (по умолчанию):
 ```bash
-# повесьте на машину второй/алиас IP под туннель, напр. 203.0.113.10
-sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s 203.0.113.10 -j DROP
-sudo ./universal-bypass-tool --exit-node --local-ip 203.0.113.10 \
-    --url "YOUR_YANDEX_DOC_URL" --debug
+./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 ```
-Ещё чище — запускать ноду в отдельном network namespace / контейнере, тогда
-правило вообще не трогает сервисы хоста. `-m owner --uid-owner` тут **не
-работает**: рвущие туннель RST генерит ядро без сокета-владельца, и owner-матч
-не срабатывает.
 
-Запасной вариант на весь хост (только на однозадачной машине, с пониманием
-последствий):
+Запуск в raw-режиме (Linux, root):
 ```bash
-sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
-sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
+sudo ./universal-bypass-tool --exit-node --mode raw --local-ip 203.0.113.10 \
+    --url "YOUR_YANDEX_DOC_URL" --debug
 ```
 
 ### 1. Настройка десктопного клиента:
@@ -142,6 +136,34 @@ sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 ```
 
 Затем настройте SOCKS5-прокси в браузере на localhost:1080.
+
+### 2. Использование транспорта Cups.online
+
+Cups.online — публичный сервис live-coding интервью. Каждая комната интервью — это канал Centrifugo (`$shared_editor:room-<uuid>`), переносящий произвольные base64-блобы — ровно то, что нужно OpenFlux для пересылки TCP-пакетов.
+
+**Выходная нода:** создаёт небольшой набор комнат на старте и печатает base64-список комнат, который клиент должен использовать:
+
+```bash
+./universal-bypass-tool --exit-node --transport cupsonline --debug
+```
+
+```
+=== COPY THIS TO CLIENT ===
+eyJyb29tcyI6WyI0YTFh...base64...
+===========================
+```
+
+**Клиент:** вставьте напечатанный base64 в `--url`:
+
+```bash
+./universal-bypass-tool --client --transport cupsonline \
+    --url "eyJyb29tcyI6WyI0YTFh...base64..." --socks5 :1080 --debug
+```
+
+Примечания:
+- Список комнат — это ключ сессии: комнаты живут, пока выходная нода их держит; каждый рестарт ноды генерирует новый список.
+- TCP-потоки прибиты к одной комнате по flow-hash, поэтому порядок пакетов внутри соединения сохраняется.
+- Добавьте `--encryption-key-file <path>` на обеих сторонах, если не хотите, чтобы Cups.online видел содержимое.
 
 ## Флаги
 
@@ -154,7 +176,9 @@ sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 | `--maxToken`  | ``                  | Токен авторизации (Max)        |
 | `--maxUid`    | ``                  | ID пользователя (Max)          |
 | `--debug`     | `false`             | Включить подробное логирование |
-| `--transport` | `yandex`            | Выбор транспорта               |
+| `--transport` | `yandex`            | `yandex`, `vyandex`, `oneme`, `cupsonline` |
+| `--mode`      | `proxy`             | Режим выходной ноды: `proxy` (по умолчанию) или `raw` (только Linux, нужен root) |
+| `--local-ip`  | ``                  | Egress IP выходной ноды (только raw, точечный дроп RST) |
 
 ## Реализация собственных транспортов
 
