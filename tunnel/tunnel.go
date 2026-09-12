@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/waiter"
 
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
@@ -22,7 +24,6 @@ type TCPTunnel struct {
 	tunnelEP    *TunnelLinkEndpoint
 	transport   transport.Transport
 	isExitNode  bool
-	rawEP       *RawSocketEndpoint
 	startTime   time.Time
 	packetCount atomic.Uint64
 }
@@ -61,11 +62,13 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
-        SetTCPBuffers(t.gvisorStack)
+	SetTCPBuffers(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
-		trans.Send(data)
+		if err := trans.Send(data); err != nil {
+			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
+		}
 	}
 	t.tunnelEP = tunnelEP
 
@@ -88,51 +91,58 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 	return t
 }
 
+// setupExitNode — proxy-режим, без raw sockets и WinDivert.
+//
+// gVisor принимает IP-пакеты от клиента (tunnel NIC), терминирует каждую
+// TCP-сессию локально через tcp.NewForwarder и открывает свежий net.Dial
+// к настоящему адресату. Ответы сплайсятся обратно в gVisor.
 func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
-	localIP := getLocalIP()
-	utils.Debugf("[TUNNEL] EXIT NODE - Local IP: %s", localIP)
+	utils.Debugf("[TUNNEL] EXIT NODE - proxy mode (no raw sockets)")
 
-	rawEP, err := NewRawSocketEndpoint(tcpip.NICID(2))
-	if err != nil {
-		utils.Debugf("[TUNNEL] Raw socket error: %v", err)
-		return
-	}
-
-	t.rawEP = rawEP
-	rawEP.SetTransportSender(func(data []byte) {
-		t.transport.Send(data)
-	})
-
-	internetNIC := tcpip.NICID(2)
-	if err := t.gvisorStack.CreateNIC(internetNIC, rawEP); err != nil {
-		utils.Debugf("[TUNNEL] CreateNIC internet error: %v", err)
-		return
-	}
-
-	var ipBytes [4]byte
-	fmt.Sscanf(localIP, "%d.%d.%d.%d", &ipBytes[0], &ipBytes[1], &ipBytes[2], &ipBytes[3])
-	internetAddr := tcpip.AddrFrom4(ipBytes)
-	t.gvisorStack.AddProtocolAddress(internetNIC, tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   internetAddr,
-			PrefixLen: 24,
-		},
-	}, stack.AddressProperties{})
-
-	t.gvisorStack.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
+	// Принимаем пакеты на любой dst IP и отвечаем с любого src IP.
+	t.gvisorStack.SetPromiscuousMode(tunnelNIC, true)
+	t.gvisorStack.SetSpoofing(tunnelNIC, true)
 	t.gvisorStack.AddRoute(tcpip.Route{
 		Destination: header.IPv4EmptySubnet,
-		NIC:         internetNIC,
+		NIC:         tunnelNIC,
 	})
 
-	tunnelSubnet := tcpip.AddressWithPrefix{
-		Address:   tcpip.AddrFrom4([4]byte{10, 10, 10, 0}),
-		PrefixLen: 24,
-	}.Subnet()
-	t.gvisorStack.AddRoute(tcpip.Route{
-		Destination: tunnelSubnet,
-		NIC:         tunnelNIC,
+	fwd := tcp.NewForwarder(t.gvisorStack, 0, 2048, t.handleExitTCP)
+	t.gvisorStack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+}
+
+// handleExitTCP вызывается gVisor'ом на каждый входящий SYN от клиента.
+func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
+	id := r.ID()
+	dest := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+
+	var wq waiter.Queue
+	ep, tErr := r.CreateEndpoint(&wq)
+	if tErr != nil {
+		utils.Debugf("[EXIT] CreateEndpoint %s: %v", dest, tErr)
+		r.Complete(true)
+		return
+	}
+	r.Complete(false)
+	local := gonet.NewTCPConn(&wq, ep)
+
+	utils.SafeGo("exit.flow", func() {
+		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+		if err != nil {
+			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
+			local.Close()
+			return
+		}
+		utils.Debugf("[EXIT] %s connected", dest)
+
+		go func() {
+			io.Copy(remote, local)
+			remote.Close()
+			local.Close()
+		}()
+		io.Copy(local, remote)
+		local.Close()
+		remote.Close()
 	})
 }
 
@@ -164,13 +174,8 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 	}
 	utils.Debugf("[TUNNEL] DialTCP %s -> %s:%d", address, ip.String(), tcpAddr.Port)
 
-	nic := tcpip.NICID(1)
-	if t.isExitNode {
-		nic = tcpip.NICID(2)
-	}
-
 	conn, err := gonet.DialTCP(t.gvisorStack, tcpip.FullAddress{
-		NIC:  nic,
+		NIC:  tcpip.NICID(1),
 		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
 		Port: uint16(tcpAddr.Port),
 	}, ipv4.ProtocolNumber)
@@ -199,26 +204,4 @@ func (t *TCPTunnel) printStats() {
 			stats.TCP.Retransmits.Value(),
 		)
 	}
-}
-
-// localIPOverride, when set, is the address the exit node uses as its egress
-// IP (both for source rewriting and the return-packet filter). Point it at a
-// dedicated alias IP so the RST-drop iptables rule can be scoped with
-// `-s <ip>` instead of dropping RSTs host-wide.
-var localIPOverride string
-
-// SetLocalIP overrides the auto-detected egress IP for the exit node.
-func SetLocalIP(ip string) { localIPOverride = ip }
-
-func getLocalIP() string {
-	if localIPOverride != "" {
-		return localIPOverride
-	}
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "192.168.1.100"
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
 }

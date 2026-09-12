@@ -180,6 +180,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		if existingSession == nil {
 			utils.SafeGo("yandex.writer", t.writerLoop)
+			utils.Debugf("[YDOCS] writer loop started")
+		} else {
+			utils.Debugf("[YDOCS] reusing existing session/writer")
 		}
 
 		// Auth - use safeWrite

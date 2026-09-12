@@ -38,6 +38,7 @@ func (e *TunnelLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 	for _, pkt := range pkts.AsSlice() {
 		data := pkt.ToView().ToSlice()
 		e.packetOut.Add(1)
+		utils.Debugf("-> %d bytes - %s\n", len(data), network.ParsePacketInfo(data))
 		if e.onOutgoingPacket != nil {
 			e.onOutgoingPacket(data)
 		}
@@ -46,7 +47,7 @@ func (e *TunnelLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 	return n, nil
 }
 
-func (e *TunnelLinkEndpoint) MTU() uint32                                 { return 1500 }
+func (e *TunnelLinkEndpoint) MTU() uint32 { return TunnelMTU() }
 func (e *TunnelLinkEndpoint) MaxHeaderLength() uint16                      { return 0 }
 func (e *TunnelLinkEndpoint) LinkAddress() tcpip.LinkAddress               { return "\x02\x00\x00\x00\x00\x01" }
 func (e *TunnelLinkEndpoint) Capabilities() stack.LinkEndpointCapabilities { return stack.CapabilityNone }

@@ -8,9 +8,10 @@ import (
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
-        _ "github.com/wlynxg/anet"
+
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/cupsonline"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
@@ -21,33 +22,71 @@ var (
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
-	localIP      string
+	ifaceName    string
+	mtuOverride  int
 )
 
 func main() {
-	//os.Setenv("GODEBUG", "netdns=go")
-        fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress\n")
 
-	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
+	exitNode := flag.Bool("exit-node", false, "Run as exit node")
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
-	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline)")
+	flag.StringVar(&globalDocUrl, "url", "http://#",
+		"Yandex doc URL, or (cupsonline client) base64 room list, or ignored (cupsonline exit-node)")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
-	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (scoped RST drop)")
+	flag.StringVar(&ifaceName, "iface", "",
+		"Interface for client egress (e.g. wg0, eth0). Picks MTU from it. Empty = auto.")
+	flag.IntVar(&mtuOverride, "mtu", 0,
+		"Override client-interface MTU, in bytes. Set on the CLIENT if a tunnel/VPN with MTU<1500 is in the path. 0 = auto.")
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
-	flag.Parse()
 
-	if localIP != "" {
-		tunnel.SetLocalIP(localIP)
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s [--exit-node|--client] [options]
+
+Modes:
+  --exit-node   Run as the exit node (proxy mode, no raw sockets).
+  --client      Run as the client (SOCKS5 proxy on the local machine).
+
+MTU / interface (client side, optional):
+
+  The CLIENT generates TCP segments, so its MTU decides how big those
+  segments are. If a tunnel/VPN (WireGuard, OpenVPN, etc.) sits between
+  the client and the exit node with MTU < 1500, set the MTU on the CLIENT,
+  otherwise it emits ~1452-byte segments that get dropped and nothing works.
+
+  Priority: --mtu overrides --iface's MTU. If neither is set, MTU is
+  auto-detected from the route to 8.8.8.8, falling back to 1500.
+
+Transports:
+  yandex       Yandex.Docs document (--url)
+  vyandex      Yandex Volga (--url)
+  oneme        MAX messenger (--maxToken, --maxUid)
+  cupsonline   Cups.online interview rooms
+                 exit-node: --url ignored, prints base64 room list on start
+                 client:    --url is that base64 room list
+
+Options:
+`, os.Args[0])
+		flag.PrintDefaults()
 	}
 
-	// The exit node often runs on a tiny VPS; keep the heap tight under load
-	// (GC aggressively). Set GOMEMLIMIT in the environment for a hard soft-cap.
+	flag.Parse()
+
+	if ifaceName != "" {
+		if err := tunnel.SetInterface(ifaceName); err != nil {
+			log.Fatalf("Select interface: %v", err)
+		}
+	}
+	if mtuOverride > 0 {
+		tunnel.SetMTUOverride(mtuOverride)
+	}
+
 	if *exitNode {
 		godebug.SetGCPercent(20)
 	}
@@ -76,6 +115,8 @@ func main() {
 	case "oneme":
 		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
 		inner = oneme.NewOneMeTransport(*exitNode, maxToken, uidint, config)
+	case "cupsonline":
+		inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, !*exitNode)
 	default:
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
@@ -85,9 +126,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("Read encryption key file: %v", err)
 		}
-		// The context is just a public KDF salt (domain separation between
-		// unrelated sessions using the same secret), not a secret itself -
-		// the document URL is a convenient, already-shared identifier.
 		context := *transportType
 		if globalDocUrl != "" {
 			context = globalDocUrl
@@ -109,19 +147,7 @@ func main() {
 	tun := tunnel.NewTCPTunnel(trans, *exitNode)
 
 	if *exitNode {
-		log.Printf("Running as EXIT NODE (needs root for raw socket)")
-		if localIP != "" {
-			// Scoped: only drop kernel RSTs originating from the tunnel's
-			// egress IP, leaving the host's other services (and their
-			// closed-port RSTs) untouched.
-			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
-		} else {
-			log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
-			log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
-			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s <ip> -j DROP")
-			log.Printf("! Host-wide fallback (drops ALL outbound RST; makes closed ports look filtered):")
-			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
-		}
+		log.Printf("Running as EXIT NODE (proxy mode)")
 		select {}
 	} else {
 		log.Printf("Running as CLIENT (SOCKS5 on %s)", *socksAddr)
