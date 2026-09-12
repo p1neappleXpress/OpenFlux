@@ -3,14 +3,18 @@ import Combine
 
 enum TransportKind: String, CaseIterable, Identifiable {
     case yandex = "yandex"
+    case volga = "volga"
     case max = "oneme"
     var id: String { rawValue }
     var title: String {
         switch self {
         case .yandex: return "Yandex Docs"
-        case .max: return "MAX"
+        case .volga:  return "VOLGA"
+        case .max:    return "MAX"
         }
     }
+    /// VOLGA uses the same Yandex.Docs document URL as the classic transport.
+    var usesDocURL: Bool { self == .yandex || self == .volga }
 }
 
 /// Swift wrapper around the OpenFlux Go static library (liboflux.a).

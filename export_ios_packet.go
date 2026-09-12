@@ -77,6 +77,11 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	switch tt {
 	case "yandex", "":
 		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+	case "volga", "vyandex":
+		// Slim VOLGA profile so the relay worker pool + queues stay under the
+		// NE memory cap (the default is a server profile).
+		t = transport.NewCompressedTransport(
+			yandex.NewYandexVolgaTransportWithConfig(docURL, config, yandex.SlimVolgaConfig()))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
