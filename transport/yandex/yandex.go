@@ -173,6 +173,26 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			UserID:     userID,
 		}
 
+		connectedAt := time.Now()
+
+		// Wait for the server's engine.io OPEN packet ("0{...sid...}") before
+		// sending anything. Sending our socket.io "40"/"42" packets right
+		// after the WS upgrade (the old behavior) races the server's own
+		// handshake packet - observed empirically as the server closing with
+		// 1005 within ~50-100ms of accepting the connection, right after it
+		// emits its "0{...}" packet, because the client wrote to the
+		// namespace before the handshake it announces was actually open.
+		_, first, err := conn.ReadMessage()
+		if err != nil {
+			utils.Debugf("[YDOCS] Read error waiting for engine.io open: %v", err)
+			conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
+		if len(first) == 0 || first[0] != '0' {
+			utils.Debugf("[YDOCS] unexpected first message (wanted engine.io open \"0...\"): %s", string(first))
+		}
+
 		t.Mu.Lock()
 		t.session = session
 		t.SetConnected(true)
@@ -195,7 +215,6 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		messagePart, _ := json.Marshal([]interface{}{"message", authData})
 		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
-		connectedAt := time.Now()
 		for t.IsRunning() {
 			_, message, err := conn.ReadMessage()
 			if err != nil {

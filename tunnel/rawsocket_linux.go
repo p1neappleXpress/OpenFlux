@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -17,6 +18,15 @@ import (
 	"universal-bypass-tool/network"
 	"universal-bypass-tool/utils"
 )
+
+// rawSocketMark tags every packet WritePackets sends through sendFd (SYNs,
+// data, and our own legitimate RSTs) so entrypoint.sh's OUTPUT DROP rule for
+// RST packets can exempt them by fwmark. Without this, that rule can't tell
+// our raw socket's own RSTs apart from the kernel's spurious auto-RSTs
+// (fired because this netstack's sockets have no kernel-side counterpart)
+// and drops both — which surfaces here as Sendto returning EPERM. Must match
+// the mark used in docker/entrypoint.sh.
+const rawSocketMark = 100
 
 type RawSocketEndpoint struct {
 	dispatcher      stack.NetworkDispatcher
@@ -39,6 +49,13 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 	if err := syscall.SetsockoptInt(sendFd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
 		syscall.Close(sendFd)
 		return nil, fmt.Errorf("IP_HDRINCL: %v", err)
+	}
+
+	if err := unix.SetsockoptInt(sendFd, unix.SOL_SOCKET, unix.SO_MARK, rawSocketMark); err != nil {
+		// Non-fatal: without the mark, entrypoint.sh's RST-drop rule can't
+		// exempt our own RSTs and we're back to the original EPERM bug, but
+		// the tunnel itself still works.
+		utils.Debugf("[RAW-NIC%d] SO_MARK failed (need NET_ADMIN?): %v", nicID, err)
 	}
 
 	recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)

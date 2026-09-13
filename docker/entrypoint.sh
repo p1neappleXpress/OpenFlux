@@ -55,7 +55,14 @@ case "${DEBUG:-0}" in
 esac
 
 if [ "$role" = exit-node ]; then
-  echo "[entrypoint] dropping outbound TCP RSTs inside the container netns"
+  echo "[entrypoint] dropping outbound TCP RSTs inside the container netns (except our own, fwmark 100)"
+  # The mark-100 RETURN rule must come first: it exempts RSTs the exit node's
+  # own raw socket sends on purpose (rawSocketMark in tunnel/rawsocket_linux.go)
+  # so only the kernel's spurious auto-RSTs (no fwmark, since they're not
+  # sent through that socket) get dropped below.
+  if ! iptables -A OUTPUT -p tcp --tcp-flags RST RST -m mark --mark 100 -j RETURN; then
+    echo "[entrypoint] WARNING: iptables failed (missing NET_ADMIN?); kernel RSTs will kill tunnel connections" >&2
+  fi
   if ! iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP; then
     echo "[entrypoint] WARNING: iptables failed (missing NET_ADMIN?); kernel RSTs will kill tunnel connections" >&2
   fi
