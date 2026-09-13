@@ -2,7 +2,10 @@ module universal-bypass-tool
 
 go 1.26.4
 
-require github.com/gorilla/websocket v1.5.3
+require (
+	fluxcore v0.0.0
+	github.com/gorilla/websocket v1.5.3
+)
 
 require gvisor.dev/gvisor v0.0.0-20260530041128-23ef90c42be7
 
@@ -45,3 +48,5 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace fluxcore => ./fluxcore

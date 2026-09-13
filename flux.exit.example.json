@@ -1,0 +1,21 @@
+{
+  "mode": "exit-node",
+  "socks5": "127.0.0.1:1080",
+  "apiAddr": "",
+  "tunMode": false,
+  "routes": [
+    {
+      "transport": "wss",
+      "listenAddr": "127.0.0.1:8443",
+      "certFile": "tls/openflux-exit-cert.pem",
+      "keyFile": "tls/openflux-exit-key.pem",
+      "authToken": "${OPENFLUX_AUTH_TOKEN}",
+      "denyCIDRs": [
+        "203.0.113.10/32"
+      ]
+    }
+  ],
+  "pingEvery": "3s",
+  "pingTimeout": "6s",
+  "debug": false
+}

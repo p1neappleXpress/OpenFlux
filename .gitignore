@@ -33,6 +33,14 @@ Thumbs.db
 .env
 .env.local
 
+# Local OpenFlux runtime configuration and TLS material
+flux.json
+flux.client.json
+flux.exit.json
+tls/
+*.key
+*-key.pem
+
 .gradle/
 *.hprof
 

@@ -1,206 +1,226 @@
 # OpenFlux
 
-**English** | [Русский](README.ru.md)
+OpenFlux is an experimental TCP tunnel. The current MVP exposes a local SOCKS5 proxy, carries each SOCKS5 `CONNECT` over authenticated WSS/TLS to a controlled exit node, and opens an ordinary outbound TCP connection from that exit.
 
-Network stack research tool. TCP tunnel with pluggable transports.
+The goal of this milestone is a small, testable transport—not a polished application.
 
+## Supported MVP path
 
-# Disclaimer
-
-The author of OpenFlux **does not encourage** the use of this project to bypass restrictions or violate the rules of any platform, and **is not responsible** for the final scenarios of how users apply this tool in real life or on the Internet. Any specific technical features of the application are nothing more than an **architectural coincidence**, created **without any intent**.
-
-The project is **entirely non-commercial**, contains **no paid features, hidden subscriptions, or commercial benefit**.
-
-The author **is not responsible** for forks, modifications, or derivative versions of OpenFlux created by third parties. Any changes added to a fork are the responsibility of its author.
-
-The author **is not responsible** for:
-
-- Any use of OpenFlux by third parties
-- Consequences caused by the use of forks and modifications
-- Damage resulting from derivative versions
-- Violations committed using forks
-
-The original code is provided **as is**, **without any warranties**.
-
-## Clients
-
-| Platform | Download | Notes |
-|----------|----------|-------|
-| **Android** | [OpenFluxAndroid releases](https://github.com/p1neappleXpress/OpenFluxAndroid) | Standalone APK |
-| **iOS** | [TestFlight beta](https://testflight.apple.com/join/BwnAcdus) | System-wide VPN via Network Extension |
-
-> **iOS app** built by [@saharev1](https://github.com/saharev1) — full iOS client, TestFlight pipeline, system VPN support, DNS-over-TLS, and many stability fixes. HUGE thanks! 🙏
->
-> **Android app** — [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid).
-
-## Overview
-```
-Client (SOCKS5) --> Transport --> Exit Node --> Internet
+```text
+Application
+  -> SOCKS5 at 127.0.0.1:1080
+  -> one authenticated WSS connection per SOCKS CONNECT
+  -> OpenFlux exit on a controlled VPS
+  -> ordinary outbound TCP connection
 ```
 
-## Requirements
-1. Golang v. 1.26.3+ - is required for building desktop client / exit node binary (universal-bypass-tool);
-2. Android Native Development Kit (NDK) v.27.0.12077973+ - is required for building Android client binary;
-3. XCode v. 26.6+ - is required for building iOS client binary;
-4. Linux VPS / VDS exit node.
+Implemented and tested:
 
-## Overview
+- SOCKS5 `CONNECT` with no authentication;
+- TCP streams only;
+- IPv4 destinations and domain names;
+- DNS resolution on the exit node;
+- TLS certificate verification, with an optional private CA;
+- bearer-token authentication and WebSocket subprotocol `openflux.v1`;
+- optional HTTP or SOCKS5 bootstrap proxy for the WSS connection;
+- clean shutdown of listeners and active tunnels;
+- destination-policy enforcement before the exit dials.
 
-TCP packets are sent via Transport. Currently, there are three transports available:
-1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets via WebRTC DataChannel
-    WARNING:
-   - **Do not use** your primary or important MAX account.
-   - **Do not use** an account whose deletion or loss of access would be critical.
-   - Usage via an **external VPS** may lead to **account restrictions**.
-   - The **restriction may persist** after stopping OpenFlux.
-   - MAX transport should be considered **experimental** until the blocking mechanism is understood.
-3. Cups.online - sends packets via live-coding interview rooms (Centrifugo channels)
-    WARNING:
-   - Cups.online is a public interview service; rooms are open to anyone who knows
-     their UUID.
-   - Use --encryption-key-file if you care about confidentiality.
-   - Do not abuse the room-creation endpoint; the exit node creates a small fixed
-     number of rooms (default 4) at startup and keeps them for the session.
+Current limits:
 
-Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to destination point.
+- no UDP or SOCKS5 `BIND`;
+- no IPv6 destinations;
+- no multiplexing: every SOCKS connection creates one WSS connection;
+- no TUN support in the supported WSS route;
+- no inbound port forwarding;
+- only the first enabled route is selected;
+- no systemd deployment instructions yet.
 
-## Structure
+> A working WSS tunnel does **not** prove that it works through a Russian carrier whitelist. Operator, tariff, region, and endpoint behavior must be tested separately, using an officially permitted carrier. V2rayN may be used as a controlled bootstrap path, but success through it is not proof of independent reachability.
 
-```
-OpenFlux/
-├── main.go                     # CLI entry (client / exit-node)
-├── export_ios.go               # cgo bridge for the iOS static library (build tag: ios)
-├── transport/
-│   ├── transport.go            # Transport interface
-│   ├── compressor.go           # Compression wrapper
-│   ├── yandex/                 # Yandex Docs backend
-│   ├── oneme/                  # MAX Messenger backend
-│   └── cupsonline/             # Cups.online interview-room backend
-├── tunnel/
-│   ├── tunnel.go               # TCP tunnel core (proxy + raw exit modes)
-│   ├── endpoint.go             # Virtual NIC
-│   ├── rawsocket_linux.go      # Raw-socket exit mode (Linux, root)
-│   └── rawsocket_{darwin,windows}.go  # stubs (raw mode unsupported)
-├── socks5/                     # SOCKS5 server
-├── network/                    # Checksums, packet parsing
-├── utils/                      # Logging
-├── ios-app/                    # SwiftUI iOS client (XcodeGen), links liboflux.a
-├── build_ios.sh                # Build the iOS static library (liboflux.a)
-├── build_ios_app.sh            # Build + archive + export the iOS app IPA
-└── build_android.sh            # Build the Android client binary
-```
+## Build
 
-## Build (desktop client / exit-node binary)
+Use the Go version declared in [`go.mod`](go.mod):
 
 ```bash
-go mod tidy
-go build -o universal-bypass-tool .
+go build -o openflux .
 ```
 
-## Build for Android (client binary)
-```bash
-export ANDROID_NDK_HOME=<your Android NDK path>
-./build_android.sh
-```
+The root module uses the local nested module in [`fluxcore`](fluxcore/), so build from the repository root.
 
-## Build for iOS (client binary)
-```bash
-export XCODE_PATH="<your Xcode.app path>" # optional, defaults to /Applications/Xcode.app
-./build_ios.sh
-```
+## Configuration
 
-## Usage
+OpenFlux loads JSON with `--config`, expands environment variables, validates the complete configuration, and starts the first enabled route.
 
-### 1. Setting up exit node
+Two safe templates are included:
 
-The exit node runs a userspace TCP/IP stack (gvisor) in one of two modes:
+- [`flux.example.json`](flux.example.json) — client, with SOCKS5 on localhost;
+- [`flux.exit.example.json`](flux.exit.example.json) — exit node, listening only on VPS localhost for the initial SSH-forwarded smoke test.
 
-- **proxy** (default, recommended) - every TCP connection from the client is terminated locally and re-originated through an ordinary `net.Dial` to the real destination. **No root, no raw sockets, no iptables** - just a normal process. Works on Linux, Windows, macOS.
-- **raw** - gVisor forwards raw IP packets through a raw socket (Linux only, needs root + a scoped RST-drop iptables rule). Slightly faster end-to-end, but requires privileges.
-
-Run in proxy mode (default):
-```bash
-./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
-```
-
-Run in raw mode (Linux, root):
-```bash
-sudo ./universal-bypass-tool --exit-node --mode raw --local-ip 203.0.113.10 \
-    --url "YOUR_YANDEX_DOC_URL" --debug
-```
-
-### 1. Setting up desktop client:
-
-Setup commands for desktop client:
-```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
-```
-
-Then set up SOCKS5 proxy in your browser at localhost:1080.
-
-### 2. Using the Cups.online transport
-
-Cups.online is a public live-coding interview service. Each interview room is a Centrifugo channel (`$shared_editor:room-<uuid>`) that carries arbitrary base64 blobs - exactly what OpenFlux needs to move TCP packets.
-
-**Exit node:** creates a small set of rooms at startup and prints a base64 room list that the client must use:
+Copy them to local, untracked files before editing:
 
 ```bash
-./universal-bypass-tool --exit-node --transport cupsonline --debug
+cp flux.example.json flux.client.json
 ```
-
-```
-=== COPY THIS TO CLIENT ===
-eyJyb29tcyI6WyI0YTFh...base64...
-===========================
-```
-
-**Client:** paste the printed base64 into `--url`:
 
 ```bash
-./universal-bypass-tool --client --transport cupsonline \
-    --url "eyJyb29tcyI6WyI0YTFh...base64..." --socks5 :1080 --debug
+cp flux.exit.example.json flux.exit.json
 ```
 
-Notes:
-- The room list is a session key: rooms live only as long as the exit node keeps them, and each exit-node restart produces a new list.
-- TCP flows are pinned to a single room by flow-hash, so packet ordering inside a connection is preserved.
-- Add `--encryption-key-file <path>` on both sides if you do not want Cups.online to see the contents.
+The example token is an environment reference:
 
-## Flags
+```json
+"authToken": "${OPENFLUX_AUTH_TOKEN}"
+```
 
-| Flag          | Default             | Description                |
-|---------------|---------------------|----------------------------|
-| `--client`    |                     | Run as client              |
-| `--exit-node` |                     | Run as exit node           |
-| `--socks5`    | `:1080`             | SOCKS5 listen address      |
-| `--url`       | `https://localhost` | Document URL (Yandex Docs) |
-| `--maxToken`  | ``                  | Auth token (Max)           |
-| `--maxUid`    | ``                  | User ID (Max)              |
-| `--debug`     | `false`             | Enable verbose logging     |
-| `--transport` | `yandex`            | `yandex`, `vyandex`, `oneme`, `cupsonline` |
-| `--mode`      | `proxy`             | Exit-node mode: `proxy` (default) or `raw` (Linux only, needs root) |
-| `--local-ip`  | ``                  | Egress IP for exit node (raw mode only, scoped RST drop) |
+Provision the **same** random token on the client and exit. It must contain at least 32 non-whitespace characters; 32 random bytes encoded as 64 hexadecimal characters is a suitable choice. Keep it out of source control, chat, screenshots, process arguments, and logs. If `OPENFLUX_AUTH_TOKEN` is unset, validation fails instead of starting without authentication.
 
-## Implementing custom transports
+### TLS files
 
-You are free to implement the `Transport` interface from `transport/transport.go` and register your custom transport in main.go switch block.
+The exit requires:
+
+- `certFile`: server certificate, optionally followed by its chain;
+- `keyFile`: matching private key, readable only by the exit service account.
+
+The certificate must contain the verification name in its Subject Alternative Name. The client either uses normal system trust or supplies the issuing CA through `caFile`. `serverName` is an optional TLS verification-name override; it does not disable certificate verification.
+
+Relative `caFile`, `certFile`, and `keyFile` paths are resolved relative to the JSON configuration file.
+
+There is deliberately no insecure certificate-skip option.
+
+## Initial foreground smoke test
+
+This procedure keeps the WSS port private and does not require firewall, routing, NAT, DNS, raw-socket, or systemd changes.
+
+### 1. Prepare the exit
+
+Place the exit configuration and TLS certificate/key on the VPS. Keep the example:
+
+```json
+"listenAddr": "127.0.0.1:8443"
+```
+
+Replace the documentation address in `denyCIDRs` with the VPS public IPv4 address as a `/32`. The exit also blocks addresses assigned to its local interfaces, but the explicit `/32` documents the intended boundary.
+
+Set `OPENFLUX_AUTH_TOKEN` through a protected environment mechanism, then run in the foreground:
+
+```bash
+./openflux --config flux.exit.json
+```
+
+Expected startup output includes the selected `wss` route and `WSS exit listening on 127.0.0.1:8443`. The token and private-key contents must never appear in output.
+
+### 2. Create an SSH local forward
+
+Using the already-authorized SSH connection to the VPS, forward a client-side port to the exit listener:
+
+```bash
+ssh -N -L 18443:127.0.0.1:8443 user@your-vps
+```
+
+If SSH itself currently uses V2rayN, keep using that known-good SSH setup. In MobaXterm, the equivalent is a local port forward from `127.0.0.1:18443` to VPS-side `127.0.0.1:8443`.
+
+### 3. Prepare and run the client
+
+The client template connects to the local SSH forward:
+
+```json
+"endpoint": "wss://127.0.0.1:18443/openflux/v1/tunnel"
+```
+
+Set `serverName` to the exact DNS SAN in the exit certificate and set `caFile` when using a private CA. Provision the same `OPENFLUX_AUTH_TOKEN`, then run:
+
+```bash
+./openflux --config flux.client.json
+```
+
+Expected startup output includes:
+
+```text
+SOCKS5 listening on 127.0.0.1:1080
+```
+
+### 4. Send controlled traffic
+
+Use remote DNS through SOCKS (`--socks5-hostname`, not `--socks5`) and a controlled HTTP endpoint:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://your-controlled-test-host.example/
+```
+
+Verify:
+
+- the controlled response arrives intact;
+- the destination hostname is resolved from the VPS, not the client;
+- the observed public source address is the VPS address;
+- loopback, private, link-local, VPS-local, and configured denied destinations fail;
+- concurrent requests work;
+- Ctrl+C closes listeners and active streams cleanly;
+- logs contain no token, authorization header, proxy credentials, cookie, private key, or payload.
+
+Do not add systemd or expose a public WSS port until this foreground test is understood and repeatable.
+
+## Optional WSS bootstrap proxy
+
+For a controlled test against a WSS endpoint that is already reachable outside the VPS, add this to the client route:
+
+```json
+"proxyURL": "socks5://127.0.0.1:10808"
+```
+
+Supported schemes are `http` and `socks5`. A SOCKS5 URL requires an explicit port. Do not point `proxyURL` at OpenFlux's own SOCKS listener (`127.0.0.1:1080`), because that would create a loop. Do not embed proxy credentials in a checked-in configuration.
+
+## Exit destination policy
+
+Before dialing, the exit:
+
+1. parses the requested `host:port` strictly;
+2. resolves a hostname once using IPv4 DNS on the VPS;
+3. validates every returned address;
+4. dials only validated literal IPv4 addresses.
+
+The policy rejects IPv6 and blocks unspecified, loopback, private, link-local, multicast, carrier-grade NAT, benchmark, documentation, reserved, local-interface, and administrator-configured CIDR ranges. If any DNS answer is denied, the request is denied. This prevents validation/dial DNS rebinding.
+
+## Protocol and architecture
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the connection sequence, trust boundaries, framing, policy, and shutdown behavior.
+
+## Development verification
+
+Run the nested configuration-module tests separately, then the root suite:
+
+```bash
+go -C fluxcore test ./...
+```
+
+```bash
+go test ./...
+```
+
+Static analysis and a local build:
+
+```bash
+go vet ./...
+```
+
+```bash
+go build ./...
+```
+
+A Linux/amd64 static build can be produced with:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o build/openflux-linux-amd64 .
+```
+
+Automated tests use local listeners and injected resolvers/dialers; they do not need MAX, Yandex, the public Internet, or a VPS.
+
+## Experimental legacy paths
+
+Yandex Docs, Yandex Volga, OneMe/MAX, CupsOnline, the packet transport abstraction, gVisor, and raw exit mode remain in the repository for research compatibility. They are **not** the supported MVP path and may require credentials, elevated privileges, or network behavior that this WSS design intentionally avoids.
+
+The current [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`.env.example`](.env.example), and `docker/entrypoint.sh` still describe that legacy container path. Do not use them as WSS deployment instructions. The initial WSS validation path is the foreground binary procedure above.
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 or later**.
-See [LICENSE](LICENSE) for the full text.
-
-Third-party licenses are listed in [NOTICE](NOTICE).
-
-## Disclaimer
-
-Educational use only. Test on your own machines and networks.
-
-## Support the project
-
-**USDT · TRC20**
-
-```
-TXyTj5DqJNcQpd2yWwdVuXdabvQibXgLKC
-```
+See [`LICENSE`](LICENSE).
