@@ -1,0 +1,18 @@
+{
+  "mode": "client",
+  "socks5": "127.0.0.1:1080",
+  "apiAddr": "",
+  "tunMode": false,
+  "routes": [
+    {
+      "transport": "wss",
+      "endpoint": "wss://127.0.0.1:18443/openflux/v1/tunnel",
+      "authToken": "${OPENFLUX_AUTH_TOKEN}",
+      "caFile": "tls/openflux-ca.pem",
+      "serverName": "openflux-exit.example.invalid"
+    }
+  ],
+  "pingEvery": "3s",
+  "pingTimeout": "6s",
+  "debug": false
+}

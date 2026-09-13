@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flux</title>
+<style>
+  :root{
+    --bg:#070d0e; --surface:#0f1719; --surface2:#14201f; --line:#1f2d2e; --line2:#294040;
+    --ink:#e8efee; --ink2:#b4c5c3; --muted:#7f9593;
+    --accent:#2fcdb8; --pulse:#34e0c8;
+    --ok:#34c98a; --warn:#e0a33a; --crit:#ec6055;
+    --mono:ui-monospace,"Cascadia Code","Segoe UI Mono",Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;min-height:100vh}
+  .app{max-width:860px;margin:0 auto;padding:0 16px 60px}
+
+  /* header */
+  header.top{display:flex;align-items:center;justify-content:space-between;padding:18px 2px 14px;gap:12px}
+  .brand{display:flex;align-items:center;gap:11px}
+  .mark{font-family:var(--mono);font-weight:600;font-size:20px;letter-spacing:.32em;color:var(--ink)}
+  .mark b{color:var(--accent)}
+  .conn{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--muted)}
+  .cdot{width:8px;height:8px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 0 rgba(52,201,138,.5)}
+  .cdot.alive{background:var(--ok);animation:ping 2s infinite}
+  .cdot.stress{background:var(--warn)}
+  .cdot.offline{background:var(--crit)}
+  @keyframes ping{0%{box-shadow:0 0 0 0 rgba(52,201,138,.45)}70%{box-shadow:0 0 0 7px rgba(52,201,138,0)}100%{box-shadow:0 0 0 0 rgba(52,201,138,0)}}
+
+  /* tabs */
+  nav.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:22px;overflow-x:auto}
+  nav.tabs button{appearance:none;background:none;border:none;color:var(--muted);font-family:var(--mono);
+    font-size:12px;letter-spacing:.1em;text-transform:uppercase;padding:11px 14px;cursor:pointer;
+    border-bottom:2px solid transparent;white-space:nowrap}
+  nav.tabs button:hover{color:var(--ink2)}
+  nav.tabs button.on{color:var(--accent);border-bottom-color:var(--accent)}
+  nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:4px}
+
+  section[hidden]{display:none}
+
+  /* heart */
+  .heart{text-align:center;padding:22px 0 6px}
+  .bpm{font-family:var(--mono);font-weight:600;font-size:clamp(64px,17vw,104px);line-height:1;letter-spacing:-.02em}
+  .bpm small{font-size:20px;color:var(--muted);letter-spacing:.2em;margin-left:6px}
+  .hstatus{font-family:var(--mono);font-size:12px;letter-spacing:.26em;text-transform:uppercase;margin-top:10px;color:var(--ink2)}
+  .hstatus .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:9px;vertical-align:middle}
+  .ecg{margin:22px auto 4px;max-width:560px;height:84px;border:1px solid var(--line);border-radius:14px;
+    background:var(--surface);overflow:hidden;position:relative}
+  .ecg svg{width:200%;height:84px;display:block}
+  .ecg .track{animation:sweep 4s linear infinite}
+  .ecg-line{fill:none;stroke:var(--pulse);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+  @media(prefers-reduced-motion:reduce){.ecg .track{animation:none}.cdot.alive{animation:none}}
+  @keyframes sweep{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+  .active-line{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:14px}
+  .active-line b{color:var(--ink)}
+
+  /* weather strip */
+  .weather{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:22px 0 6px}
+  .wcell{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:12px 12px 13px;text-align:center}
+  .wcell .t{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  .wcell .c{font-family:var(--mono);font-weight:600;font-size:14px;margin-top:8px;text-transform:capitalize}
+
+  /* generic tiles */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:20px}
+  .kpi{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:14px}
+  .kpi .l{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  .kpi .v{font-family:var(--mono);font-weight:600;font-size:24px;margin-top:8px;font-variant-numeric:tabular-nums}
+
+  /* routes */
+  .route{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:14px 16px;margin-bottom:10px;transition:border-color .3s}
+  .route.active{border-color:var(--accent)}
+  .route .top{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+  .route .name{font-weight:600}
+  .route .sc{font-family:var(--mono);font-weight:600;font-size:20px;font-variant-numeric:tabular-nums}
+  .pill{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;padding:3px 8px;
+    border-radius:999px;border:1px solid var(--line2);color:var(--muted);margin-left:8px;vertical-align:middle}
+  .pill.active{border-color:var(--accent);color:var(--accent)}
+  .pill.quarantined{border-color:var(--crit);color:var(--crit)}
+  .pill.standby{border-color:var(--line2);color:var(--ink2)}
+  .bar{height:6px;border-radius:4px;background:#132021;margin-top:11px;overflow:hidden}
+  .bar>i{display:block;height:100%;transition:width .45s,background .45s}
+  .rmeta{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:9px;display:flex;flex-wrap:wrap;gap:4px 14px}
+
+  /* network svg */
+  .netwrap{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:8px}
+  .netwrap svg{width:100%;height:auto;display:block}
+  .nlabel{font-family:var(--mono);font-size:11px;fill:var(--ink)}
+  .nsub{font-family:var(--mono);font-size:9px;fill:var(--muted)}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .legend i{display:inline-block;width:18px;height:0;border-top-width:2px;border-top-style:solid;margin-right:7px;vertical-align:middle}
+
+  /* table */
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+  table{border-collapse:collapse;width:100%;min-width:520px;font-size:13px}
+  th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+    font-weight:500;background:var(--surface2)}
+  td{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink2)}
+  td.name{font-family:var(--sans);color:var(--ink);font-weight:600}
+  tr:last-child td{border-bottom:none}
+
+  /* events */
+  .ev{font-family:var(--mono);font-size:12.5px;color:var(--ink2);padding:8px 2px;border-bottom:1px solid var(--line);display:flex;gap:12px}
+  .ev time{color:var(--muted);flex:0 0 auto}
+  .ev:last-child{border-bottom:none}
+  .empty{color:var(--muted);font-family:var(--mono);font-size:13px;padding:24px 2px}
+  h2.sec{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:24px 0 10px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><span class="mark"><b>◇</b> FLUX</span></div>
+    <div class="conn"><span class="cdot" id="cdot"></span><span id="connText">connecting…</span></div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="heart" class="on">Heart</button>
+    <button data-tab="network">Network</button>
+    <button data-tab="routes">Routes</button>
+    <button data-tab="stats">Stats</button>
+    <button data-tab="events">Events</button>
+  </nav>
+
+  <!-- HEART -->
+  <section id="heart">
+    <div class="heart">
+      <div class="bpm" id="bpm">–<small>BPM</small></div>
+      <div class="hstatus"><span class="dot" id="hdot"></span><span id="hstatus">waiting for signal</span></div>
+    </div>
+    <div class="ecg" aria-hidden="true">
+      <svg viewBox="0 0 1200 84" preserveAspectRatio="none"><g class="track" id="ecgTrack">
+        <polyline class="ecg-line" points="0,46 150,46 175,46 190,20 205,70 222,46 372,46 397,46 412,20 427,70 444,46 594,46 619,46 634,20 649,70 666,46 816,46 841,46 856,20 871,70 888,46 1038,46 1063,46 1078,20 1093,70 1110,46 1200,46"/>
+      </g></svg>
+    </div>
+    <div class="active-line" id="activeLine">—</div>
+
+    <h2 class="sec">Network weather</h2>
+    <div class="weather" id="weather"></div>
+  </section>
+
+  <!-- NETWORK -->
+  <section id="network" hidden>
+    <div class="netwrap"><div id="netsvg"></div></div>
+    <div class="legend">
+      <span><i style="border-color:var(--accent)"></i>active</span>
+      <span><i style="border-color:var(--line2)"></i>standby</span>
+      <span><i style="border-color:var(--crit);border-top-style:dashed"></i>quarantined</span>
+    </div>
+  </section>
+
+  <!-- ROUTES -->
+  <section id="routes" hidden>
+    <div id="routeList"></div>
+  </section>
+
+  <!-- STATS -->
+  <section id="stats" hidden>
+    <div class="kpis" id="kpis"></div>
+    <h2 class="sec">Route DNA · reputation</h2>
+    <div class="tablewrap"><table id="dnaTable">
+      <thead><tr><th>Route</th><th>Samples</th><th>Avg</th><th>Best</th><th>Worst</th><th>Adopt</th><th>Fail</th></tr></thead>
+      <tbody id="dnaBody"></tbody>
+    </table></div>
+  </section>
+
+  <!-- EVENTS -->
+  <section id="events" hidden>
+    <div id="eventList"></div>
+  </section>
+</div>
+
+<script>
+"use strict";
+var snap = null, tab = "heart";
+
+function col(s){ return s>=70 ? "var(--ok)" : s>=45 ? "var(--warn)" : "var(--crit)"; }
+var condColor = {excellent:"var(--ok)",good:"var(--ok)",fair:"var(--warn)",degrading:"var(--warn)",unstable:"var(--crit)"};
+function statusColor(st){ return st==="alive" ? "var(--ok)" : st==="stress" ? "var(--warn)" : "var(--crit)"; }
+function ms(ns){ return Math.round((ns||0)/1e6); }
+function pct(x){ return Math.round((x||0)*100); }
+function esc(s){ return String(s).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c];}); }
+function fmtDur(sec){
+  sec=Math.max(0,sec||0);
+  var h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=Math.floor(sec%60);
+  if(h) return h+"h "+m+"m";
+  if(m) return m+"m "+s+"s";
+  return s+"s";
+}
+function activeRoute(){ return (snap && snap.routes||[]).find(function(r){return r.state==="active";}); }
+
+/* ---------- tabs ---------- */
+var TABS = ["heart","network","routes","stats","events"];
+function setTab(name){
+  if(TABS.indexOf(name)<0) return;
+  tab = name;
+  var btns = document.getElementById("tabs").children;
+  Array.prototype.forEach.call(btns, function(x){ x.classList.toggle("on", x.dataset.tab===name); });
+  TABS.forEach(function(id){ document.getElementById(id).hidden = (id!==name); });
+  renderTab();
+}
+document.getElementById("tabs").addEventListener("click", function(e){
+  var b = e.target.closest("button"); if(!b) return;
+  setTab(b.dataset.tab);
+});
+// deep-link: ?tab=network
+var _params = new URLSearchParams(location.search);
+if(_params.get("tab")) setTab(_params.get("tab"));
+
+/* ---------- render ---------- */
+function render(){
+  if(!snap) return;
+  // header + heart dot always reflect live status
+  var st = snap.status || "offline";
+  var cdot = document.getElementById("cdot");
+  cdot.className = "cdot " + st;
+  document.getElementById("connText").textContent =
+    st==="alive" ? "connection alive" : st==="stress" ? "under stress" : "offline";
+  renderTab();
+}
+function renderTab(){
+  if(!snap) return;
+  if(tab==="heart") renderHeart();
+  else if(tab==="network") renderNetwork();
+  else if(tab==="routes") renderRoutes();
+  else if(tab==="stats") renderStats();
+  else if(tab==="events") renderEvents();
+}
+
+function renderHeart(){
+  var st = snap.status || "offline";
+  var bpm = document.getElementById("bpm");
+  bpm.innerHTML = (snap.bpm||"–") + "<small>BPM</small>";
+  bpm.style.color = statusColor(st);
+  document.getElementById("hdot").style.background = statusColor(st);
+  document.getElementById("hstatus").textContent =
+    st==="alive" ? "connection alive" : st==="stress" ? "network under stress" : "offline";
+  // beat speed follows BPM
+  var track = document.getElementById("ecgTrack");
+  var beat = snap.bpm ? Math.max(1.2, 240/snap.bpm) : 4;
+  track.style.animationDuration = beat.toFixed(2)+"s";
+  track.querySelector(".ecg-line").style.stroke = st==="stress" ? "var(--warn)" : st==="offline" ? "var(--crit)" : "var(--pulse)";
+  var act = activeRoute();
+  document.getElementById("activeLine").innerHTML = act
+    ? "active path &nbsp;<b>"+esc(act.label)+"</b>&nbsp; · &nbsp;health "+act.score+" · rtt "+ms(act.metrics.RTT)+"ms"
+    : "no active path";
+  // weather
+  var w = snap.weather||{};
+  var cells=[["now",w.now],["+15m",w.plus15],["+30m",w.plus30],["+60m",w.plus60]];
+  document.getElementById("weather").innerHTML = cells.map(function(c){
+    return '<div class="wcell"><div class="t">'+c[0]+'</div><div class="c" style="color:'+(condColor[c[1]]||"var(--ink)")+'">'+(c[1]||"–")+'</div></div>';
+  }).join("");
+}
+
+function renderRoutes(){
+  var rs = snap.routes||[];
+  document.getElementById("routeList").innerHTML = rs.length ? rs.map(function(r){
+    var m=r.metrics||{};
+    return '<div class="route '+(r.state==="active"?"active":"")+'">'
+      +'<div class="top"><span class="name">'+esc(r.label)+'<span class="pill '+r.state+'">'+r.state+'</span></span>'
+      +'<span class="sc" style="color:'+col(r.score)+'">'+r.score+'</span></div>'
+      +'<div class="bar"><i style="width:'+Math.max(2,r.score)+'%;background:'+col(r.score)+'"></i></div>'
+      +'<div class="rmeta"><span>rtt '+ms(m.RTT)+'ms</span><span>loss '+pct(m.LossRatio)+'%</span>'
+      +'<span>jitter '+ms(m.Jitter)+'ms</span><span>risk '+pct(r.degradation)+'%</span></div></div>';
+  }).join("") : '<div class="empty">No routes yet.</div>';
+}
+
+function renderNetwork(){
+  var rs = (snap.routes||[]).slice(0,4); // keep the map readable
+  var W=400, H=300, dev={x:200,y:34}, exit={x:200,y:266};
+  var n = rs.length || 1;
+  var exitName = (rs[0] && rs[0].dna && rs[0].dna.exit) ? rs[0].dna.exit.toUpperCase() : "internet";
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Network map">';
+  // device + exit nodes
+  svg+=node(dev.x,dev.y,"DEVICE","this machine");
+  svg+=node(exit.x,exit.y,"EXIT",exitName);
+  rs.forEach(function(r,i){
+    var x = n===1 ? 200 : 70 + i*(260/(n-1));
+    var y = 150;
+    var active = r.state==="active", quar = r.state==="quarantined";
+    var stroke = active?"var(--accent)":quar?"var(--crit)":"var(--line2)";
+    var w = active?2.6:1.4;
+    var dash = quar?'stroke-dasharray="5 4"':'';
+    // device -> route -> exit
+    svg+='<path d="M'+dev.x+','+(dev.y+20)+' L'+x+','+(y-22)+'" fill="none" stroke="'+stroke+'" stroke-width="'+w+'" '+dash+'/>';
+    svg+='<path d="M'+x+','+(y+22)+' L'+exit.x+','+(exit.y-20)+'" fill="none" stroke="'+stroke+'" stroke-width="'+w+'" '+dash+'/>';
+    if(active){
+      svg+='<path d="M'+dev.x+','+(dev.y+20)+' L'+x+','+(y-22)+' M'+x+','+(y+22)+' L'+exit.x+','+(exit.y-20)+'" fill="none" stroke="var(--pulse)" stroke-width="'+w+'" stroke-dasharray="2 8" opacity="0.9"><animate attributeName="stroke-dashoffset" from="10" to="0" dur="0.6s" repeatCount="indefinite"/></path>';
+    }
+    svg+=routeNode(x,y,r);
+  });
+  svg+='</svg>';
+  document.getElementById("netsvg").innerHTML = svg;
+}
+function node(cx,cy,label,sub){
+  return '<rect x="'+(cx-52)+'" y="'+(cy-18)+'" width="104" height="36" rx="9" fill="var(--surface2)" stroke="var(--line2)"/>'
+    +'<text class="nlabel" x="'+cx+'" y="'+(cy-1)+'" text-anchor="middle">'+label+'</text>'
+    +'<text class="nsub" x="'+cx+'" y="'+(cy+11)+'" text-anchor="middle">'+sub+'</text>';
+}
+function routeNode(cx,cy,r){
+  var active=r.state==="active", quar=r.state==="quarantined";
+  var stroke=active?"var(--accent)":quar?"var(--crit)":"var(--line2)";
+  var fill=active?"rgba(47,205,184,.12)":"var(--surface2)";
+  return '<rect x="'+(cx-46)+'" y="'+(cy-22)+'" width="92" height="44" rx="9" fill="'+fill+'" stroke="'+stroke+'"/>'
+    +'<text class="nlabel" x="'+cx+'" y="'+(cy-3)+'" text-anchor="middle" font-size="10">'+esc((r.dna&&r.dna.transport?r.dna.transport:r.label).toUpperCase())+'</text>'
+    +'<text class="nsub" x="'+cx+'" y="'+(cy+11)+'" text-anchor="middle" fill="'+col(r.score)+'">'+r.state+' · '+r.score+'</text>';
+}
+function shortLabel(l){ return String(l).split("→").pop(); }
+
+function renderStats(){
+  var s = snap.stats||{};
+  var tiles=[
+    ["Uptime", fmtDur(s.uptimeSec)],
+    ["Failovers", s.failovers||0],
+    ["Recoveries", s.recoveries||0],
+    ["Quarantines", s.quarantines||0],
+    ["Routes known", s.routesKnown||(snap.routes||[]).length],
+    ["Health now", snap.score||0]
+  ];
+  document.getElementById("kpis").innerHTML = tiles.map(function(t){
+    return '<div class="kpi"><div class="l">'+t[0]+'</div><div class="v">'+t[1]+'</div></div>';
+  }).join("");
+  var ps = (snap.profiles||[]).slice().sort(function(a,b){return (b.samples||0)-(a.samples||0);});
+  document.getElementById("dnaBody").innerHTML = ps.length ? ps.map(function(p){
+    var lbl = [p.dna.transport,p.dna.exit].filter(Boolean).join("→");
+    return '<tr><td class="name">'+esc(lbl)+'</td><td>'+p.samples+'</td><td>'+ (p.avgScore||0).toFixed(1)
+      +'</td><td>'+(p.bestScore||0).toFixed(0)+'</td><td>'+(p.worstScore||0).toFixed(0)
+      +'</td><td>'+(p.adoptions||0)+'</td><td>'+(p.failovers||0)+'</td></tr>';
+  }).join("") : '<tr><td colspan="7" style="color:var(--muted)">Learning… no profiles yet.</td></tr>';
+}
+
+function renderEvents(){
+  var evs = (snap.events||[]).slice().reverse();
+  document.getElementById("eventList").innerHTML = evs.length ? evs.slice(0,60).map(function(e){
+    var t = new Date(e.time).toLocaleTimeString();
+    return '<div class="ev"><time>'+t+'</time><span>'+esc(e.message||e.kind)+'</span></div>';
+  }).join("") : '<div class="empty">No events yet.</div>';
+}
+
+/* ---------- data ---------- */
+function apply(d){ snap=d; render(); }
+// initial fetch so the page renders immediately, then live stream
+fetch("/api/snapshot").then(function(r){return r.json();}).then(apply).catch(function(){});
+if(!_params.has("nostream")){
+  try{
+    var es = new EventSource("/api/stream");
+    es.onmessage = function(e){ try{ apply(JSON.parse(e.data)); }catch(_){ } };
+    es.onerror = function(){ var c=document.getElementById("cdot"); c.className="cdot offline";
+      document.getElementById("connText").textContent="reconnecting…"; };
+  }catch(_){}
+}
+</script>
+</body>
+</html>

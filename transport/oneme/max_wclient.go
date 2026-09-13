@@ -107,12 +107,7 @@ func (c *MaxClient) LoginByToken(token string) error {
 	}
 	c.loggedIn = true
 	go c.keepalive()
-	users := c.getUserMap(resp)
-	fmt.Println("\n=== CONTACTS ===")
-	for id, u := range users {
-		fmt.Printf("  ID: %d | %s %s | Phone: %d\n", id, u.FirstName, u.LastName, u.Phone)
-	}
-	fmt.Println()
+	fmt.Println("[MAX] Logged in")
 	return nil
 }
 
