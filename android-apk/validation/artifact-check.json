@@ -1,0 +1,24 @@
+{
+  "apk_size": 6692702,
+  "sha256": "cf89e1e316277a227f37f378c84090a164265ad0da90fabb76daf62879fa579f",
+  "native_sizes": {
+    "lib/arm64-v8a/libopenflux.so": 12914688,
+    "lib/arm64-v8a/libopenfluxtun.so": 5708584
+  },
+  "version": "0.3-mtu",
+  "version_code": 3,
+  "sdk_min": 26,
+  "sdk_target": 35,
+  "abi": "arm64-v8a",
+  "signer_same_as_previous": true,
+  "default_url_embedded": true,
+  "zip_integrity": true,
+  "elf_16k_alignment": true,
+  "default_mtu": 1200,
+  "mtu_range": [
+    576,
+    1500
+  ],
+  "core_default_mtu_test_max_packet": 1172,
+  "core_default_mtu_test_syn_mss": 1160
+}

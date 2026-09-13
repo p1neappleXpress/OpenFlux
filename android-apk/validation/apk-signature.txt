@@ -1,0 +1,17 @@
+Verifies
+Verified using v1 scheme (JAR signing): false
+Verified using v2 scheme (APK Signature Scheme v2): true
+Verified using v3 scheme (APK Signature Scheme v3): true
+Verified using v3.1 scheme (APK Signature Scheme v3.1): false
+Verified using v4 scheme (APK Signature Scheme v4): false
+Verified for SourceStamp: false
+Number of signers: 1
+Signer #1 certificate DN: CN=OpenFlux Local Build, OU=Local Development, O=Local
+Signer #1 certificate SHA-256 digest: 052178ea36059ab63bc4b5b15f40a844145acedcdb5db7b0ebacbe9a86a7f0c5
+Signer #1 certificate SHA-1 digest: 9c24831e00a355c7f1d2925910c057f6302a5f9b
+Signer #1 certificate MD5 digest: 47bc35ebbe922eb03f722521b155b732
+Signer #1 key algorithm: RSA
+Signer #1 key size (bits): 3072
+Signer #1 public key SHA-256 digest: 6f954625f9763856d66d8d47c0f6b88f3b5164306d05e25e69d4085a1764f63e
+Signer #1 public key SHA-1 digest: ecc6ed385f3c7c9cff88253e9225ab604229a238
+Signer #1 public key MD5 digest: 87f421f19db179d97b3e1cdcb52415b6

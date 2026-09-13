@@ -1,0 +1,65 @@
+Third-party modules used by the pinned build.
+OpenFlux upstream: https://github.com/p1neappleXpress/OpenFlux
+Local Android SOCKS5 changes: core-overlay/socks5.go
+
+github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
+
+github.com/google/btree v1.1.2
+
+github.com/google/uuid v1.6.0
+
+github.com/gorilla/websocket v1.5.3
+
+github.com/pierrec/lz4/v4 v4.1.27
+
+github.com/pion/datachannel v1.5.8
+
+github.com/pion/dtls/v2 v2.2.12
+
+github.com/pion/ice/v2 v2.3.38
+
+github.com/pion/interceptor v0.1.29
+
+github.com/pion/logging v0.2.2
+
+github.com/pion/mdns v0.0.12
+
+github.com/pion/randutil v0.1.0
+
+github.com/pion/rtcp v1.2.14
+
+github.com/pion/rtp v1.8.7
+
+github.com/pion/sctp v1.8.19
+
+github.com/pion/sdp/v3 v3.0.9
+
+github.com/pion/srtp/v2 v2.0.20
+
+github.com/pion/stun v0.6.1
+
+github.com/pion/transport/v2 v2.2.10
+
+github.com/pion/turn/v2 v2.1.6
+
+github.com/pion/webrtc/v3 v3.3.6
+
+github.com/pmezard/go-difflib v1.0.0
+
+github.com/stretchr/testify v1.9.0
+
+github.com/wlynxg/anet v0.0.5
+
+golang.org/x/crypto v0.49.0
+
+golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
+
+golang.org/x/net v0.52.0
+
+golang.org/x/sys v0.43.0
+
+golang.org/x/time v0.15.0
+
+gopkg.in/yaml.v3 v3.0.1
+
+gvisor.dev/gvisor v0.0.0-20260530041128-23ef90c42be7

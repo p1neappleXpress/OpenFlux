@@ -1,0 +1,30 @@
+=== RUN   TestTCPThroughSOCKSLargeTransferAndHalfClose
+--- PASS: TestTCPThroughSOCKSLargeTransferAndHalfClose (0.08s)
+=== RUN   TestDNSUDPOverSOCKSTCP
+=== RUN   TestDNSUDPOverSOCKSTCP/truncated=false
+=== RUN   TestDNSUDPOverSOCKSTCP/truncated=true
+--- PASS: TestDNSUDPOverSOCKSTCP (0.00s)
+    --- PASS: TestDNSUDPOverSOCKSTCP/truncated=false (0.00s)
+    --- PASS: TestDNSUDPOverSOCKSTCP/truncated=true (0.00s)
+=== RUN   TestDNSExplicitResolverPreserved
+--- PASS: TestDNSExplicitResolverPreserved (0.00s)
+=== RUN   TestDNSTCPRetryMapsVirtualResolver
+--- PASS: TestDNSTCPRetryMapsVirtualResolver (0.01s)
+=== RUN   TestDNSFailureReturnsServfail
+--- PASS: TestDNSFailureReturnsServfail (0.00s)
+=== RUN   TestUnsupportedUDPIPv6AndMalformedDNSDoNotConnect
+--- PASS: TestUnsupportedUDPIPv6AndMalformedDNSDoNotConnect (0.00s)
+=== RUN   TestStopBeforeRunAndRepeatedSessions
+--- PASS: TestStopBeforeRunAndRepeatedSessions (0.01s)
+=== RUN   TestStopDuringDNSResponse
+--- PASS: TestStopDuringDNSResponse (0.00s)
+=== RUN   TestStopDuringIncompleteTCPHandshake
+--- PASS: TestStopDuringIncompleteTCPHandshake (0.00s)
+=== RUN   TestDNSLargeEDNSReplyRespectsSelectedMTU
+=== RUN   TestDNSLargeEDNSReplyRespectsSelectedMTU/576
+=== RUN   TestDNSLargeEDNSReplyRespectsSelectedMTU/1500
+--- PASS: TestDNSLargeEDNSReplyRespectsSelectedMTU (0.00s)
+    --- PASS: TestDNSLargeEDNSReplyRespectsSelectedMTU/576 (0.00s)
+    --- PASS: TestDNSLargeEDNSReplyRespectsSelectedMTU/1500 (0.00s)
+PASS
+ok  	openflux-android-tun/bridge	1.115s
