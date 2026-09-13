@@ -83,6 +83,49 @@ OpenFlux/
 └── build_android.sh            # Сборка клиентского бинарника Android
 ```
 
+### Установка выходной ноды одной командой
+
+На Debian/Ubuntu выходную ноду можно развернуть вспомогательным скриптом:
+
+```bash
+sudo ./scripts/install-vps.sh \
+  --transport yandex \
+  --url "https://disk.yandex.ru/i/YOUR_DOCUMENT"
+```
+
+Установщик использует существующий Docker Compose-профиль `exit-node` из
+репозитория. Поэтому правило подавления TCP RST остаётся внутри сетевого
+пространства имён контейнера и не затрагивает другие сервисы хоста.
+
+Поддерживаются и другие транспорты:
+
+```bash
+sudo ./scripts/install-vps.sh \
+  --transport oneme \
+  --max-token "TOKEN" \
+  --max-uid "OTHER_SIDE_UID"
+```
+
+После установки доступны команды:
+
+```bash
+openflux-health
+openflux-status
+openflux-log
+openflux-update
+```
+
+Автоматическое еженедельное обновление с откатом при неудачном запуске
+включается отдельно:
+
+```bash
+sudo ./scripts/install-vps.sh \
+  --transport yandex \
+  --url "https://disk.yandex.ru/i/YOUR_DOCUMENT" \
+  --enable-auto-update
+```
+
+
 ## Сборка (бинарник десктоп-клиента / выходной ноды)
 
 ```bash
