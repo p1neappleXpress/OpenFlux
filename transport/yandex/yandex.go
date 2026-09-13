@@ -201,6 +201,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				t.SetConnected(false)
+				conn.Close()
 				// If the session was healthy for a while, treat the next
 				// connect as fresh (attempt -1 -> next attempt 0) so backoff
 				// doesn't keep growing across normal long-lived reconnects.
@@ -337,18 +338,26 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	t.connectToDoc(next)
 }
 
-// reconnectBackoff returns an exponential backoff with jitter, capped at 15s.
+// reconnectBackoff returns an exponential backoff with jitter, capped at 30s.
+//
+// Each reconnect dials a brand new WebSocket, which the doc-collab server
+// registers as a brand new participant in the doc's room regardless of
+// client-side user-id reuse - a fast connect/close/reconnect loop piles up
+// visible "ghost" participants quickly (confirmed by logging the server's
+// participant-list messages during a failure streak). The floor here (was
+// 500ms) is raised to slow that churn down; this doesn't change steady-state
+// throughput since successful connects never hit backoff at all.
 func reconnectBackoff(n int) time.Duration {
 	if n < 1 {
 		n = 1
 	}
 	shift := n - 1
-	if shift > 5 {
-		shift = 5
+	if shift > 4 {
+		shift = 4
 	}
-	d := 500 * time.Millisecond * time.Duration(1<<uint(shift))
-	if d > 15*time.Second {
-		d = 15 * time.Second
+	d := 1500 * time.Millisecond * time.Duration(1<<uint(shift))
+	if d > 30*time.Second {
+		d = 30 * time.Second
 	}
 	// add up to +50% jitter
 	d += time.Duration(rand.Int63n(int64(d/2) + 1))
