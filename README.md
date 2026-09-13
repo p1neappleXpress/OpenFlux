@@ -82,6 +82,47 @@ OpenFlux/
 └── build_android.sh            # Build the Android client binary
 ```
 
+### One-shot VPS installer
+
+On Debian/Ubuntu, the exit node can be deployed with the helper script:
+
+```bash
+sudo ./scripts/install-vps.sh \
+  --transport yandex \
+  --url "https://disk.yandex.ru/i/YOUR_DOCUMENT"
+```
+
+The installer uses the repository's existing Docker Compose `exit-node` profile.
+The TCP RST suppression rule therefore remains inside the exit-node container's
+network namespace and does not affect unrelated host services.
+
+Other transports are supported as well:
+
+```bash
+sudo ./scripts/install-vps.sh \
+  --transport oneme \
+  --max-token "TOKEN" \
+  --max-uid "OTHER_SIDE_UID"
+```
+
+Useful commands installed on the VPS:
+
+```bash
+openflux-health
+openflux-status
+openflux-log
+openflux-update
+```
+
+Automatic weekly updates with runtime rollback are opt-in:
+
+```bash
+sudo ./scripts/install-vps.sh \
+  --transport yandex \
+  --url "https://disk.yandex.ru/i/YOUR_DOCUMENT" \
+  --enable-auto-update
+```
+
 ## Build (desktop client / exit-node binary)
 
 ```bash
