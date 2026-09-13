@@ -38,6 +38,7 @@ func (e *TunnelLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 	for _, pkt := range pkts.AsSlice() {
 		data := pkt.ToView().ToSlice()
 		e.packetOut.Add(1)
+		utils.Debugf("-> %d bytes - %s\n", len(data), network.ParsePacketInfo(data))
 		if e.onOutgoingPacket != nil {
 			e.onOutgoingPacket(data)
 		}
