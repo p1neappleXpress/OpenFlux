@@ -20,6 +20,14 @@ import (
 	"universal-bypass-tool/utils"
 )
 
+// Precompiled once. cursorPayloadRe in particular runs on every inbound
+// message, so compiling it per call (as before) was pure overhead on the hot
+// receive path.
+var (
+	cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
+	clientConfigRe  = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
+)
+
 type YandexDocsInfo struct {
 	CookieStr   string
 	Token       string
@@ -217,27 +225,52 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 }
 
 func (t *YandexDocsTransport) writerLoop() {
-	for t.IsRunning() {
+	// The write queue is created once and preserved across reconnects, so we
+	// capture it and block on it instead of polling with a 10ms sleep. The old
+	// poll added up to 10ms of latency to every send and woke the CPU 100x/sec
+	// while idle.
+	var queue chan []byte
+	for t.IsRunning() && queue == nil {
 		t.Mu.Lock()
-		session := t.session
+		if t.session != nil {
+			queue = t.session.WriteQueue
+		}
 		t.Mu.Unlock()
+		if queue == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if queue == nil {
+		return
+	}
 
+	var pending []byte
+	for t.IsRunning() {
+		if pending == nil {
+			packet, ok := <-queue
+			if !ok {
+				return
+			}
+			pending = packet
+		}
+
+		t.Mu.RLock()
+		session := t.session
+		t.Mu.RUnlock()
 		if session == nil || session.Conn == nil {
-			time.Sleep(10 * time.Millisecond)
+			// Mid-reconnect: hold the packet and retry rather than drop it.
+			time.Sleep(15 * time.Millisecond)
 			continue
 		}
 
-		select {
-		case packet := <-session.WriteQueue:
-			payload := base64.StdEncoding.EncodeToString(packet)
-			msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
-
-			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
-				utils.Debugf("[YDOCS] Write error: %v", err)
-			}
-		default:
-			time.Sleep(10 * time.Millisecond)
+		payload := base64.StdEncoding.EncodeToString(pending)
+		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+			utils.Debugf("[YDOCS] Write error: %v", err)
+			time.Sleep(15 * time.Millisecond)
+			continue // keep pending; the reconnect will bring up a new conn
 		}
+		pending = nil
 	}
 }
 
@@ -310,8 +343,7 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 		return response[left : left+right]
 	}
 
-	re := regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
-	matches := re.FindStringSubmatch(response)
+	matches := cursorPayloadRe.FindStringSubmatch(response)
 	if len(matches) > 1 {
 		return matches[1]
 	}
@@ -386,8 +418,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 
-	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
-	matches := re.FindStringSubmatch(html)
+	matches := clientConfigRe.FindStringSubmatch(html)
 	if len(matches) < 2 {
 		// Help diagnose: is this a login page, a new-editor page, etc.?
 		hint := "no client-config script"

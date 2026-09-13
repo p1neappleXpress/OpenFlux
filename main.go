@@ -41,6 +41,10 @@ func main() {
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+	legacy := flag.Bool("legacy", false, "Use legacy per-packet LZ4 codec without batching (for A/B comparison)")
+	benchSend := flag.Int("bench-send", 0, "Benchmark: push this many MB through the transport, then report and exit")
+	benchSink := flag.Bool("bench-sink", false, "Benchmark: receive from the transport and measure goodput")
+	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
 	flag.Parse()
 
 	exitMode, err := tunnel.ParseExitMode(*mode)
@@ -58,7 +62,8 @@ func main() {
 		godebug.SetGCPercent(20)
 	}
 
-	if !*exitNode && !*client {
+	benchMode := *benchSink || *benchSend > 0
+	if !*exitNode && !*client && !benchMode {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -75,8 +80,8 @@ func main() {
 	}
 
 	config := transport.DefaultConfig()
-	var inner transport.Transport
 
+	var inner transport.Transport
 	switch *transportType {
 	case "vyandex":
 		inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
@@ -91,6 +96,9 @@ func main() {
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
 
+	// Optional AES-256-GCM encryption sits closest to the raw transport, so on
+	// send we batch/compress first and encrypt the result (ciphertext would not
+	// compress). Both peers must use the same secret.
 	if *encryptionKeyFile != "" {
 		secretBytes, err := os.ReadFile(*encryptionKeyFile)
 		if err != nil {
@@ -108,7 +116,28 @@ func main() {
 		log.Printf("Transport encryption: AES-256-GCM enabled")
 	}
 
-	trans := transport.NewCompressedTransport(inner)
+	// App-layer codec, outermost. Default is the new batching+zstd layer;
+	// --legacy selects the old per-packet LZ4 path so the two can be compared
+	// over the same channel. Client and exit node must use the same one.
+	var trans transport.Transport
+	if *legacy {
+		log.Printf("Codec: legacy (per-packet LZ4, no batching)")
+		trans = transport.NewCompressedTransport(inner)
+	} else {
+		log.Printf("Codec: batched (zstd + coalescing)")
+		trans = transport.NewBatchedTransport(inner)
+	}
+
+	// Benchmark modes run the transport directly with no tunnel / raw socket,
+	// so they never touch the host network.
+	if *benchSink {
+		runBenchSink(trans)
+		return
+	}
+	if *benchSend > 0 {
+		runBenchSend(trans, *benchSend, *benchCompressible)
+		return
+	}
 
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
