@@ -39,12 +39,24 @@ type DocSession struct {
 	WriteQueue chan []byte
 	UserID     string
 	writeMu    sync.Mutex
+	closeOnce  sync.Once
+	closed     atomic.Bool
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.Conn.WriteMessage(messageType, data)
+}
+
+// forceClose closes the underlying connection exactly once. This unblocks any
+// goroutine parked in conn.ReadMessage, so a half-closed socket (writes fail
+// with EPIPE while reads hang forever) still drives the reconnect path.
+func (s *DocSession) forceClose() {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.Conn.Close()
+	})
 }
 
 type YandexDocsTransport struct {
@@ -252,10 +264,14 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 		session := t.session
 		t.Mu.Unlock()
 
-		if session != nil && session.Conn != nil {
+		if session != nil && session.Conn != nil && !session.closed.Load() {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
-				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
+				utils.Debugf("[YDOCS] Keep-alive failed, forcing reconnect: %v", err)
 				t.SetConnected(false)
+				// Tear down the dead socket so the read loop unblocks and
+				// scheduleReconnect fires; otherwise a half-closed connection
+				// loops keep-alive failures forever without ever reconnecting.
+				session.forceClose()
 			}
 		}
 	}

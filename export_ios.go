@@ -12,6 +12,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +74,11 @@ func init() {
 	// per-packet logging is expensive.
 	utils.SetOutput(logbuf)
 
+	// Capture fatal Go crashes (throw/unrecovered panic — invisible in iOS crash
+	// logs) to a file, and surface the previous crash's traceback in the log on
+	// the next launch so we can diagnose device-only aborts.
+	setupCrashCapture()
+
 	// The client's local (mobile) DNS may be poisoned for censored hosts
 	// (observed: ifconfig.me -> 240.0.1.72, a reserved address). Resolve names
 	// over DNS-over-TLS instead so DialTCP gets real IPs to hand the exit node.
@@ -79,6 +87,25 @@ func init() {
 		StrictErrors: false,
 		Dial:         dialSecureDNS,
 	}
+}
+
+// crashFile keeps the fatal-crash sink fd open for the process lifetime.
+var crashFile *os.File
+
+func setupCrashCapture() {
+	path := filepath.Join(os.TempDir(), "oflux-crash.log")
+	// Surface the previous run's crash traceback (if any) into the app log.
+	if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+		logbuf.Write([]byte("===== PREVIOUS CRASH (Go traceback) ====="))
+		logbuf.Write(b)
+		logbuf.Write([]byte("===== END PREVIOUS CRASH ====="))
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return
+	}
+	crashFile = f
+	debug.SetCrashOutput(f, debug.CrashOptions{})
 }
 
 // dotServer is a DNS-over-TLS endpoint (addr:853 + TLS SNI).
@@ -183,10 +210,41 @@ const (
 	startPanic          = 5
 )
 
+// buildDocTransport turns a document-URL spec into a transport. A single URL
+// yields one compressed channel (unchanged behavior); a comma-separated list
+// yields a MultiplexTransport that stripes flows across the documents to widen
+// the aggregate channel. Each inner document is wrapped in its own
+// CompressedTransport, so the exit node just runs the same URL list. Shared by
+// both the in-app SOCKS core and the packet-tunnel extension.
+func buildDocTransport(spec string, config transport.TransportConfig, factory func(string) transport.Transport) transport.Transport {
+	var urls []string
+	for _, u := range strings.Split(spec, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			urls = append(urls, u)
+		}
+	}
+
+	if len(urls) <= 1 {
+		u := spec
+		if len(urls) == 1 {
+			u = urls[0]
+		}
+		return transport.NewCompressedTransport(factory(u))
+	}
+
+	channels := make([]transport.Transport, 0, len(urls))
+	for _, u := range urls {
+		channels = append(channels, transport.NewCompressedTransport(factory(u)))
+	}
+	utils.Debugf("[BRIDGE] multiplex: %d channels", len(channels))
+	return transport.NewMultiplexTransport(channels)
+}
+
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
 //
 // transportType: "yandex" or "oneme".
-// url:           Yandex.Docs document URL (yandex transport).
+// url:           Yandex.Docs document URL (yandex transport). A comma-separated
+//                list multiplexes across those documents.
 // socksAddr:     e.g. "127.0.0.1:1080".
 // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
 //
@@ -228,10 +286,13 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return yandex.NewYandexDocsTransport(u, config)
+		})
 	case "volga", "vyandex":
-		t = transport.NewCompressedTransport(
-			yandex.NewYandexVolgaTransportWithConfig(docURL, config, yandex.SlimVolgaConfig()))
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return yandex.NewYandexVolgaTransportWithConfig(u, config, yandex.SlimVolgaConfig())
+		})
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var tunnel = TunnelController()
@@ -13,7 +14,10 @@ struct ContentView: View {
     @AppStorage("debugLog") private var debugLog: Bool = false
     @AppStorage("dnsPreset") private var dnsPreset: String = "default"
     @AppStorage("dnsCustom") private var dnsCustom: String = ""
+    @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
     @State private var showInfo = false
+    @State private var showImportResult = false
+    @State private var importOK = false
 
     private var transport: TransportKind {
         TransportKind(rawValue: transportRaw) ?? .yandex
@@ -37,6 +41,25 @@ struct ContentView: View {
         dnsSpec.withCString { OpenFluxSetDoTResolver(UnsafeMutablePointer(mutating: $0)) }
     }
 
+    /// Import an "OFLUX1:" config string (base64url of {t,u}) — sets the
+    /// transport and document URL in one paste. Returns false if it can't parse.
+    @discardableResult
+    private func importConfig(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("OFLUX1:") else { return false }
+        var b64 = String(s.dropFirst("OFLUX1:".count))
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let u = obj["u"] as? String, !u.isEmpty else { return false }
+        let t = (obj["t"] as? String) ?? "volga"
+        docURL = u
+        transportRaw = (t == "vyandex" ? "volga" : t)
+        return true
+    }
+
     private var canStart: Bool {
         guard (Int(socksPort) ?? 0) > 0 else { return false }
         switch transport {
@@ -57,6 +80,16 @@ struct ContentView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(tunnel.running)
+
+                    Button {
+                        importOK = importConfig(UIPasteboard.general.string ?? "")
+                        showImportResult = true
+                    } label: {
+                        Label("Import config from clipboard", systemImage: "square.and.arrow.down")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
                     .disabled(tunnel.running)
 
                     connectionFields
@@ -88,6 +121,14 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showInfo) { InfoView() }
+            .alert(importOK ? "Config imported" : "No valid config",
+                   isPresented: $showImportResult) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(importOK
+                     ? "Transport and document URL were filled in. Tap Start VPN."
+                     : "Copy an OFLUX1:… config string, then tap Import again.")
+            }
         }
         .navigationViewStyle(.stack)
     }
@@ -192,7 +233,8 @@ struct ContentView: View {
             } else {
                 Button {
                     vpn.start(transport: transport.rawValue, url: docURL,
-                              maxToken: maxToken, maxUid: maxUid, dns: dnsSpec)
+                              maxToken: maxToken, maxUid: maxUid, dns: dnsSpec,
+                              tunnelUDP: tunnelUDP)
                 } label: {
                     Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
                 }
@@ -200,6 +242,12 @@ struct ContentView: View {
                 .disabled(!canStart)
             }
             Text("Routes the whole device through the exit node (TCP + DNS-over-TCP).")
+                .font(.caption2).foregroundColor(.secondary)
+            Toggle(isOn: $tunnelUDP) {
+                Text("Tunnel UDP / QUIC").font(.caption)
+            }
+            .disabled(vpn.active)
+            Text("Off = QUIC falls back to TCP (works on any node). On = tunnel UDP — needs a UDP-capable exit node.")
                 .font(.caption2).foregroundColor(.secondary)
         }
     }

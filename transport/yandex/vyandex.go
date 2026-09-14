@@ -498,9 +498,11 @@ func (r *relayClient) Start() {
 }
 
 func (r *relayClient) Stop() {
+	// Do NOT close(queue)/close(batchQueue): a client TCP connection tearing
+	// down can still call Send concurrently (gvisor emits a final FIN/RST during
+	// Close), and a send on a closed channel is a fatal panic that recover()
+	// cannot catch. Workers already exit on ctx.Done(); the channels are GC'd.
 	r.cancel()
-	close(r.queue)
-	close(r.batchQueue)
 	r.wg.Wait()
 }
 
@@ -510,6 +512,10 @@ func (r *relayClient) Send(data []byte) error {
 	}
 	if len(data) > r.config.MaxPayloadBytes {
 		return fmt.Errorf("packet too large: %d > %d", len(data), r.config.MaxPayloadBytes)
+	}
+	// Stopped: drop instead of queuing (workers are gone, nothing drains it).
+	if r.ctx.Err() != nil {
+		return fmt.Errorf("relay stopped")
 	}
 
 	cp := make([]byte, len(data))
@@ -526,6 +532,11 @@ func (r *relayClient) Send(data []byte) error {
 
 func (r *relayClient) worker(id int) {
 	defer r.wg.Done()
+	defer func() {
+		if rec := recover(); rec != nil {
+			utils.Debugf("[VOLGA] recovered in worker %d: %v", id, rec)
+		}
+	}()
 
 	batch := make([][]byte, 0, r.config.BatchSize)
 	totalBytes := 0
@@ -739,6 +750,11 @@ func (w *wsListener) Stop() {
 }
 
 func (w *wsListener) run() {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Debugf("[VOLGA] recovered in ws run: %v", r)
+		}
+	}()
 	delay := w.config.ReconnectMinDelay
 
 	for {
@@ -793,8 +809,8 @@ func (w *wsListener) connect() error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
-		ReadBufferSize:   4 << 20,
-		WriteBufferSize:  4 << 20,
+		ReadBufferSize:   128 << 10, // 4MB was needlessly large; 128KB keeps the
+		WriteBufferSize:  128 << 10, // iOS Network Extension well under its memory cap.
 	}
 
 	conn, _, err := dialer.Dial(wsURL, header)
@@ -805,6 +821,37 @@ func (w *wsListener) connect() error {
 
 	utils.Debugf("[VOLGA] WS connected: user=%s", w.auth.UserIDStr)
 
+	// Keepalive: ping periodically and extend the read deadline on pong/message.
+	// A silently-dropped ws (NAT/idle timeout, server drop without close) is then
+	// detected within ~pongWait instead of freezing the tunnel for the full read
+	// timeout. The relay sends over HTTP, so this ping goroutine is the ws's only
+	// writer — no concurrent-write hazard.
+	const pongWait = 35 * time.Second
+	const pingPeriod = 15 * time.Second
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(pingPeriod)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			case <-done:
+				return
+			case <-w.ctx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -812,17 +859,23 @@ func (w *wsListener) connect() error {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
-
+		conn.SetReadDeadline(time.Now().Add(pongWait))
 		w.handleMessage(msg)
 	}
 }
 
 func (w *wsListener) handleMessage(raw []byte) {
+	// A malformed/unexpected server message must never crash the process — swallow
+	// the panic and keep the WebSocket loop alive.
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Debugf("[VOLGA] recovered in handleMessage: %v", r)
+		}
+	}()
 	var envelope struct {
 		Operation string `json:"operation"`
 		Message   string `json:"message"`
@@ -1055,6 +1108,11 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
 }
 
 func (t *YandexVolgaTransport) keepAliveLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Debugf("[VOLGA] recovered in keepAliveLoop: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(t.config.KeepAliveInterval)
 	defer ticker.Stop()
 
@@ -1072,6 +1130,11 @@ func (t *YandexVolgaTransport) keepAliveLoop() {
 }
 
 func (t *YandexVolgaTransport) statsLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			utils.Debugf("[VOLGA] recovered in statsLoop: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 

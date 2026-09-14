@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -68,20 +69,30 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		return C.int(startAlreadyRunning)
 	}
 
-	// Keep the extension well under the NE memory cap.
+	// Memory strategy: SetMemoryLimit is the hard backstop that keeps us under
+	// the NE cap; GCPercent then only controls how eagerly we collect BELOW that
+	// limit. GCPercent=20 forced a GC on every 20% heap growth — under a
+	// throughput load (compression + WebSocket framing + packet copies) that
+	// pins the phone CPU in near-continuous GC and caps throughput. Raise it so
+	// GC is driven by the memory limit, not by needless frequent cycles; peak
+	// memory is still bounded by SetMemoryLimit, so this does not risk jetsam.
 	debug.SetMemoryLimit(40 << 20)
-	debug.SetGCPercent(20)
+	debug.SetGCPercent(100)
 
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return yandex.NewYandexDocsTransport(u, config)
+		})
 	case "volga", "vyandex":
 		// Slim VOLGA profile so the relay worker pool + queues stay under the
-		// NE memory cap (the default is a server profile).
-		t = transport.NewCompressedTransport(
-			yandex.NewYandexVolgaTransportWithConfig(docURL, config, yandex.SlimVolgaConfig()))
+		// NE memory cap (the default is a server profile). Note: multiplexing
+		// VOLGA multiplies that pool per channel, so keep VOLGA lists short.
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return yandex.NewYandexVolgaTransportWithConfig(u, config, yandex.SlimVolgaConfig())
+		})
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
@@ -89,7 +100,11 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		return C.int(startBadTransport)
 	}
 
-	outQ := make(chan []byte, 1024)
+	// Device-bound packet queue. 1024 was too shallow: a download burst fills it
+	// faster than the device drains, packets get dropped, and the tunneled TCP
+	// treats that as loss and backs off — throttling throughput. A deeper queue
+	// absorbs bursts; entries are transient and bounded by the memory limit.
+	outQ := make(chan []byte, 4096)
 	// Packets coming back from the exit node -> queue for the device.
 	t.Receive(func(data []byte) {
 		select {
@@ -141,22 +156,39 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 		}
 		dstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
 		if dstPort == 53 {
-			// Bound concurrent DNS resolutions so a burst can't spawn an
-			// unbounded pile of goroutines + TLS handshakes (memory).
+			// DNS is answered locally over DNS-over-TLS (defeats poisoning and
+			// avoids a round-trip through the covert channel for every query).
+			// Bound concurrent resolutions so a burst can't spawn an unbounded
+			// pile of goroutines + TLS handshakes (memory).
 			select {
 			case dnsSem <- struct{}{}:
 				go func() { defer func() { <-dnsSem }(); handleDNSPacket(pkt, outQ) }()
 			default: // too many in flight: drop, the client retries
 			}
+		} else if tunnelUDP.Load() {
+			// UDP tunneling ON: forward all other UDP (QUIC/HTTP3, games, …)
+			// over the transport; the exit node NATs it on its raw socket.
+			// Requires a UDP-capable exit node.
+			t.Send(pkt)
 		} else {
-			// We can't carry UDP (TCP-only transport). Instead of silently
-			// dropping it (which makes apps stall on QUIC/UDP:443 before
-			// falling back to TCP), reply ICMP port-unreachable so they switch
-			// to TCP immediately.
+			// UDP tunneling OFF (default, legacy-safe): reply ICMP
+			// port-unreachable so apps fall back from QUIC/UDP:443 to TCP fast
+			// instead of stalling — works against any (TCP-only) exit node.
 			sendICMPPortUnreachable(pkt, outQ)
 		}
 	}
 }
+
+// tunnelUDP controls whether non-DNS UDP is forwarded over the transport (ON,
+// needs a UDP-capable exit node) or fast-failed with ICMP (OFF, legacy-safe on
+// any exit node). Default OFF so a single build works against both node types.
+var tunnelUDP atomic.Bool
+
+// OpenFluxSetTunnelUDP toggles UDP forwarding. Set before starting the tunnel
+// (the extension reads it from providerConfiguration).
+//
+//export OpenFluxSetTunnelUDP
+func OpenFluxSetTunnelUDP(on C.int) { tunnelUDP.Store(on != 0) }
 
 // sendICMPPortUnreachable enqueues an ICMP "destination/port unreachable" for a
 // UDP datagram we won't forward, so the sender falls back to TCP fast.

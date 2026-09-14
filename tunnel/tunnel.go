@@ -81,6 +81,13 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 	}
 
 	trans.Receive(func(data []byte) {
+		// Exit node: UDP is NATed directly on the raw socket (the gvisor stack
+		// only speaks TCP), so intercept it before it enters the stack. TCP and
+		// everything else go through gvisor as before.
+		if isExitNode && t.rawEP != nil && len(data) >= 20 && data[0]>>4 == 4 && data[9] == 17 {
+			t.rawEP.SendUDPOut(data)
+			return
+		}
 		tunnelEP.InjectInbound(data)
 	})
 

@@ -37,6 +37,39 @@ func TCPChecksum(tcpData []byte, srcIP, dstIP [4]byte) uint16 {
 	return uint16(^sum)
 }
 
+// UDPChecksum computes the UDP checksum over the pseudo-header + UDP datagram.
+// The caller must zero the checksum field (bytes 6-7 of udpData) beforehand.
+// Per RFC 768 a computed value of 0 is transmitted as 0xFFFF (0 means "none").
+func UDPChecksum(udpData []byte, srcIP, dstIP [4]byte) uint16 {
+	udpLen := len(udpData)
+	pseudoHeader := []byte{
+		srcIP[0], srcIP[1], srcIP[2], srcIP[3],
+		dstIP[0], dstIP[1], dstIP[2], dstIP[3],
+		0, 17,
+		byte(udpLen >> 8), byte(udpLen & 0xff),
+	}
+
+	all := make([]byte, 0, len(pseudoHeader)+udpLen)
+	all = append(all, pseudoHeader...)
+	all = append(all, udpData...)
+
+	sum := uint32(0)
+	for i := 0; i < len(all)-1; i += 2 {
+		sum += uint32(all[i])<<8 | uint32(all[i+1])
+	}
+	if len(all)%2 == 1 {
+		sum += uint32(all[len(all)-1]) << 8
+	}
+	for sum>>16 > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	csum := uint16(^sum)
+	if csum == 0 {
+		return 0xFFFF
+	}
+	return csum
+}
+
 func IPChecksum(b []byte) uint16 {
 	sum := uint32(0)
 	for i := 0; i < len(b)-1; i += 2 {

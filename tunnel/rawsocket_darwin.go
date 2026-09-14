@@ -69,6 +69,10 @@ func (e *RawSocketEndpoint) SetTransportSender(sendFunc func([]byte)) {
 	e.sendToTransport = sendFunc
 }
 
+// SendUDPOut is a no-op here: UDP L3 NAT is implemented for the Linux exit node
+// only (see rawsocket_linux.go). Exit nodes don't run on darwin.
+func (e *RawSocketEndpoint) SendUDPOut([]byte) {}
+
 func (e *RawSocketEndpoint) readLoop() {
 	buf := make([]byte, 65535)
 

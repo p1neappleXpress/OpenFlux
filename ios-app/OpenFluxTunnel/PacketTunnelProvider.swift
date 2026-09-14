@@ -37,12 +37,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let maxToken = (conf["maxToken"] as? String) ?? ""
         let maxUid = (conf["maxUid"] as? String) ?? ""
         let dnsSpec = (conf["dns"] as? String) ?? ""
+        let tunnelUDP = (conf["udp"] as? String) == "1"
 
         // Override the DNS-over-TLS upstream if the user configured one (empty =
         // built-in defaults). Must run in the extension process before start.
         dnsSpec.withCString { d in
             OpenFluxSetDoTResolver(UnsafeMutablePointer(mutating: d))
         }
+        // UDP tunneling (default off = legacy-safe on any exit node).
+        OpenFluxSetTunnelUDP(tunnelUDP ? 1 : 0)
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
