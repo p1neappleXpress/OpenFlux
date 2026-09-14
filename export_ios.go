@@ -229,12 +229,12 @@ func buildDocTransport(spec string, config transport.TransportConfig, factory fu
 		if len(urls) == 1 {
 			u = urls[0]
 		}
-		return transport.NewCompressedTransport(factory(u))
+		return transport.NewBatchedTransport(factory(u))
 	}
 
 	channels := make([]transport.Transport, 0, len(urls))
 	for _, u := range urls {
-		channels = append(channels, transport.NewCompressedTransport(factory(u)))
+		channels = append(channels, transport.NewBatchedTransport(factory(u)))
 	}
 	utils.Debugf("[BRIDGE] multiplex: %d channels", len(channels))
 	return transport.NewMultiplexTransport(channels)
