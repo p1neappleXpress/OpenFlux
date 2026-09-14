@@ -25,12 +25,12 @@ var (
 )
 
 // buildMuxTransport turns a document-URL spec into a transport. The spec is a
-// comma-separated list: a single URL yields one batched channel, while multiple
-// URLs yield a MultiplexTransport that stripes flows across the documents. Each
-// inner document is wrapped in its own BatchedTransport, which coalesces queued
-// packets into one zstd frame per channel message (far fewer Yandex messages
-// than the old per-packet codec); the exit node runs the same URL list.
-// NOTE: batching is symmetric — client and exit node must both use it.
+// comma-separated list: a single URL yields one channel, while multiple URLs
+// yield a MultiplexTransport that stripes flows across the documents. Each inner
+// document is wrapped in its own AdaptiveTransport, a self-negotiating codec
+// that starts in the legacy per-packet format and upgrades to batching once the
+// peer proves it speaks batch — so a new build interoperates with an old peer
+// (staying legacy) instead of breaking, and runs fast when both are new.
 func buildMuxTransport(urlSpec string, factory func(string) transport.Transport) transport.Transport {
 	var urls []string
 	for _, u := range strings.Split(urlSpec, ",") {
@@ -44,12 +44,12 @@ func buildMuxTransport(urlSpec string, factory func(string) transport.Transport)
 		if len(urls) == 1 {
 			u = urls[0]
 		}
-		return transport.NewBatchedTransport(factory(u))
+		return transport.NewAdaptiveTransport(factory(u))
 	}
 
 	channels := make([]transport.Transport, 0, len(urls))
 	for _, u := range urls {
-		channels = append(channels, transport.NewBatchedTransport(factory(u)))
+		channels = append(channels, transport.NewAdaptiveTransport(factory(u)))
 	}
 	log.Printf("Multiplex: %d channels", len(channels))
 	return transport.NewMultiplexTransport(channels)

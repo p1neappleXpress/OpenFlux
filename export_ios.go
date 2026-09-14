@@ -211,11 +211,12 @@ const (
 )
 
 // buildDocTransport turns a document-URL spec into a transport. A single URL
-// yields one compressed channel (unchanged behavior); a comma-separated list
-// yields a MultiplexTransport that stripes flows across the documents to widen
-// the aggregate channel. Each inner document is wrapped in its own
-// CompressedTransport, so the exit node just runs the same URL list. Shared by
-// both the in-app SOCKS core and the packet-tunnel extension.
+// yields one channel; a comma-separated list yields a MultiplexTransport that
+// stripes flows across the documents. Each inner document is wrapped in its own
+// AdaptiveTransport, a self-negotiating codec that starts legacy and upgrades to
+// batching once the peer proves it speaks batch — so an updated app keeps
+// working against an old exit node instead of breaking. Shared by both the
+// in-app SOCKS core and the packet-tunnel extension.
 func buildDocTransport(spec string, config transport.TransportConfig, factory func(string) transport.Transport) transport.Transport {
 	var urls []string
 	for _, u := range strings.Split(spec, ",") {
@@ -229,12 +230,12 @@ func buildDocTransport(spec string, config transport.TransportConfig, factory fu
 		if len(urls) == 1 {
 			u = urls[0]
 		}
-		return transport.NewBatchedTransport(factory(u))
+		return transport.NewAdaptiveTransport(factory(u))
 	}
 
 	channels := make([]transport.Transport, 0, len(urls))
 	for _, u := range urls {
-		channels = append(channels, transport.NewBatchedTransport(factory(u)))
+		channels = append(channels, transport.NewAdaptiveTransport(factory(u)))
 	}
 	utils.Debugf("[BRIDGE] multiplex: %d channels", len(channels))
 	return transport.NewMultiplexTransport(channels)
