@@ -22,6 +22,7 @@ import (
 
 	"universal-bypass-tool/network"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/mailru"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/utils"
@@ -92,6 +93,10 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		// VOLGA multiplies that pool per channel, so keep VOLGA lists short.
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return yandex.NewYandexVolgaTransportWithConfig(u, config, yandex.SlimVolgaConfig())
+		})
+	case "mailru", "mail":
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return mailru.NewMailruDocsTransport(u, config)
 		})
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)

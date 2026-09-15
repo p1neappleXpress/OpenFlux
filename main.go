@@ -12,6 +12,7 @@ import (
         _ "github.com/wlynxg/anet"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/mailru"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
@@ -104,6 +105,10 @@ func main() {
 	case "vyandex", "volga":
 		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
 			return yandex.NewYandexVolgaTransport(u, config)
+		})
+	case "mailru", "mail":
+		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
+			return mailru.NewMailruDocsTransport(u, config)
 		})
 	case "oneme":
 		uidint, _ := strconv.ParseInt(maxUid, 10, 64)

@@ -4,17 +4,19 @@ import Combine
 enum TransportKind: String, CaseIterable, Identifiable {
     case yandex = "yandex"
     case volga = "volga"
+    case mail = "mailru"
     case max = "oneme"
     var id: String { rawValue }
     var title: String {
         switch self {
         case .yandex: return "Yandex Docs"
         case .volga:  return "VOLGA"
+        case .mail:   return "Mail.ru"
         case .max:    return "MAX"
         }
     }
-    /// VOLGA uses the same Yandex.Docs document URL as the classic transport.
-    var usesDocURL: Bool { self == .yandex || self == .volga }
+    /// Document-based transports that take a public document URL / weblink.
+    var usesDocURL: Bool { self == .yandex || self == .volga || self == .mail }
 }
 
 /// Swift wrapper around the OpenFlux Go static library (liboflux.a).
@@ -108,6 +110,29 @@ final class TunnelController: ObservableObject {
         if log.count > 20000 {
             log = String(log.suffix(20000))
         }
+    }
+
+    /// Connectivity check WITHOUT the local proxy — used when the system VPN is
+    /// active (all device traffic already routes through the tunnel), so a plain
+    /// request exercises the VPN path itself.
+    func testDirect() {
+        appendLog("[app] test request (system VPN path) ...")
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 20
+        let session = URLSession(configuration: config)
+        let url = URL(string: "http://ifconfig.me/ip")!
+        let task = session.dataTask(with: url) { [weak self] data, _, err in
+            Task { @MainActor in
+                if let err = err {
+                    self?.appendLog("[app] test failed: \(err.localizedDescription)")
+                } else if let data = data, let body = String(data: data, encoding: .utf8) {
+                    self?.appendLog("[app] test OK, exit IP: \(body.trimmingCharacters(in: .whitespacesAndNewlines))")
+                } else {
+                    self?.appendLog("[app] test returned no data")
+                }
+            }
+        }
+        task.resume()
     }
 
     /// Connectivity check routed through the local SOCKS5 proxy.

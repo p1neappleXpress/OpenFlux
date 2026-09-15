@@ -6,7 +6,13 @@ struct ContentView: View {
     @StateObject private var vpn = VPNController()
 
     @AppStorage("transportKind") private var transportRaw: String = TransportKind.yandex.rawValue
-    @AppStorage("docURL") private var docURL: String = ""
+    // Each transport keeps its OWN document field so switching methods doesn't
+    // carry a Yandex link into the Mail.ru/VOLGA field and vice versa.
+    @AppStorage("docURL") private var docURL: String = ""   // Yandex Docs #1
+    @AppStorage("docURL2") private var docURL2: String = "" // Yandex Docs #2 (optional)
+    @AppStorage("volgaURL") private var volgaURL: String = "" // VOLGA (single)
+    @AppStorage("mailURL") private var mailURL: String = ""   // Mail.ru (single)
+    @State private var showSecondDoc = false
     @AppStorage("maxToken") private var maxToken: String = ""
     @AppStorage("maxUid") private var maxUid: String = ""
     // Uncommon default port to avoid clashing with other local proxies.
@@ -55,16 +61,51 @@ struct ContentView: View {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let u = obj["u"] as? String, !u.isEmpty else { return false }
         let t = (obj["t"] as? String) ?? "volga"
-        docURL = u
-        transportRaw = (t == "vyandex" ? "volga" : t)
+        let kind = (t == "vyandex" ? "volga" : t)
+        transportRaw = kind
+        // A config may bundle a comma-separated document list. Route it into the
+        // field that belongs to the imported transport.
+        let parts = u.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }.filter { !$0.isEmpty }
+        let first = parts.first ?? u
+        switch kind {
+        case "yandex":
+            docURL = first
+            if parts.count > 1 { docURL2 = parts[1]; showSecondDoc = true }
+            else { docURL2 = ""; showSecondDoc = false }
+        case "volga":
+            volgaURL = first
+        case "mailru":
+            mailURL = first
+        default:
+            docURL = first
+        }
         return true
+    }
+
+    /// Document URL(s) handed to the Go core. Yandex.Docs may run two channels
+    /// (comma-joined); VOLGA is single-document only, so its second field is
+    /// never included even if one was left over from a previous transport.
+    private var effectiveURL: String {
+        switch transport {
+        case .yandex:
+            let a = docURL.trimmingCharacters(in: .whitespaces)
+            let b = docURL2.trimmingCharacters(in: .whitespaces)
+            return b.isEmpty ? a : "\(a),\(b)"
+        case .volga: return volgaURL.trimmingCharacters(in: .whitespaces)
+        case .mail:  return mailURL.trimmingCharacters(in: .whitespaces)
+        case .max:   return ""
+        }
     }
 
     private var canStart: Bool {
         guard (Int(socksPort) ?? 0) > 0 else { return false }
         switch transport {
-        case .yandex, .volga: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
-        case .max:            return !maxToken.isEmpty && !maxUid.isEmpty
+        case .yandex: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .volga:  return !volgaURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .mail:   return !mailURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .max:    return !maxToken.isEmpty && !maxUid.isEmpty
         }
     }
 
@@ -136,10 +177,43 @@ struct ContentView: View {
     @ViewBuilder
     private var connectionFields: some View {
         switch transport {
-        case .yandex, .volga:
+        case .yandex:
             field(title: "Yandex Docs URL",
-                  placeholder: "https://docs.yandex.ru/docs/view?url=...",
+                  placeholder: "https://disk.yandex.ru/i/…",
                   text: $docURL)
+            if showSecondDoc || !docURL2.isEmpty {
+                field(title: "Yandex Docs URL 2",
+                      placeholder: "second document (optional)",
+                      text: $docURL2)
+                Button(role: .destructive) {
+                    docURL2 = ""
+                    showSecondDoc = false
+                } label: {
+                    Label("Remove second document", systemImage: "minus.circle")
+                }
+                .font(.footnote)
+                .disabled(tunnel.running)
+            } else {
+                Button { showSecondDoc = true } label: {
+                    Label("Add second document", systemImage: "plus.circle")
+                }
+                .font(.footnote)
+                .disabled(tunnel.running)
+            }
+            Text("Two documents run in parallel for more speed and failover. The exit node must serve the same documents.")
+                .font(.caption2).foregroundColor(.secondary)
+        case .volga:
+            field(title: "VOLGA document URL",
+                  placeholder: "https://disk.yandex.ru/i/…",
+                  text: $volgaURL)
+            Text("VOLGA supports a single document only.")
+                .font(.caption2).foregroundColor(.secondary)
+        case .mail:
+            field(title: "Mail.ru public link",
+                  placeholder: "https://cloud.mail.ru/public/…",
+                  text: $mailURL)
+            Text("Mail.ru Cloud public document link (single document).")
+                .font(.caption2).foregroundColor(.secondary)
         case .max:
             field(title: "MAX token", placeholder: "auth token", text: $maxToken)
             field(title: "MAX user ID", placeholder: "numeric id", text: $maxUid,
@@ -168,7 +242,7 @@ struct ContentView: View {
                 } else {
                     Button {
                         tunnel.start(transport: transport,
-                                     url: docURL,
+                                     url: effectiveURL,
                                      maxToken: maxToken,
                                      maxUid: maxUid,
                                      port: Int(socksPort) ?? 10808)
@@ -176,17 +250,26 @@ struct ContentView: View {
                         Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canStart)
+                    .disabled(!canStart || vpn.active)
                 }
-                Button { tunnel.testThroughProxy() } label: {
+                Button {
+                    // In-app core running -> test via SOCKS; system VPN active
+                    // -> test the VPN path directly (no proxy).
+                    if tunnel.running { tunnel.testThroughProxy() }
+                    else { tunnel.testDirect() }
+                } label: {
                     Label("Test", systemImage: "network").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(!tunnel.running)
+                .disabled(!tunnel.running && !vpn.active)
             }
             if tunnel.running {
                 Text("SOCKS5 proxy: \(tunnel.socksAddr)")
                     .font(.footnote).foregroundColor(.secondary)
+            }
+            if vpn.active {
+                Text("System VPN is active — the in-app proxy is off (they can't run together). Test connectivity by opening a site.")
+                    .font(.caption2).foregroundColor(.secondary)
             }
         }
     }
@@ -232,7 +315,11 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
             } else {
                 Button {
-                    vpn.start(transport: transport.rawValue, url: docURL,
+                    // Mutual exclusion: the in-app SOCKS core and the system VPN
+                    // are both "the client" and would collide on the same document
+                    // (both use client IP 10.10.10.2). Stop the in-app core first.
+                    tunnel.stop()
+                    vpn.start(transport: transport.rawValue, url: effectiveURL,
                               maxToken: maxToken, maxUid: maxUid, dns: dnsSpec,
                               tunnelUDP: tunnelUDP)
                 } label: {

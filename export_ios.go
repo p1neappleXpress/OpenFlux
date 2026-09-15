@@ -23,6 +23,7 @@ import (
 
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/mailru"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
@@ -293,6 +294,10 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	case "volga", "vyandex":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return yandex.NewYandexVolgaTransportWithConfig(u, config, yandex.SlimVolgaConfig())
+		})
+	case "mailru", "mail":
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return mailru.NewMailruDocsTransport(u, config)
 		})
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)

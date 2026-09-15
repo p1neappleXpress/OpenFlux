@@ -84,8 +84,51 @@ working if one document's channel drops.
 --url "https://disk.yandex.ru/i/AAAA,https://disk.yandex.ru/i/BBBB"
 ```
 
-In the iOS app, paste the same comma-separated list (no spaces) in the document
-field.
+In the iOS app, use the **+ (Add second document)** button to enter the second
+document (VOLGA is single-document only, so it has no + button).
+
+## 5. Import config (`OFLUX1:`)
+
+Instead of entering the transport and document URL(s) by hand, the app can
+import them from a single `OFLUX1:` string — the **Import** button reads it from
+the clipboard and fills in the fields.
+
+Format:
+
+```
+OFLUX1:<base64url(JSON)>
+```
+
+where the JSON is:
+
+```json
+{"t":"yandex","u":"https://disk.yandex.ru/i/XXXXXXXXXXXX"}
+```
+
+- `t` — transport: `yandex` (classic) or `volga`. Optional (defaults to volga);
+  `vyandex` is accepted as an alias for `volga`.
+- `u` — document URL, or a comma-separated list for a Yandex multi-document
+  setup. Required.
+- The payload is standard base64 with `+`→`-`, `/`→`_`, and `=` padding removed
+  (base64url); the app re-adds the padding on import.
+
+Generate one from the shell:
+
+```bash
+echo -n '{"t":"yandex","u":"https://disk.yandex.ru/i/XXXXXXXXXXXX"}' | \
+  { printf 'OFLUX1:'; base64 | tr '+/' '-_' | tr -d '='; }
+```
+
+Examples (placeholder document IDs):
+
+```
+# single Yandex document
+OFLUX1:eyJ0IjoieWFuZGV4IiwidSI6Imh0dHBzOi8vZGlzay55YW5kZXgucnUvaS9YWFhYWFhYWFhYWFgifQ
+# two Yandex documents
+OFLUX1:eyJ0IjoieWFuZGV4IiwidSI6Imh0dHBzOi8vZGlzay55YW5kZXgucnUvaS9BQUFBLGh0dHBzOi8vZGlzay55YW5kZXgucnUvaS9CQkJCIn0
+# single VOLGA document
+OFLUX1:eyJ0Ijoidm9sZ2EiLCJ1IjoiaHR0cHM6Ly9kaXNrLnlhbmRleC5ydS9pL1hYWFhYWFhYWFhYWCJ9
+```
 
 ## Rules that must hold (client ↔ exit node)
 
@@ -95,7 +138,7 @@ These are the common causes of a stuck **`connecting`** state:
 |------|-----|
 | **Same document list** on both sides — exact same URLs, same order. | With a multi-document exit node, reply traffic is spread across all documents; a client listening on fewer documents never receives the replies routed to the ones it is missing. |
 | **Same transport** on both sides. | `yandex` and `volga` use different document channels and are not wire-compatible. |
-| **Same build version** on both sides. | The wire codec is symmetric; a client and exit node on different versions can produce incompatible frames. |
+| **Mixed build versions are OK.** | The codec self-negotiates: a newer client and an older exit node (or vice versa) fall back to the legacy per-packet format and keep working; they upgrade to batching only when both support it. Updating one side no longer breaks the other. |
 
 If the client is stuck on `connecting`, check those three first, then confirm
 the exit node log shows `WebSocket connected` for every document.

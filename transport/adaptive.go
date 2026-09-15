@@ -65,6 +65,11 @@ type AdaptiveTransport struct {
 	peerBatch atomic.Bool
 	running   atomic.Bool
 
+	// forceLegacy pins this side to the legacy per-packet codec (no batching,
+	// no probes) regardless of the peer — a debug override, set via
+	// OPENFLUX_FORCE_LEGACY=1, for A/B measurement or interop testing.
+	forceLegacy bool
+
 	lingerMs      int
 	maxBatchBytes int
 	maxBatchCount int
@@ -77,6 +82,7 @@ func NewAdaptiveTransport(inner Transport) *AdaptiveTransport {
 	return &AdaptiveTransport{
 		Transport:     inner,
 		queue:         make(chan []byte, batchQueueDepth),
+		forceLegacy:   os.Getenv("OPENFLUX_FORCE_LEGACY") == "1",
 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
 		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
 		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
@@ -157,6 +163,9 @@ func (a *AdaptiveTransport) deliver(pkts [][]byte) {
 // legacy peer discards it, a batch peer flips to sending us batches. We keep
 // probing (slowly) even after negotiation so a peer that reconnects re-learns.
 func (a *AdaptiveTransport) probeLoop() {
+	if a.forceLegacy {
+		return // never advertise batch capability
+	}
 	probe := encodeBatch(nil) // [0x02, 0x00]
 	for a.running.Load() {
 		time.Sleep(probeInterval)
@@ -176,10 +185,10 @@ func (a *AdaptiveTransport) flushLoop() {
 			return
 		}
 
-		// Legacy mode: the peer hasn't proven batch support yet. Send this
-		// packet on its own, compressed exactly like the old codec so any old
-		// peer decodes it.
-		if !a.peerBatch.Load() {
+		// Legacy mode: the peer hasn't proven batch support yet (or we're pinned
+		// to legacy). Send this packet on its own, compressed exactly like the
+		// old codec so any old peer decodes it.
+		if a.forceLegacy || !a.peerBatch.Load() {
 			_ = a.Transport.Send(compress(first))
 			continue
 		}
