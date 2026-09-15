@@ -175,6 +175,7 @@ Notes:
 | `--exit-node` |                     | Run as exit node           |
 | `--socks5`    | `:1080`             | SOCKS5 listen address      |
 | `--url`       | `https://localhost` | Document URL (Yandex Docs) |
+| `--url-file`  | ``                  | Read the document URL from a file instead of `--url` |
 | `--maxToken`  | ``                  | Auth token (Max)           |
 | `--maxUid`    | ``                  | User ID (Max)              |
 | `--debug`     | `false`             | Enable verbose logging     |

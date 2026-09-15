@@ -50,8 +50,8 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -75,6 +75,22 @@ func (t *YandexDocsTransport) Start() error {
 	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
 	t.connectToDoc(0)
 
+	return nil
+}
+
+func (t *YandexDocsTransport) Stop() error {
+	if err := t.BaseTransport.Stop(); err != nil {
+		return err
+	}
+
+	t.Mu.Lock()
+	session := t.session
+	t.session = nil
+	t.Mu.Unlock()
+
+	if session != nil && session.Conn != nil {
+		return session.Conn.Close()
+	}
 	return nil
 }
 
@@ -237,7 +253,11 @@ func (t *YandexDocsTransport) writerLoop() {
 				utils.Debugf("[YDOCS] Write error: %v", err)
 			}
 		default:
-			time.Sleep(10 * time.Millisecond)
+			// Short poll interval: under bursty/ack-clocked traffic the queue
+			// drains and refills faster than the old 10ms granularity, which
+			// was adding up to 10ms of dead time per gap and capping
+			// throughput independent of the network or CPU.
+			time.Sleep(time.Millisecond)
 		}
 	}
 }

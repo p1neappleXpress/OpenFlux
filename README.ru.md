@@ -173,6 +173,7 @@ eyJyb29tcyI6WyI0YTFh...base64...
 | `--exit-node` |                     | Запуск в режиме ноды           |
 | `--socks5`    | `:1080`             | Адрес SOCKS5 прокси            |
 | `--url`       | `https://localhost` | URL документа (Yandex Docs)    |
+| `--url-file`  | ``                  | Прочитать URL документа из файла вместо `--url` |
 | `--maxToken`  | ``                  | Токен авторизации (Max)        |
 | `--maxUid`    | ``                  | ID пользователя (Max)          |
 | `--debug`     | `false`             | Включить подробное логирование |

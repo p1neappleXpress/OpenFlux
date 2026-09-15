@@ -35,6 +35,9 @@ func main() {
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline)")
 	mode := flag.String("mode", "proxy", "Exit-node mode: proxy (default, works everywhere) or raw (Linux only, needs root)")
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
+	urlFile := flag.String("url-file", "",
+		"Read the document URL from a file instead of --url (e.g. to keep it out of the process "+
+			"arguments/shell history on a shared exit-node host)")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (raw mode only, scoped RST drop)")
@@ -42,6 +45,17 @@ func main() {
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
 	flag.Parse()
+
+	if *urlFile != "" {
+		if globalDocUrl != "" && globalDocUrl != "http://#" {
+			log.Fatalf("use only one of --url or --url-file")
+		}
+		data, err := os.ReadFile(*urlFile)
+		if err != nil {
+			log.Fatalf("Read --url-file: %v", err)
+		}
+		globalDocUrl = strings.TrimSpace(string(data))
+	}
 
 	exitMode, err := tunnel.ParseExitMode(*mode)
 	if err != nil {
