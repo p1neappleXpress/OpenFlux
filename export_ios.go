@@ -124,8 +124,8 @@ const (
 
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
 //
-// transportType: "yandex" or "oneme".
-// url:           Yandex.Docs document URL (yandex transport).
+// transportType: "yandex", "vyandex", or "oneme".
+// url:           Yandex.Docs document URL(s). Comma-separated for multi-stream.
 // socksAddr:     e.g. "127.0.0.1:1080".
 // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
 //
@@ -164,17 +164,22 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	probe.Close()
 
 	config := transport.DefaultConfig()
-	var t transport.Transport
+	var inner transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		urls := splitURLs(docURL)
+		inner = buildYandexInner(urls, config, false)
+	case "vyandex":
+		urls := splitURLs(docURL)
+		inner = buildYandexInner(urls, config, true)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		inner = oneme.NewOneMeTransport(false, mToken, uidint, config)
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)
 	}
+	var t transport.Transport = transport.NewCompressedTransport(inner)
 
 	if err := t.Start(); err != nil {
 		utils.Debugf("[BRIDGE] Failed to start transport: %v", err)

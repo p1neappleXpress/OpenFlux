@@ -65,6 +65,40 @@ TCP packets are sent via Transport. Currently, there are three transports availa
 
 Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to destination point.
 
+## Multi-stream (issue #50)
+
+Fan a single tunnel across **N Yandex documents** so that if one document's WebSocket dies, the tunnel keeps flowing via the remaining N-1. Activated by passing a comma-separated list of URLs to `--url`:
+
+```bash
+# exit node
+./universal-bypass-tool --exit-node \
+    --url "https://disk.yandex.ru/i/AAA,https://disk.yandex.ru/i/BBB,https://disk.yandex.ru/i/CCC" --debug
+
+# client (same URL set)
+./universal-bypass-tool --client \
+    --url "https://disk.yandex.ru/i/AAA,https://disk.yandex.ru/i/BBB,https://disk.yandex.ru/i/CCC" \
+    --socks5 :1080 --debug
+```
+
+A plain single URL keeps the legacy single-channel behavior.
+
+**How it works:**
+- **Send** picks the next healthy stream round-robin; skips dead ones automatically.
+- **Receive** fans in from all streams; ordering is fine because the tunnel carries TCP.
+- **IsConnected** is OR over all streams: the tunnel is up while any one document is alive.
+
+**Observability:** add `--multistream-status 5s` to get periodic per-stream status logs:
+```
+[MULTI] up=2/3 s0=UP(rx=122,tx=106,rc=0) s1=DOWN(rx=0,tx=0,rc=3) s2=UP(rx=120,tx=104,rc=1)
+```
+
+**Mobile clients:** multi-stream works on iOS and Android. On iOS, pass comma-separated URLs in the URL field. On Android, the CLI binary supports `--url url1,url2,...` natively.
+
+**Notes:**
+- Both peers (client and exit node) must use the same URL set.
+- Works with both `yandex` and `vyandex` transports.
+- `cupsonline` already carries multi-room state inside its base64 URL and does not support comma-separated multi-URL.
+
 ## Structure
 
 ```
@@ -74,6 +108,7 @@ OpenFlux/
 ├── transport/
 │   ├── transport.go            # Transport interface
 │   ├── compressor.go           # Compression wrapper
+│   ├── multistream.go          # Multi-stream wrapper (N transports as one)
 │   ├── yandex/                 # Yandex Docs backend
 │   ├── oneme/                  # MAX Messenger backend
 │   └── cupsonline/             # Cups.online interview-room backend
@@ -174,7 +209,8 @@ Notes:
 | `--client`    |                     | Run as client              |
 | `--exit-node` |                     | Run as exit node           |
 | `--socks5`    | `:1080`             | SOCKS5 listen address      |
-| `--url`       | `https://localhost` | Document URL (Yandex Docs) |
+| `--url`       | `https://localhost` | Document URL(s). Comma-separated for multi-stream |
+| `--multistream-status` | `0` | Log per-stream state on this interval (e.g. `5s`). No-op with single URL |
 | `--maxToken`  | ``                  | Auth token (Max)           |
 | `--maxUid`    | ``                  | User ID (Max)              |
 | `--debug`     | `false`             | Enable verbose logging     |
