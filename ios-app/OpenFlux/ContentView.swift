@@ -274,18 +274,53 @@ struct ContentView: View {
         }
     }
 
+    /// Human label for the current DNS preset (shown in the collapsed menu).
+    private var dnsPresetLabel: String {
+        switch dnsPreset {
+        case "cloudflare": return "Cloudflare"
+        case "google":     return "Google"
+        case "quad9":      return "Quad9"
+        case "adguard":    return "AdGuard"
+        case "custom":     return "Custom…"
+        default:           return "Default (Yandex/Google/CF)"
+        }
+    }
+
     private var dnsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("DNS (DNS-over-TLS)").font(.caption).foregroundColor(.secondary)
-            Picker("DNS", selection: $dnsPreset) {
-                Text("Default (Yandex/Google/CF)").tag("default")
-                Text("Cloudflare").tag("cloudflare")
-                Text("Google").tag("google")
-                Text("Quad9").tag("quad9")
-                Text("AdGuard").tag("adguard")
-                Text("Custom…").tag("custom")
+            // A plain Picker(.menu) does not truncate its selected value, so the
+            // long "Default (Yandex/Google/CF)" label overflowed the row and slid
+            // off-screen on scroll. Drive the same Picker from a Menu whose label
+            // we control: one line, tail-truncated, bounded by a Spacer so it can
+            // never run past the row.
+            Menu {
+                Picker("DNS", selection: $dnsPreset) {
+                    Text("Default (Yandex/Google/CF)").tag("default")
+                    Text("Cloudflare").tag("cloudflare")
+                    Text("Google").tag("google")
+                    Text("Quad9").tag("quad9")
+                    Text("AdGuard").tag("adguard")
+                    Text("Custom…").tag("custom")
+                }
+            } label: {
+                HStack {
+                    Text(dnsPresetLabel)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundColor(.primary)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .contentShape(Rectangle())
             }
-            .pickerStyle(.menu)
             .disabled(tunnel.running)
             if dnsPreset == "custom" {
                 TextField("1.1.1.1@cloudflare-dns.com", text: $dnsCustom)

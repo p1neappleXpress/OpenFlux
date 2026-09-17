@@ -40,12 +40,22 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		syscall.Close(sendFd)
 		return nil, fmt.Errorf("IP_HDRINCL: %v", err)
 	}
+	// Large send buffer: a SOCK_RAW socket with IP_HDRINCL gets no kernel
+	// auto-tuning, so the default (~208 KiB) caps the bandwidth-delay product
+	// and causes drops on high-BDP paths — exactly this exit node, which sits
+	// ~100 ms from the covert-channel backend and pushes 30+ Mbps. (Best-effort:
+	// the kernel clamps to net.core.wmem_max, so ignore any error.)
+	syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024*1024)
 
 	recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
 	if err != nil {
 		syscall.Close(sendFd)
 		return nil, fmt.Errorf("recv socket failed: %v (need root)", err)
 	}
+	// Large receive buffer for the same reason (no auto-tuning on SOCK_RAW);
+	// the default is not enough at ~100 ms RTT for 30+ Mbps. Clamped to
+	// net.core.rmem_max by the kernel, so best-effort.
+	syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
 
 	addr := &syscall.SockaddrInet4{
 		Addr: [4]byte{0, 0, 0, 0},

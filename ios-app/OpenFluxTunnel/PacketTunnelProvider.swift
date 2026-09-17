@@ -29,6 +29,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return cidrs.map { NEIPv4Route(destinationAddress: $0.0, subnetMask: $0.1) }
     }()
 
+    /// Drives `reasserting` from the Go transport's live state (issue #36).
+    private var healthTimer: Timer?
+    /// When the transport first went down; nil while it is up. A short grace on
+    /// this avoids flapping `reasserting` for a sub-second reconnect.
+    private var outageSince: Date?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
@@ -91,13 +96,49 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             self.startReadLoop()
             self.startWriteLoop()
+            self.startHealthMonitor()
             completionHandler(nil)
         }
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        stopHealthMonitor()
         OpenFluxStopPacketTunnel()
         completionHandler()
+    }
+
+    /// Polls the Go transport once a second and mirrors its up/down state into
+    /// `reasserting`. When the Yandex WebSocket drops, the Go side reconnects on
+    /// its own; without this, iOS reads the gap as a tunnel failure and tears the
+    /// VPN down (issue #36). Holding `reasserting = true` across the gap keeps the
+    /// tunnel alive (shown as "Reasserting…") and lets it resume when the
+    /// transport is back — no cancelTunnelWithError, no stopping readPackets.
+    private func startHealthMonitor() {
+        DispatchQueue.main.async {
+            self.healthTimer?.invalidate()
+            self.healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                if OpenFluxPacketTunnelConnected() != 0 {
+                    self.outageSince = nil
+                    if self.reasserting { self.reasserting = false }
+                } else {
+                    if self.outageSince == nil { self.outageSince = Date() }
+                    if let s = self.outageSince,
+                       Date().timeIntervalSince(s) > 3,
+                       !self.reasserting {
+                        self.reasserting = true
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopHealthMonitor() {
+        DispatchQueue.main.async {
+            self.healthTimer?.invalidate()
+            self.healthTimer = nil
+            self.outageSince = nil
+        }
     }
 
     /// Device -> Go stack.

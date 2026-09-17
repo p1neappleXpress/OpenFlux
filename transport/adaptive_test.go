@@ -151,6 +151,73 @@ func TestAdaptiveSendStartsLegacyThenUpgrades(t *testing.T) {
 	})
 }
 
+// TestAdaptiveForceBatch: with forceBatch set, Send must coalesce into batch
+// frames from the very first packet, without the peer ever proving batch — for
+// talking to a known batch-only node (upstream BatchedTransport).
+func TestAdaptiveForceBatch(t *testing.T) {
+	inner := &recordingTransport{}
+	inner.connected.Store(true)
+	a := NewAdaptiveTransport(inner)
+	a.forceBatch = true
+	a.Receive(func([]byte) {})
+	if err := a.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Stop()
+
+	pkt := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{1, 1, 1, 1}, 1000, 443)
+	for i := 0; i < 20; i++ {
+		_ = a.Send(pkt)
+	}
+	waitFor(t, func() bool {
+		for _, f := range inner.sentFrames() {
+			if len(f) > 2 && f[0] == batchFormatVersion {
+				return true // a non-empty batch frame appeared without peerBatch
+			}
+		}
+		return false
+	})
+	if a.peerBatch.Load() {
+		t.Fatal("forceBatch must not depend on peerBatch being set")
+	}
+}
+
+// TestAdaptiveOptimisticUpgrade: a silent peer after a real send flips us to
+// batch (batch-only node), but the guards must hold otherwise.
+func TestAdaptiveOptimisticUpgrade(t *testing.T) {
+	// Silent peer, real packet sent long ago -> upgrade.
+	a := NewAdaptiveTransport(&recordingTransport{})
+	a.firstRealSend.Store(time.Now().Add(-2 * optimisticUpgradeDelay).UnixNano())
+	a.maybeOptimisticUpgrade()
+	if !a.peerBatch.Load() {
+		t.Fatal("silent peer after real send should upgrade to batch")
+	}
+
+	// No real send yet (idle) -> must NOT upgrade.
+	b := NewAdaptiveTransport(&recordingTransport{})
+	b.maybeOptimisticUpgrade()
+	if b.peerBatch.Load() {
+		t.Fatal("idle connection (no real send) must not upgrade")
+	}
+
+	// Peer answered (everRx) -> live legacy peer, must NOT upgrade.
+	c := NewAdaptiveTransport(&recordingTransport{})
+	c.firstRealSend.Store(time.Now().Add(-2 * optimisticUpgradeDelay).UnixNano())
+	c.everRx.Store(true)
+	c.maybeOptimisticUpgrade()
+	if c.peerBatch.Load() {
+		t.Fatal("a peer that answered must stay on legacy")
+	}
+
+	// Within the grace window -> too early, must NOT upgrade.
+	d := NewAdaptiveTransport(&recordingTransport{})
+	d.firstRealSend.Store(time.Now().UnixNano())
+	d.maybeOptimisticUpgrade()
+	if d.peerBatch.Load() {
+		t.Fatal("within grace window must not upgrade yet")
+	}
+}
+
 // nonProbe filters out the 2-byte empty-batch probes so send-path assertions
 // look only at real data frames.
 func nonProbe(frames [][]byte) [][]byte {

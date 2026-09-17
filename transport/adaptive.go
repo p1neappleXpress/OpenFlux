@@ -19,6 +19,12 @@ const (
 	defaultLingerMs      = 5
 	batchQueueDepth      = 4096
 	probeInterval        = 3 * time.Second
+	// optimisticUpgradeDelay: how long after our first real legacy send we wait,
+	// hearing nothing at all back, before assuming the peer is a batch-only node
+	// (upstream BatchedTransport) that silently drops our legacy frames — and
+	// flipping to batch so it can finally decode us. A live legacy peer would
+	// have answered a real packet within this window, so it never trips.
+	optimisticUpgradeDelay = 4 * time.Second
 )
 
 func envInt(name string, def int) int {
@@ -65,10 +71,24 @@ type AdaptiveTransport struct {
 	peerBatch atomic.Bool
 	running   atomic.Bool
 
+	// everRx is set the moment we receive ANY frame from the peer (legacy or
+	// batch); firstRealSend holds the unix-nano time of our first real (non-probe)
+	// legacy send, 0 until then. Together they drive the optimistic upgrade: a
+	// peer that never answers a real packet is a batch-only node dropping our
+	// legacy frames.
+	everRx        atomic.Bool
+	firstRealSend atomic.Int64
+
 	// forceLegacy pins this side to the legacy per-packet codec (no batching,
 	// no probes) regardless of the peer — a debug override, set via
 	// OPENFLUX_FORCE_LEGACY=1, for A/B measurement or interop testing.
 	forceLegacy bool
+
+	// forceBatch pins this side to batch from the first packet (skips the legacy
+	// start and the wait for the peer to prove batch) — set via
+	// OPENFLUX_FORCE_BATCH=1, for talking to a known batch-only node (upstream
+	// BatchedTransport) with no connect delay. forceLegacy wins if both are set.
+	forceBatch bool
 
 	lingerMs      int
 	maxBatchBytes int
@@ -83,6 +103,7 @@ func NewAdaptiveTransport(inner Transport) *AdaptiveTransport {
 		Transport:     inner,
 		queue:         make(chan []byte, batchQueueDepth),
 		forceLegacy:   os.Getenv("OPENFLUX_FORCE_LEGACY") == "1",
+		forceBatch:    os.Getenv("OPENFLUX_FORCE_BATCH") == "1",
 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
 		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
 		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
@@ -123,6 +144,7 @@ func (a *AdaptiveTransport) Receive(callback func([]byte)) {
 	a.mu.Unlock()
 
 	a.Transport.Receive(func(data []byte) {
+		a.everRx.Store(true) // any reply proves the peer is not silently dropping us
 		if len(data) > 0 && data[0] == batchFormatVersion {
 			// A batch frame proves the peer speaks batch — upgrade our sends.
 			a.peerBatch.Store(true)
@@ -172,9 +194,29 @@ func (a *AdaptiveTransport) probeLoop() {
 		if !a.running.Load() {
 			return
 		}
-		if a.IsConnected() {
-			_ = a.Transport.Send(probe)
+		if !a.IsConnected() {
+			continue
 		}
+		_ = a.Transport.Send(probe)
+		a.maybeOptimisticUpgrade()
+	}
+}
+
+// maybeOptimisticUpgrade flips to batch when the peer looks like a batch-only
+// node: it drops our legacy frames AND never sends unprompted, so peerBatch
+// would never flip and the link would deadlock. If we've sent a real packet and
+// heard NOTHING back for the grace window, switch — a live legacy peer would
+// have answered by now. Guarded by firstRealSend so an idle connection (no real
+// sends) never trips this and a genuinely-legacy peer stays on legacy.
+func (a *AdaptiveTransport) maybeOptimisticUpgrade() {
+	if a.forceBatch || a.peerBatch.Load() {
+		return
+	}
+	t0 := a.firstRealSend.Load()
+	if t0 != 0 && !a.everRx.Load() &&
+		time.Since(time.Unix(0, t0)) > optimisticUpgradeDelay {
+		utils.Debugf("[ADAPT] optimistic batch upgrade: peer silent after real send, assuming batch-only node")
+		a.peerBatch.Store(true)
 	}
 }
 
@@ -187,8 +229,10 @@ func (a *AdaptiveTransport) flushLoop() {
 
 		// Legacy mode: the peer hasn't proven batch support yet (or we're pinned
 		// to legacy). Send this packet on its own, compressed exactly like the
-		// old codec so any old peer decodes it.
-		if a.forceLegacy || !a.peerBatch.Load() {
+		// old codec so any old peer decodes it. Record when the first real (non-
+		// probe) packet went out so the optimistic upgrade can time out on silence.
+		if a.forceLegacy || (!a.forceBatch && !a.peerBatch.Load()) {
+			a.firstRealSend.CompareAndSwap(0, time.Now().UnixNano())
 			_ = a.Transport.Send(compress(first))
 			continue
 		}

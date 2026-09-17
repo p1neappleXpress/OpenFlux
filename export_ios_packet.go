@@ -75,12 +75,22 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	// limit. GCPercent=20 forced a GC on every 20% heap growth — under a
 	// throughput load (compression + WebSocket framing + packet copies) that
 	// pins the phone CPU in near-continuous GC and caps throughput. Raise it so
-	// GC is driven by the memory limit, not by needless frequent cycles; peak
-	// memory is still bounded by SetMemoryLimit, so this does not risk jetsam.
-	debug.SetMemoryLimit(40 << 20)
+	// GC is driven by the memory limit, not by needless frequent cycles.
+	//
+	// The iOS 15+ jetsam cap for a packet-tunnel extension is 50 MB of RSS, and
+	// SetMemoryLimit only bounds the Go heap — TLS/DoT buffers, the WebSocket
+	// framing scratch and the runtime itself live OUTSIDE it. Keep the heap limit
+	// at 32 MB so there is ~18 MB of headroom for that non-heap memory before the
+	// OS kills the process (the cause behind "VPN dies after 15-20s" reports).
+	debug.SetMemoryLimit(32 << 20)
 	debug.SetGCPercent(100)
 
 	config := transport.DefaultConfig()
+	// Trim the per-stream queue (default 1024 ≈ 1.4 MB/stream): with two docs
+	// multiplexed this is a real slice of the 50 MB budget, and 512 still absorbs
+	// a normal burst. Peak memory, not raw throughput, is the binding constraint
+	// inside the extension.
+	config.MaxQueueSize = 512
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
@@ -109,7 +119,9 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	// faster than the device drains, packets get dropped, and the tunneled TCP
 	// treats that as loss and backs off — throttling throughput. A deeper queue
 	// absorbs bursts; entries are transient and bounded by the memory limit.
-	outQ := make(chan []byte, 4096)
+	// 2048 (≈2.9 MB at full ~1.4 KB packets) is the compromise between that burst
+	// headroom and the tightened 32 MB jetsam budget — half the old 4096.
+	outQ := make(chan []byte, 2048)
 	// Packets coming back from the exit node -> queue for the device.
 	t.Receive(func(data []byte) {
 		select {
@@ -256,6 +268,25 @@ func OpenFluxTunReadPacket(buf *C.char, max C.int) C.int {
 	case <-ctx.Done():
 		return 0
 	}
+}
+
+// OpenFluxPacketTunnelConnected reports whether the packet-tunnel transport is
+// currently up (1) or in a reconnect gap / stopped (0). The NEPacketTunnelProvider
+// polls this to drive `reasserting`: a transient Yandex WebSocket drop must NOT
+// look to iOS like a tunnel failure (which makes the OS tear the VPN down), so on
+// an outage the provider sets reasserting=true and keeps the tunnel alive until
+// this returns 1 again. Cheap and lock-guarded; safe to call once per second.
+//
+//export OpenFluxPacketTunnelConnected
+func OpenFluxPacketTunnelConnected() C.int {
+	ptMu.Lock()
+	t := ptTrans
+	on := ptOn
+	ptMu.Unlock()
+	if on && t != nil && t.IsConnected() {
+		return 1
+	}
+	return 0
 }
 
 //export OpenFluxStopPacketTunnel
