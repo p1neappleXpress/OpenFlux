@@ -1,6 +1,7 @@
 package yandex
 
 import (
+	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -277,17 +278,19 @@ func (t *YandexDocsTransport) writerLoop() {
 }
 
 func (t *YandexDocsTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
-	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
-
+	base := t.GetConfig().KeepAliveInterval
 	for t.IsRunning() {
-		<-ticker.C
+		jitter := time.Duration(rand.Int63n(int64(base))) - base/2
+		time.Sleep(base + jitter)
+		if !t.IsRunning() {
+			return
+		}
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
 
 		if session != nil && session.Conn != nil {
+			keepAliveMsg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s%s"}]`, keepAliveMarker, randomKeepAlivePadding())
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
 				t.SetConnected(false)
@@ -296,10 +299,28 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 	}
 }
 
+// keepAliveMarker replaces the old fixed "---KA---" sentinel. Keep-alive
+// packets used to be fixed-size and fixed-interval, which is a distinguishing
+// signature for traffic analysis even over TLS (packet size + timing survive
+// encryption). Randomizing both the interval (see keepAliveLoop) and the
+// padding length below breaks that fingerprint.
+const keepAliveMarker = "__KA__"
+
+func randomKeepAlivePadding() string {
+	n := 4 + rand.Intn(48)
+	buf := make([]byte, n)
+	if _, err := crand.Read(buf); err != nil {
+		for i := range buf {
+			buf[i] = byte(rand.Intn(256))
+		}
+	}
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
-	if strings.Contains(text, "---KA---") {
+	if strings.Contains(text, keepAliveMarker) {
 		return
 	}
 
