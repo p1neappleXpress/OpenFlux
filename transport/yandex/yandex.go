@@ -1,6 +1,7 @@
 package yandex
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -52,28 +53,34 @@ type DocSession struct {
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.Conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return err
+	}
 	return s.Conn.WriteMessage(messageType, data)
 }
 
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
+	ctx, cancel := context.WithCancel(context.Background())
 	t := &YandexDocsTransport{
+		ctx: ctx, cancel: cancel,
 		BaseTransport: transport.NewBaseTransport(config),
 		url:           url,
 	}
 	t.baseUserID = randUserID()
 	return t
 }
-
 
 func (t *YandexDocsTransport) Start() error {
 	if err := t.BaseTransport.Start(); err != nil {
@@ -84,6 +91,19 @@ func (t *YandexDocsTransport) Start() error {
 	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
 	t.connectToDoc(0)
 
+	return nil
+}
+
+// Stop cancels reconnect waits and closes the socket to unblock ReadMessage.
+func (t *YandexDocsTransport) Stop() error {
+	t.BaseTransport.Stop()
+	t.cancel()
+	t.Mu.Lock()
+	session := t.session
+	t.Mu.Unlock()
+	if session != nil {
+		session.Conn.Close()
+	}
 	return nil
 }
 
@@ -151,14 +171,17 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		}
+		if dial := t.GetConfig().DialContext; dial != nil {
+			dialer.NetDialContext = dial
+		}
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
 		headers.Set("Origin", info.Origin)
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
 
-		utils.Debugf("[YDOCS] WebSocket dial %s", info.WsURL)
-		conn, resp, err := dialer.Dial(info.WsURL, headers)
+		utils.Debugf("[YDOCS] dialing WebSocket")
+		conn, resp, err := dialer.DialContext(t.ctx, info.WsURL, headers)
 		if err != nil {
 			status := 0
 			if resp != nil {
@@ -168,7 +191,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			t.scheduleReconnect(attempt)
 			return
 		}
-		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
+		defer conn.Close()
+		utils.Debugf("[YDOCS] WebSocket connected")
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
@@ -183,6 +207,10 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		}
 
 		t.Mu.Lock()
+		if !t.IsRunning() {
+			t.Mu.Unlock()
+			return
+		}
 		t.session = session
 		t.SetConnected(true)
 		t.Mu.Unlock()
@@ -249,11 +277,12 @@ func (t *YandexDocsTransport) writerLoop() {
 	var pending []byte
 	for t.IsRunning() {
 		if pending == nil {
-			packet, ok := <-queue
-			if !ok {
+			select {
+			case <-t.ctx.Done():
 				return
+			case packet := <-queue:
+				pending = packet
 			}
-			pending = packet
 		}
 
 		t.Mu.RLock()
@@ -282,7 +311,11 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
 
 	for t.IsRunning() {
-		<-ticker.C
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
@@ -362,7 +395,11 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	// turn into a tight connect/close loop (previously reconnect was instant).
 	d := reconnectBackoff(next)
 	utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, next)
-	time.Sleep(d)
+	select {
+	case <-t.ctx.Done():
+		return
+	case <-time.After(d):
+	}
 	if !t.IsRunning() {
 		return
 	}
@@ -409,9 +446,21 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		},
 		Timeout: 15 * time.Second,
 	}
+	if t.BaseTransport != nil && t.GetConfig().DialContext != nil {
+		client.Transport = &http.Transport{DialContext: t.GetConfig().DialContext,
+			MaxIdleConns: 4, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}
+		defer client.CloseIdleConnections()
+	}
 
-	utils.Debugf("[YDOCS] fetchDocInfo GET %s", url)
-	req, _ := http.NewRequest("GET", url, nil)
+	utils.Debugf("[YDOCS] requesting document configuration")
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	} // standalone configuration parser
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("invalid document request")
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -421,7 +470,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	htmlBytes, _ := io.ReadAll(resp.Body)
 	html := string(htmlBytes)
-	utils.Debugf("[YDOCS] response status=%d finalURL=%s body=%dB", resp.StatusCode, resp.Request.URL.String(), len(html))
+	utils.Debugf("[YDOCS] response status=%d body=%dB", resp.StatusCode, len(html))
 
 	var cookies []string
 	for _, c := range resp.Cookies() {
@@ -435,7 +484,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		if strings.Contains(html, "passport") || strings.Contains(strings.ToLower(html), "login") {
 			hint = "looks like a login page (doc not public?)"
 		}
-		return YandexDocsInfo{}, fmt.Errorf("config not found: %s (status %d, final %s)", hint, resp.StatusCode, resp.Request.URL.String())
+		return YandexDocsInfo{}, fmt.Errorf("config not found: %s (status %d)", hint, resp.StatusCode)
 	}
 
 	var config map[string]interface{}

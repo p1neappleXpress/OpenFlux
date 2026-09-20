@@ -1,121 +1,211 @@
 import NetworkExtension
 
 /// System VPN entry point. Bridges the device's IP packets to the OpenFlux Go
-/// tun2socks stack (TCP forwarded through the transport; DNS proxied over TCP).
+/// packet transport (IPv4 TCP, opt-in UDP, local DNS-over-TLS).
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
-    /// Networks that must NOT go through the tunnel: the Yandex backend the
-    /// transport talks to, plus the DoT DNS resolvers. Otherwise the
-    /// extension's own traffic loops back into itself.
-    static let bypassRoutes: [NEIPv4Route] = {
-        let cidrs: [(String, String)] = [
-            ("5.45.192.0", "255.255.192.0"),
-            ("5.255.192.0", "255.255.192.0"),
-            ("37.9.64.0", "255.255.192.0"),
-            ("37.140.128.0", "255.255.192.0"),
-            ("77.88.0.0", "255.255.192.0"),
-            ("84.201.128.0", "255.255.192.0"),
-            ("87.250.224.0", "255.255.224.0"),
-            ("90.156.176.0", "255.255.252.0"),
-            ("93.158.128.0", "255.255.192.0"),
-            ("95.108.128.0", "255.255.128.0"),
-            ("100.43.64.0", "255.255.224.0"),
-            ("178.154.128.0", "255.255.128.0"),
-            ("213.180.192.0", "255.255.224.0"),
-            // DoT DNS resolvers used by the Go client.
-            ("8.8.8.8", "255.255.255.255"),
-            ("1.1.1.1", "255.255.255.255"),
-        ]
-        return cidrs.map { NEIPv4Route(destinationAddress: $0.0, subnetMask: $0.1) }
-    }()
+    /// Go supplies both the inherited Yandex CIDRs and fresh /32 routes. Its
+    /// carrier dialer enforces this exact snapshot, including after reconnect.
+    private struct BypassRoute: Decodable {
+        let destination: String
+        let mask: String
+    }
 
+    private let lifecycle = DispatchQueue(label: "OpenFlux.packet.lifecycle")
+    private let stateLock = NSLock()
+    private var generation: UInt64 = 0
+    private var running = false
+    private var healthTimer: DispatchSourceTimer?
+    private let writeGroup = DispatchGroup()
+
+    private func isRunning(_ id: UInt64) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return running && generation == id
+    }
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
-        let transport = (conf["transport"] as? String) ?? "yandex"
-        let url = (conf["url"] as? String) ?? ""
-        let maxToken = (conf["maxToken"] as? String) ?? ""
-        let maxUid = (conf["maxUid"] as? String) ?? ""
-
-        // Virtual interface: capture all IPv4 + all DNS.
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
-        // 10.10.10.2 is the address the exit node expects the client to use
-        // (it hardcodes return packets to 10.10.10.2), enabling pure L3
-        // forwarding with no gvisor stack in the extension.
-        let ipv4 = NEIPv4Settings(addresses: ["10.10.10.2"], subnetMasks: ["255.255.255.0"])
-        ipv4.includedRoutes = [NEIPv4Route.default()]
-        // Exclude the transport's own backend (Yandex ranges) and the DoT DNS
-        // servers so the extension's own connections bypass the tunnel instead
-        // of looping back into it.
-        ipv4.excludedRoutes = Self.bypassRoutes
-        settings.ipv4Settings = ipv4
-        settings.mtu = 1500
-        // A benign in-tunnel DNS address: queries to it are captured and
-        // answered locally over DoT (the real resolvers are excluded above).
-        let dns = NEDNSSettings(servers: ["198.18.0.1"])
-        dns.matchDomains = [""]
-        settings.dnsSettings = dns
-
-        setTunnelNetworkSettings(settings) { error in
-            if let error = error {
-                completionHandler(error)
+        lifecycle.async { [weak self] in
+            guard let self = self else { return }
+            self.stateLock.lock()
+            if self.running {
+                self.stateLock.unlock()
+                completionHandler(Self.failure(1, "Tunnel already running"))
                 return
             }
-            let rc = transport.withCString { tt in
-                url.withCString { u in
-                    maxToken.withCString { tok in
-                        maxUid.withCString { uid in
-                            OpenFluxStartPacketTunnel(
-                                UnsafeMutablePointer(mutating: tt),
-                                UnsafeMutablePointer(mutating: u),
-                                UnsafeMutablePointer(mutating: tok),
-                                UnsafeMutablePointer(mutating: uid))
-                        }
+            self.generation &+= 1
+            let id = self.generation
+            self.running = true
+            self.stateLock.unlock()
+            do {
+                let conf = (self.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
+                let transport = (conf["transport"] as? String) ?? "yandex"
+                let url = (conf["url"] as? String) ?? ""
+                // Profiles created before V2 used legacy, never silently upgrade them.
+                let codec = (conf["codec"] as? String) ?? "legacy"
+                let udpForwarding = (conf["udpForwarding"] as? Bool) ?? false
+                let maxUid = (conf["maxUid"] as? String) ?? ""
+                guard ["yandex", "vyandex", "oneme"].contains(transport),
+                      ["batched", "legacy"].contains(codec) else { throw SecretStoreError.invalidRecord }
+                var key = ""
+                var token = ""
+                if let recordID = conf["credentialID"] as? String {
+                    guard recordID.hasPrefix("vpn-"),
+                          let data = try KeychainSecretStore().read(account: recordID) else { throw SecretStoreError.invalidRecord }
+                    let record = try JSONDecoder().decode(TunnelCredentials.self, from: data)
+                    guard record.transport == transport, record.url == url,
+                          ((conf["encryptionEnabled"] as? Bool) ?? false) == !record.preparedKey.isEmpty else {
+                        throw SecretStoreError.invalidRecord
+                    }
+                    key = record.preparedKey
+                    token = record.maxToken
+                } else if (conf["encryptionEnabled"] as? Bool) == true || transport == "oneme" {
+                    // Missing Keychain never downgrades encryption or falls back to plaintext MAX credentials.
+                    throw SecretStoreError.invalidRecord
+                }
+
+                // Bootstrap BEFORE capturing DNS/default routes: DoT preferred,
+                // system fallback restricted to Yandex carrier endpoints only.
+                let routeJSON = transport.withCString { tt in
+                    url.withCString { u in
+                        OpenFluxResolveBypassIPv4V2(UnsafeMutablePointer(mutating: tt), UnsafeMutablePointer(mutating: u))
                     }
                 }
+                guard let routeJSON = routeJSON else { throw Self.failure(7, "Cannot resolve transport bypass routes") }
+                let routeData = Data(String(cString: routeJSON).utf8)
+                OpenFluxFreeString(routeJSON)
+                let routes = try JSONDecoder().decode([BypassRoute].self, from: routeData)
+                guard !routes.isEmpty else { throw Self.failure(7, "Missing transport bypass routes") }
+                let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+                let ipv4 = NEIPv4Settings(addresses: ["10.10.10.2"], subnetMasks: ["255.255.255.0"])
+                ipv4.includedRoutes = [NEIPv4Route.default()]
+                ipv4.excludedRoutes = routes.map {
+                    NEIPv4Route(destinationAddress: $0.destination, subnetMask: $0.mask)
+                }
+                settings.ipv4Settings = ipv4
+                settings.mtu = 1500
+                let dns = NEDNSSettings(servers: ["198.18.0.1"])
+                dns.matchDomains = [""]
+                settings.dnsSettings = dns
+                self.setTunnelNetworkSettings(settings) { [weak self] error in
+                    guard let self = self else { return }
+                    self.lifecycle.async {
+                        guard self.isRunning(id) else {
+                            completionHandler(Self.failure(8, "Tunnel start cancelled")); return
+                        }
+                        if error != nil {
+                            self.finishStop()
+                            completionHandler(Self.failure(9, "Cannot configure tunnel network settings")); return
+                        }
+                        let rc = transport.withCString { tt in
+                            url.withCString { u in
+                                token.withCString { tok in
+                                    maxUid.withCString { uid in
+                                        codec.withCString { c in
+                                            key.withCString { k in
+                                                OpenFluxStartPacketTunnelWithKeyV2(
+                                                    UnsafeMutablePointer(mutating: tt), UnsafeMutablePointer(mutating: u),
+                                                    UnsafeMutablePointer(mutating: tok), UnsafeMutablePointer(mutating: uid),
+                                                    UnsafeMutablePointer(mutating: c), UnsafeMutablePointer(mutating: k))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        guard rc == 0 else {
+                            self.finishStop()
+                            completionHandler(Self.failure(Int(rc), "Transport failed to start")); return
+                        }
+                        OpenFluxTunSetUDPEnabled(udpForwarding ? 1 : 0)
+                        self.startReadLoop(id)
+                        self.startWriteLoop(id)
+                        self.startHealthMonitor(id)
+                        completionHandler(nil)
+                    }
+                }
+            } catch {
+                self.finishStop()
+                completionHandler(Self.failure(10, "Cannot load VPN credentials or resolve transport endpoints"))
             }
-            if rc != 0 {
-                completionHandler(NSError(domain: "OpenFlux", code: Int(rc),
-                    userInfo: [NSLocalizedDescriptionKey: "start failed (\(rc))"]))
-                return
-            }
-            self.startReadLoop()
-            self.startWriteLoop()
-            completionHandler(nil)
         }
+    }
+
+    private static func failure(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "OpenFlux", code: code, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
-        OpenFluxStopPacketTunnel()
-        completionHandler()
-    }
-
-    /// Device -> Go stack.
-    private func startReadLoop() {
-        packetFlow.readPackets { [weak self] packets, _ in
-            guard let self = self else { return }
-            for p in packets {
-                p.withUnsafeBytes { raw in
-                    if let base = raw.bindMemory(to: CChar.self).baseAddress {
-                        OpenFluxTunWritePacket(UnsafeMutablePointer(mutating: base), Int32(p.count))
-                    }
-                }
-            }
-            self.startReadLoop()
+        lifecycle.async { [weak self] in
+            self?.finishStop()
+            completionHandler()
         }
     }
 
-    /// Go stack -> device.
-    private func startWriteLoop() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let maxLen: Int32 = 4096
+    private func finishStop() {
+        stateLock.lock()
+        running = false
+        generation &+= 1
+        stateLock.unlock()
+        healthTimer?.cancel()
+        healthTimer = nil
+        reasserting = false
+        OpenFluxStopPacketTunnel()
+        // An explicit new start cannot overlap an old Go reader. Reconnects
+        // never reach this path and retain the same pair of packet-flow loops.
+        writeGroup.wait()
+    }
+
+    private func startHealthMonitor(_ id: UInt64) {
+        healthTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: lifecycle)
+        timer.schedule(deadline: .now(), repeating: 1)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.isRunning(id) else { return }
+            // A relay outage never cancels the provider or starts new read/write loops.
+            self.reasserting = OpenFluxPacketTunnelIsConnected() == 0
+        }
+        healthTimer = timer
+        timer.resume()
+    }
+
+    private func startReadLoop(_ id: UInt64) {
+        guard isRunning(id) else { return }
+        packetFlow.readPackets { [weak self] packets, protocols in
+            guard let self = self else { return }
+            self.lifecycle.async {
+                guard self.isRunning(id) else { return }
+                for (p, proto) in zip(packets, protocols) where proto.int32Value == AF_INET {
+                    guard p.count <= 65535 else { continue }
+                    p.withUnsafeBytes { raw in
+                        if let base = raw.bindMemory(to: CChar.self).baseAddress {
+                            OpenFluxTunWritePacket(UnsafeMutablePointer(mutating: base), Int32(p.count))
+                        }
+                    }
+                }
+                self.startReadLoop(id)
+            }
+        }
+    }
+
+    private func startWriteLoop(_ id: UInt64) {
+        writeGroup.enter()
+        let group = writeGroup
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, group] in
+            defer { group.leave() }
+            let maxLen: Int32 = 65535
             let buf = UnsafeMutablePointer<CChar>.allocate(capacity: Int(maxLen))
             defer { buf.deallocate() }
-            while true {
+            while self?.isRunning(id) == true {
+                // The Go read blocks with a bounded timeout; 0 must not terminate
+                // packetFlow or cause a busy loop during reconnect.
                 let n = OpenFluxTunReadPacket(buf, maxLen)
-                if n <= 0 { break }
-                let data = Data(bytes: buf, count: Int(n))
-                self.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
+                if n < 0 { break }
+                if n == 0 { continue }
+                guard let self = self, self.isRunning(id) else { break }
+                autoreleasepool {
+                    let data = Data(bytes: buf, count: Int(n))
+                    self.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
+                }
             }
         }
     }

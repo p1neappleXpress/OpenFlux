@@ -3,22 +3,24 @@ package oneme
 import (
 	"crypto/rand"
 	"fmt"
+	"log"
+	"openflux/utils"
 )
 
 var vvv bool
 
 func logDebug(format string, args ...interface{}) {
 	if vvv {
-		fmt.Printf("  [DBG] "+format+"\n", args...)
+		utils.Debugf("[MAX] "+format, args...)
 	}
 }
 
 func logInfo(format string, args ...interface{}) {
-	fmt.Printf("[INF] "+format+"\n", args...)
+	log.Print(utils.RedactURLs(fmt.Sprintf("[MAX] "+format, args...)))
 }
 
 func logError(format string, args ...interface{}) {
-	fmt.Printf("[ERR] "+format+"\n", args...)
+	log.Print(utils.RedactURLs(fmt.Sprintf("[MAX] "+format, args...)))
 }
 
 func min(a, b int) int {

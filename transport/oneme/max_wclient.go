@@ -103,16 +103,11 @@ func (c *MaxClient) LoginByToken(token string) error {
 	var payload map[string]interface{}
 	json.Unmarshal(resp.Payload, &payload)
 	if _, ok := payload["error"]; ok {
-		return fmt.Errorf("login failed: %v", payload["error"])
+		return fmt.Errorf("MAX login failed")
 	}
 	c.loggedIn = true
 	go c.keepalive()
-	users := c.getUserMap(resp)
-	fmt.Println("\n=== CONTACTS ===")
-	for id, u := range users {
-		fmt.Printf("  ID: %d | %s %s | Phone: %d\n", id, u.FirstName, u.LastName, u.Phone)
-	}
-	fmt.Println()
+	logInfo("MAX login completed")
 	return nil
 }
 

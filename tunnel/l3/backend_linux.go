@@ -12,18 +12,27 @@ import (
 )
 
 type rawBackend struct {
-	sendFd int
-	recvFd int
-	egress [4]byte
+	sendFd  int
+	recvFds []int
+	egress  [4]byte
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	recvMu    sync.Mutex
+	fdMu      sync.RWMutex
 }
 
 func newBackend() (L3Backend, error) {
-	egress, err := detectEgressIPv4()
-	if err != nil {
-		return nil, err
+	localIPMu.Lock()
+	egress := localIPOverride
+	hasOverride := hasLocalIPOverride
+	localIPMu.Unlock()
+	if !hasOverride {
+		var err error
+		egress, err = detectEgressIPv4()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	sendFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
@@ -39,20 +48,40 @@ func newBackend() (L3Backend, error) {
 	// at RTT ~100ms and >30 Mbps.
 	syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024*1024)
 
-	recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-	if err != nil {
-		syscall.Close(sendFd)
-		return nil, fmt.Errorf("l3: recv socket: %w (need root or CAP_NET_RAW)", err)
+	var recvFds []int
+	for _, proto := range []int{syscall.IPPROTO_TCP, syscall.IPPROTO_UDP} {
+		recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, proto)
+		if err != nil {
+			for _, fd := range recvFds {
+				syscall.Close(fd)
+			}
+			syscall.Close(sendFd)
+			return nil, fmt.Errorf("l3: recv socket protocol %d: %w (need root or CAP_NET_RAW)", proto, err)
+		}
+		syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
+		recvFds = append(recvFds, recvFd)
+		// close(2) alone does not reliably wake a blocking recvfrom on Linux.
+		if err := syscall.SetsockoptTimeval(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 1}); err != nil {
+			for _, fd := range recvFds {
+				_ = syscall.Close(fd)
+			}
+			_ = syscall.Close(sendFd)
+			return nil, fmt.Errorf("l3: receive timeout: %w", err)
+		}
 	}
-	// Large receive buffer for the same reason: SOCK_RAW has no auto-tuning,
-	// and the default 208 KiB is not enough at ~100ms RTT for 30+ Mbps.
-	syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
+	if err := syscall.SetsockoptTimeval(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &syscall.Timeval{Sec: 1}); err != nil {
+		for _, fd := range recvFds {
+			_ = syscall.Close(fd)
+		}
+		_ = syscall.Close(sendFd)
+		return nil, fmt.Errorf("l3: send timeout: %w", err)
+	}
 
 	b := &rawBackend{
-		sendFd: sendFd,
-		recvFd: recvFd,
-		egress: egress,
-		closed: make(chan struct{}),
+		sendFd:  sendFd,
+		recvFds: recvFds,
+		egress:  egress,
+		closed:  make(chan struct{}),
 	}
 	utils.Debugf("[L3/linux] raw backend ready, egress=%s", ipStr(ipU32(egress)))
 	return b, nil
@@ -61,6 +90,18 @@ func newBackend() (L3Backend, error) {
 func (b *rawBackend) EgressIP() [4]byte { return b.egress }
 
 func (b *rawBackend) Send(pkt []byte) error {
+	var ok bool
+	pkt, ok = sliceIPv4(pkt)
+	if !ok {
+		return fmt.Errorf("l3: invalid IPv4 packet")
+	}
+	b.fdMu.RLock()
+	defer b.fdMu.RUnlock()
+	select {
+	case <-b.closed:
+		return net.ErrClosed
+	default:
+	}
 	var dst [4]byte
 	copy(dst[:], pkt[16:20])
 	addr := &syscall.SockaddrInet4{Addr: dst}
@@ -68,46 +109,59 @@ func (b *rawBackend) Send(pkt []byte) error {
 }
 
 func (b *rawBackend) Recv(cb func([]byte)) {
-	go func() {
-		buf := make([]byte, 65535)
-		for {
+	for _, fd := range b.recvFds {
+		go b.recvLoop(fd, cb)
+	}
+}
+
+func (b *rawBackend) recvLoop(fd int, cb func([]byte)) {
+	buf := make([]byte, 65535)
+	for {
+		b.fdMu.RLock()
+		select {
+		case <-b.closed:
+			b.fdMu.RUnlock()
+			return
+		default:
+		}
+		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		b.fdMu.RUnlock()
+		if err != nil {
+			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				continue
+			}
 			select {
 			case <-b.closed:
 				return
 			default:
 			}
-			n, _, err := syscall.Recvfrom(b.recvFd, buf, 0)
-			if err != nil {
-				if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-					continue
-				}
-				select {
-				case <-b.closed:
-					return
-				default:
-				}
-				utils.Debugf("[L3/linux] recv: %v", err)
-				continue
-			}
-			if n < 40 || buf[0]>>4 != 4 || buf[9] != 6 {
-				continue
-			}
-			if buf[16] != b.egress[0] || buf[17] != b.egress[1] ||
-				buf[18] != b.egress[2] || buf[19] != b.egress[3] {
-				continue
-			}
-			cp := make([]byte, n)
-			copy(cp, buf[:n])
-			cb(cp)
+			utils.Debugf("[L3/linux] recv: %v", err)
+			continue
 		}
-	}()
+		if n < 28 || buf[0]>>4 != 4 || (buf[9] != 6 && buf[9] != 17) {
+			continue
+		}
+		if buf[16] != b.egress[0] || buf[17] != b.egress[1] ||
+			buf[18] != b.egress[2] || buf[19] != b.egress[3] {
+			continue
+		}
+		cp := make([]byte, n)
+		copy(cp, buf[:n])
+		b.recvMu.Lock()
+		cb(cp)
+		b.recvMu.Unlock()
+	}
 }
 
 func (b *rawBackend) Close() error {
 	b.closeOnce.Do(func() {
 		close(b.closed)
+		b.fdMu.Lock()
+		defer b.fdMu.Unlock()
 		syscall.Close(b.sendFd)
-		syscall.Close(b.recvFd)
+		for _, fd := range b.recvFds {
+			syscall.Close(fd)
+		}
 	})
 	return nil
 }

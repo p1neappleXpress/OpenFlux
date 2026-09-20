@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./... -count=1
+      - run: go test -race ./... -count=1
+      - run: go vet ./...
+      - name: Compile isolated Linux raw UDP test
+        run: go test -race -c -o "$RUNNER_TEMP/openflux-l3.test" ./tunnel/l3
+      - name: Check raw UDP NAT in a disposable network namespace
+        run: |
+          sudo unshare --net sh -ec '
+            ip link set lo up
+            OPENFLUX_L3_INTEGRATION=1 "$1" -test.run "^TestLinuxRawUDPNAT$" -test.v -test.timeout=30s
+          ' sh "$RUNNER_TEMP/openflux-l3.test"
+
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}

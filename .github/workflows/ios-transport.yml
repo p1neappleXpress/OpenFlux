@@ -1,0 +1,57 @@
+name: iOS transport checks
+
+on:
+  push:
+    paths:
+      - '**.go'
+      - go.mod
+      - go.sum
+      - ios-app/**
+      - build_ios.sh
+      - .github/workflows/ios-transport.yml
+  pull_request:
+    paths:
+      - '**.go'
+      - go.mod
+      - go.sum
+      - ios-app/**
+      - build_ios.sh
+      - .github/workflows/ios-transport.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -race ./internal/... ./transport/...
+  ios-device-unsigned:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: brew install xcodegen
+      - name: Build Go C archive and generate project
+        run: |
+          XCODE_PATH="$(xcode-select -p)/../.." ./build_ios.sh
+          mkdir -p ios-app/Lib
+          cp output/ios/liboflux.a output/ios/liboflux.h ios-app/Lib/
+          cd ios-app
+          xcodegen generate
+      - name: Compile app and extension without signing
+        working-directory: ios-app
+        run: >-
+          xcodebuild -project OpenFlux.xcodeproj -scheme OpenFlux
+          -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS'
+          CODE_SIGNING_ALLOWED=NO build

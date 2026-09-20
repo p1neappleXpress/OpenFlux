@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -16,12 +17,40 @@ import (
 //	      optionally zstd-compressed as a whole.
 const (
 	batchFormatVersion = 0x02
+	wireFormatVersion  = 0x03
 	batchFlagZstd      = 0x01
+	wireTypeData       = 0x01
+	wireV3HeaderLen    = 20
+	maxFrameBytes      = 1 << 20
+	maxFrameRecords    = 1024
 )
 
+type wireMetadata struct {
+	version   byte
+	sessionID uint32
+	sequence  uint64
+}
+
+// Capabilities belong to the experimental negotiation protocol. They are not
+// authenticated or session-bound; do not enable it on untrusted channels.
+type Capabilities uint32
+
+const (
+	CapabilityIPv4 Capabilities = 1 << iota
+	CapabilityTCP
+	CapabilityUDP
+	CapabilityWireV3
+)
+
+const DefaultCapabilities = CapabilityIPv4 | CapabilityTCP | CapabilityUDP | CapabilityWireV3
+
+var capabilityMagic = [5]byte{0x00, 'O', 'F', 'X', wireFormatVersion}
+
 var (
-	zstdEnc *zstd.Encoder
-	zstdDec *zstd.Decoder
+	zstdEnc           *zstd.Encoder
+	zstdDec           *zstd.Decoder
+	mobileEncoderOnce sync.Once
+	mobileEncoder     *zstd.Encoder
 )
 
 func init() {
@@ -66,55 +95,138 @@ func frameBatch(pkts [][]byte) []byte {
 // encodeBatch serializes packets into a single wire frame, compressing the
 // whole batch with zstd only when that actually shrinks it.
 func encodeBatch(pkts [][]byte) []byte {
+	return encodeBatchUsing(pkts, zstdEnc)
+}
+
+func encodeBatchV3(pkts [][]byte, sessionID uint32, sequence uint64) []byte {
+	out := encodeBatch(pkts)
+	payload := out[2:]
+	header := make([]byte, wireV3HeaderLen, wireV3HeaderLen+len(payload))
+	header[0], header[1], header[2] = wireFormatVersion, out[1], wireTypeData
+	binary.BigEndian.PutUint32(header[4:8], sessionID)
+	binary.BigEndian.PutUint64(header[8:16], sequence)
+	binary.BigEndian.PutUint32(header[16:20], uint32(len(payload)))
+	return append(header, payload...)
+}
+
+// A smaller zstd window changes compression choices, not the batch wire format.
+// Lazy construction avoids reserving a second encoder in desktop processes.
+func encodeMobileBatch(pkts [][]byte) []byte {
+	mobileEncoderOnce.Do(func() {
+		var err error
+		mobileEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest),
+			zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(64<<10), zstd.WithLowerEncoderMem(true))
+		if err != nil {
+			panic("mobile zstd initialization failed")
+		}
+	})
+	return encodeBatchUsing(pkts, mobileEncoder)
+}
+
+func encodeBatchUsing(pkts [][]byte, encoder *zstd.Encoder) []byte {
 	framed := frameBatch(pkts)
-	compressed := zstdEnc.EncodeAll(framed, nil)
+	compressed := encoder.EncodeAll(framed, nil)
 
 	if len(compressed) < len(framed) {
-		out := make([]byte, 2, 2+len(compressed))
-		out[0] = batchFormatVersion
-		out[1] = batchFlagZstd
+		out := makeHeader(batchFlagZstd, len(compressed))
 		return append(out, compressed...)
 	}
-	out := make([]byte, 2, 2+len(framed))
-	out[0] = batchFormatVersion
-	out[1] = 0
+	out := makeHeader(0, len(framed))
 	return append(out, framed...)
+}
+
+func makeHeader(flags byte, payloadLen int) []byte {
+	header := make([]byte, 2, 2+payloadLen)
+	header[0], header[1] = batchFormatVersion, flags
+	return header
 }
 
 // decodeBatch reverses encodeBatch, returning the original packets.
 func decodeBatch(data []byte) ([][]byte, error) {
-	if len(data) < 2 {
-		return nil, fmt.Errorf("batch frame too short: %d bytes", len(data))
+	pkts, _, err := decodeBatchFrame(data)
+	return pkts, err
+}
+
+func decodeBatchFrame(data []byte) ([][]byte, wireMetadata, error) {
+	var metadata wireMetadata
+	if len(data) > maxFrameBytes+wireV3HeaderLen {
+		return nil, metadata, fmt.Errorf("batch frame exceeds size limit")
 	}
-	if data[0] != batchFormatVersion {
-		return nil, fmt.Errorf("unknown batch version 0x%02x", data[0])
+	if len(data) < 2 {
+		return nil, metadata, fmt.Errorf("batch frame too short: %d bytes", len(data))
+	}
+	version := data[0]
+	metadata.version = version
+	headerLen := 2
+	if version == wireFormatVersion {
+		if len(data) < wireV3HeaderLen {
+			return nil, metadata, fmt.Errorf("v3 frame too short: %d bytes", len(data))
+		}
+		if data[2] != wireTypeData || data[3] != 0 {
+			return nil, metadata, fmt.Errorf("unknown v3 frame type 0x%02x", data[2])
+		}
+		headerLen = wireV3HeaderLen
+		metadata.sessionID = binary.BigEndian.Uint32(data[4:8])
+		metadata.sequence = binary.BigEndian.Uint64(data[8:16])
+		payloadLen := int(binary.BigEndian.Uint32(data[16:20]))
+		if payloadLen != len(data)-headerLen {
+			return nil, metadata, fmt.Errorf("v3 payload length %d, have %d", payloadLen, len(data)-headerLen)
+		}
+	} else if version != batchFormatVersion {
+		return nil, metadata, fmt.Errorf("unknown batch version 0x%02x", data[0])
 	}
 	flags := data[1]
-	payload := data[2:]
+	if flags & ^byte(batchFlagZstd) != 0 {
+		return nil, metadata, fmt.Errorf("unknown batch flags 0x%02x", flags)
+	}
+	payload := data[headerLen:]
 
 	framed := payload
 	if flags&batchFlagZstd != 0 {
 		var err error
 		framed, err = zstdDec.DecodeAll(payload, nil)
 		if err != nil {
-			return nil, fmt.Errorf("zstd decode: %w", err)
+			return nil, metadata, fmt.Errorf("zstd decode: %w", err)
 		}
 	}
 
+	if len(framed) > maxFrameBytes {
+		return nil, metadata, fmt.Errorf("decoded batch exceeds size limit")
+	}
 	var pkts [][]byte
 	for len(framed) > 0 {
+		if len(pkts) >= maxFrameRecords {
+			return nil, metadata, fmt.Errorf("batch exceeds record limit")
+		}
 		if len(framed) < 2 {
-			return nil, fmt.Errorf("truncated length prefix")
+			return nil, metadata, fmt.Errorf("truncated length prefix")
 		}
 		n := int(binary.BigEndian.Uint16(framed[:2]))
 		framed = framed[2:]
 		if len(framed) < n {
-			return nil, fmt.Errorf("truncated packet: need %d, have %d", n, len(framed))
+			return nil, metadata, fmt.Errorf("truncated packet: need %d, have %d", n, len(framed))
 		}
 		pkt := make([]byte, n)
 		copy(pkt, framed[:n])
 		pkts = append(pkts, pkt)
 		framed = framed[n:]
 	}
-	return pkts, nil
+	return pkts, metadata, nil
+}
+
+func encodeCapabilityRecord(caps Capabilities, ack bool) []byte {
+	p := make([]byte, 10)
+	copy(p, capabilityMagic[:])
+	if ack {
+		p[5] = 1
+	}
+	binary.BigEndian.PutUint32(p[6:], uint32(caps))
+	return p
+}
+
+func decodeCapabilityRecord(p []byte) (Capabilities, bool, bool) {
+	if len(p) != 10 || string(p[:5]) != string(capabilityMagic[:]) || p[5] > 1 {
+		return 0, false, false
+	}
+	return Capabilities(binary.BigEndian.Uint32(p[6:])), p[5]&1 != 0, true
 }

@@ -1,7 +1,24 @@
 # OpenFlux iOS app
 
-SwiftUI client that links the OpenFlux Go core (`liboflux.a`) and runs the
-SOCKS5 tunnel over the Yandex.Docs transport on `127.0.0.1:1080`.
+SwiftUI client that links the OpenFlux Go core (`liboflux.a`). System VPN is
+the default mode; a local SOCKS5 proxy is available under Advanced settings.
+
+## Using the app
+
+1. Choose the transport and enter the document link or MAX credentials.
+2. Use the same encryption key and codec as the exit node, then tap Connect.
+3. For an exit node with UDP support, enable Forward UDP under Advanced settings.
+   The setting is remembered, but defaults off for compatibility with old exits.
+   DNS continues to use DNS-over-TLS. Only IPv4 is tunneled; this is not an IPv6
+   leak-protection feature.
+4. Diagnostics → Check internet access makes an HTTPS request to ipify's IPv4
+   endpoint and displays the public IP. It is user-initiated, checks the selected
+   connection mode, and is canceled when the connection state changes. Success
+   does not prove UDP support or leak protection.
+
+Advanced settings also contains the codec and local proxy mode (default port
+10808). Proxy mode does not route other apps automatically. Its log appears in
+Diagnostics; the app does not present this process-local log as a VPN-extension log.
 
 ## Layout
 - `project.yml` — XcodeGen project definition (run `xcodegen generate` to produce `OpenFlux.xcodeproj`).
@@ -39,9 +56,8 @@ Produces `ios-app/build/export/OpenFlux.ipa`, distribution-signed for the App St
 3. The build appears in TestFlight after Apple processing (a few minutes).
 
 ## Notes / follow-ups
-- The app runs a **local** SOCKS5 proxy. The in-app **Test** button proves the
-  tunnel carries traffic (fetches the exit IP through the proxy). Routing the
-  whole device requires a Network Extension (`NEPacketTunnelProvider`) target
-  with the Network Extensions capability — not included in this first build.
+- System VPN uses the included `NEPacketTunnelProvider` target and requires
+  Network Extension and shared Keychain signing entitlements. Test actual
+  routing, reconnects and UDP on a signed build on a physical iPhone.
 - Deployment target: iOS 15.0 (SwiftUI App lifecycle). The Go lib is built with
   `-miphoneos-version-min=13.0`, so it is compatible.

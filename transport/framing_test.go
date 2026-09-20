@@ -108,3 +108,44 @@ func TestDecodeBatchRejectsShortFrame(t *testing.T) {
 		t.Fatal("expected error for frame shorter than header")
 	}
 }
+
+func TestBatchV3RoundTrip(t *testing.T) {
+	want := [][]byte{[]byte("udp"), {0x45, 0x00, 0x00, 0x1c}}
+	wire := encodeBatchV3(want, 0x01020304, 42)
+	if wire[0] != wireFormatVersion || wire[2] != wireTypeData {
+		t.Fatalf("unexpected v3 header: %x", wire[:wireV3HeaderLen])
+	}
+	got, metadata, err := decodeBatchFrame(wire)
+	if err != nil {
+		t.Fatalf("decodeBatch: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d packets, want %d", len(got), len(want))
+	}
+	if metadata.sessionID != 0x01020304 || metadata.sequence != 42 {
+		t.Fatalf("metadata=%+v", metadata)
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("packet %d mismatch", i)
+		}
+	}
+}
+
+func TestCapabilityRecordRoundTrip(t *testing.T) {
+	want := DefaultCapabilities
+	record := encodeCapabilityRecord(want, true)
+	got, ack, ok := decodeCapabilityRecord(record)
+	if !ok || !ack || got != want {
+		t.Fatalf("decodeCapabilityRecord = (%x, %v, %v), want (%x, true, true)", got, ack, ok, want)
+	}
+}
+
+func TestDecodeBatchRejectsUnknownFlagsAndV3Type(t *testing.T) {
+	if _, err := decodeBatch([]byte{batchFormatVersion, 0x80}); err == nil {
+		t.Fatal("expected unknown flags error")
+	}
+	if _, err := decodeBatch([]byte{wireFormatVersion, 0, 0xff, 0}); err == nil {
+		t.Fatal("expected unknown v3 frame type error")
+	}
+}
