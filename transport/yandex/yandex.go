@@ -58,8 +58,8 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -73,7 +73,6 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig) *Yande
 	t.baseUserID = randUserID()
 	return t
 }
-
 
 func (t *YandexDocsTransport) Start() error {
 	if err := t.BaseTransport.Start(); err != nil {
@@ -126,13 +125,30 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		existingSession := t.session
 		t.Mu.Unlock()
 
-		var userID string
-		if existingSession != nil {
-			userID = existingSession.UserID
-		} else {
-			suffix := fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
-			userID = t.baseUserID + suffix
-		}
+		// Always mint a fresh doc userID for every reconnect attempt.
+		//
+		// The previous session's participant lingers on Yandex's side for
+		// several seconds after the WebSocket goes away (server-visible even
+		// after a client-initiated close). Dialing back in with the same
+		// userID lands as a "duplicate participant" on the collab server,
+		// which then closes the new socket right after the socket.io CONNECT
+		// with `websocket: close 1005 (no status)` and no frames on it. That
+		// keeps repeating until the ghost times out, so a single normal
+		// server-side drop turns into 30-120s of unusable reconnect churn.
+		//
+		// Confirmed by logging otherwise-unhandled incoming frames right
+		// before this change: after Yandex kicks a healthy session with
+		// disconnectReason code 4007 ("drop", ~66s of clean operation), the
+		// first ~10 reconnect attempts all get close 1005 within ~50ms with
+		// zero recv frames. Bumping userCounter every attempt eliminates that
+		// window entirely.
+		//
+		// The write queue (session.WriteQueue) is still preserved across
+		// reconnects on the line below, so packets that were mid-flight when
+		// the old socket died are not dropped.
+		suffix := fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
+		userID := t.baseUserID + suffix
+		_ = existingSession
 
 		info, err := t.fetchDocInfo(t.url, userID)
 		if err != nil {
