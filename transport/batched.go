@@ -35,7 +35,16 @@ type BatchedTransport struct {
 	maxBatchBytes int
 	maxBatchCount int
 
-	running atomic.Bool
+	running       atomic.Bool
+	done          chan struct{}
+	stopOnce      sync.Once
+	wg            sync.WaitGroup
+	queuedBytes   atomic.Int64
+	maxQueueBytes int64
+	encode        func([][]byte) []byte
+	lifecycleMu   sync.Mutex
+	started       bool
+	stopped       bool
 
 	mu     sync.RWMutex
 	userCb func([]byte)
@@ -51,39 +60,83 @@ func envInt(name string, def int) int {
 }
 
 func NewBatchedTransport(inner Transport) *BatchedTransport {
+	return NewBatchedTransportWithLimits(inner, batchQueueDepth, 0)
+}
+
+// NewBatchedTransportWithLimits changes only buffering, never the wire format.
+// A zero byte limit retains desktop behavior.
+func NewBatchedTransportWithLimits(inner Transport, queueDepth int, maxBytes int64) *BatchedTransport {
+	encode := encodeBatch
+	linger, batchBytes, batchCount := envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs), envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes), envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount)
+	if maxBytes > 0 {
+		encode = encodeMobileBatch
+		linger, batchBytes, batchCount = defaultLingerMs, defaultMaxBatchBytes, defaultMaxBatchCount
+	}
 	return &BatchedTransport{
+		encode:        encode,
 		Transport:     inner,
-		queue:         make(chan []byte, batchQueueDepth),
-		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
-		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
-		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
+		queue:         make(chan []byte, queueDepth),
+		done:          make(chan struct{}),
+		maxQueueBytes: maxBytes,
+		lingerMs:      linger,
+		maxBatchBytes: batchBytes,
+		maxBatchCount: batchCount,
 	}
 }
 
 func (b *BatchedTransport) Start() error {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	if b.started || b.stopped {
+		return fmt.Errorf("batch transport already started")
+	}
+	b.started = true
+	b.running.Store(true)
 	if err := b.Transport.Start(); err != nil {
+		b.running.Store(false)
 		return err
 	}
-	b.running.Store(true)
+	b.wg.Add(1)
 	go b.flushLoop()
 	return nil
 }
 
 func (b *BatchedTransport) Stop() error {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	if b.stopped {
+		return nil
+	}
+	b.stopped = true
 	b.running.Store(false)
-	return b.Transport.Stop()
+	b.stopOnce.Do(func() { close(b.done) })
+	err := b.Transport.Stop()
+	b.wg.Wait()
+	return err
 }
 
 // Send copies the packet (the caller's buffer is reused by gVisor) and enqueues
 // it for batching. A full queue drops the packet; the tunnel's TCP will
 // retransmit, same as the old "write queue full" behavior.
 func (b *BatchedTransport) Send(data []byte) error {
+	if !b.running.Load() {
+		return fmt.Errorf("batch transport stopped")
+	}
+	if len(data) == 0 || len(data) > 65535 {
+		return fmt.Errorf("invalid batch packet size")
+	}
+	n := int64(len(data))
+	if used := b.queuedBytes.Add(n); b.maxQueueBytes > 0 && used > b.maxQueueBytes {
+		b.queuedBytes.Add(-n)
+		return fmt.Errorf("batch queue byte limit")
+	}
 	p := make([]byte, len(data))
 	copy(p, data)
 	select {
 	case b.queue <- p:
 		return nil
 	default:
+		b.queuedBytes.Add(-n)
 		return fmt.Errorf("batch queue full")
 	}
 }
@@ -112,10 +165,14 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 }
 
 func (b *BatchedTransport) flushLoop() {
+	defer b.wg.Done()
 	for b.running.Load() {
-		first, ok := <-b.queue
-		if !ok {
+		var first []byte
+		select {
+		case <-b.done:
 			return
+		case first = <-b.queue:
+			b.queuedBytes.Add(-int64(len(first)))
 		}
 		batch := [][]byte{first}
 		size := 2 + len(first)
@@ -125,9 +182,12 @@ func (b *BatchedTransport) flushLoop() {
 	drainNow:
 		for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			select {
+			case <-b.done:
+				return
 			case p, ok := <-b.queue:
+				b.queuedBytes.Add(-int64(len(p)))
 				if !ok {
-					b.Transport.Send(encodeBatch(batch))
+					b.Transport.Send(b.encode(batch))
 					return
 				}
 				batch = append(batch, p)
@@ -145,10 +205,14 @@ func (b *BatchedTransport) flushLoop() {
 		linger:
 			for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 				select {
+				case <-b.done:
+					timer.Stop()
+					return
 				case p, ok := <-b.queue:
+					b.queuedBytes.Add(-int64(len(p)))
 					if !ok {
 						timer.Stop()
-						b.Transport.Send(encodeBatch(batch))
+						b.Transport.Send(b.encode(batch))
 						return
 					}
 					batch = append(batch, p)
@@ -160,6 +224,6 @@ func (b *BatchedTransport) flushLoop() {
 			timer.Stop()
 		}
 
-		b.Transport.Send(encodeBatch(batch))
+		b.Transport.Send(b.encode(batch))
 	}
 }

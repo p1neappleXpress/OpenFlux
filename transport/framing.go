@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -20,8 +21,10 @@ const (
 )
 
 var (
-	zstdEnc *zstd.Encoder
-	zstdDec *zstd.Decoder
+	zstdEnc           *zstd.Encoder
+	zstdDec           *zstd.Decoder
+	mobileEncoderOnce sync.Once
+	mobileEncoder     *zstd.Encoder
 )
 
 func init() {
@@ -66,8 +69,26 @@ func frameBatch(pkts [][]byte) []byte {
 // encodeBatch serializes packets into a single wire frame, compressing the
 // whole batch with zstd only when that actually shrinks it.
 func encodeBatch(pkts [][]byte) []byte {
+	return encodeBatchUsing(pkts, zstdEnc)
+}
+
+// A smaller zstd window changes compression choices, not the batch wire format.
+// Lazy construction avoids reserving a second encoder in desktop processes.
+func encodeMobileBatch(pkts [][]byte) []byte {
+	mobileEncoderOnce.Do(func() {
+		var err error
+		mobileEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest),
+			zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(64<<10), zstd.WithLowerEncoderMem(true))
+		if err != nil {
+			panic("mobile zstd initialization failed")
+		}
+	})
+	return encodeBatchUsing(pkts, mobileEncoder)
+}
+
+func encodeBatchUsing(pkts [][]byte, encoder *zstd.Encoder) []byte {
 	framed := frameBatch(pkts)
-	compressed := zstdEnc.EncodeAll(framed, nil)
+	compressed := encoder.EncodeAll(framed, nil)
 
 	if len(compressed) < len(framed) {
 		out := make([]byte, 2, 2+len(compressed))

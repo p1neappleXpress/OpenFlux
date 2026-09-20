@@ -7,16 +7,12 @@ import (
 	"os"
 	"runtime"
 	godebug "runtime/debug"
-	"strconv"
 	"strings"
 	"time"
 
+	"openflux/internal/transportstack"
 	"openflux/socks5"
 	"openflux/transport"
-	"openflux/transport/cupsonline"
-	"openflux/transport/mailru"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
 	"openflux/tunnel"
 	"openflux/utils"
 )
@@ -278,58 +274,29 @@ DEPRECATED (removed in v2)
 		log.Printf("Exit mode: %s", exitMode.String())
 	}
 
-	config := transport.DefaultConfig()
-	var inner transport.Transport
-
-	switch *transportType {
-	case "vyandex":
-		inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
-	case "yandex":
-		inner = yandex.NewYandexDocsTransport(globalDocUrl, config)
-	case "oneme":
-		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
-		inner = oneme.NewOneMeTransport(*role == roleExit, maxToken, uidint, config)
-	case "cupsonline":
-		inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, *role != roleExit)
-	case "mailru":
-		inner = mailru.NewMailruDocsTransport(globalDocUrl, config)
-	default:
-		log.Fatalf("Unknown transport type: %s", *transportType)
-	}
-
-	// App-layer codec, outermost. Default is the new batching+zstd layer;
-	// --codec=legacy selects the old per-packet LZ4 path so the two can be
-	// compared over the same channel. Client and exit node must use the same one.
-	switch *codec {
-	case codecBatched:
-		log.Printf("Codec: batched (zstd + coalescing)")
-		inner = transport.NewBatchedTransport(inner)
-	case codecLegacy:
-		log.Printf("Codec: legacy (per-packet LZ4, no batching)")
-		inner = transport.NewCompressedTransport(inner)
-	}
-
-	// Optional AES-256-GCM encryption sits closest to the raw transport, so on
-	// send we batch/compress first and encrypt the result (ciphertext would not
-	// compress). Both peers must use the same secret.
+	secret := ""
 	if *encryptionKeyFile != "" {
 		secretBytes, err := os.ReadFile(*encryptionKeyFile)
 		if err != nil {
-			log.Fatalf("Read encryption key file: %v", err)
+			log.Fatal("Cannot read encryption key file")
 		}
-		context := *transportType
-		if globalDocUrl != "" {
-			context = globalDocUrl
+		secret = strings.TrimSpace(string(secretBytes))
+		clear(secretBytes)
+		if secret == "" {
+			log.Fatal("Encryption key file is empty")
 		}
-		encrypted, err := transport.NewEncryptedTransport(inner, strings.TrimSpace(string(secretBytes)), context, *role == roleExit)
-		if err != nil {
-			log.Fatalf("Configure encrypted transport: %v", err)
-		}
-		inner = encrypted
+	}
+	trans, err := transportstack.New(transportstack.Options{
+		Transport: *transportType, URL: globalDocUrl, MAXToken: maxToken, MAXUID: maxUid,
+		Codec: *codec, EncryptionSecret: secret, ExitNode: *role == roleExit,
+	})
+	if err != nil {
+		log.Fatalf("Configure transport: %v", err)
+	}
+	log.Printf("Codec: %s", *codec)
+	if secret != "" {
 		log.Printf("Transport encryption: AES-256-GCM enabled")
 	}
-
-	trans := inner
 
 	// Benchmark modes run the transport directly with no tunnel / raw socket,
 	// so they never touch the host network.

@@ -10,51 +10,25 @@ import "C"
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
+	"openflux/internal/mobilelog"
+	"openflux/internal/transportstack"
 	"openflux/socks5"
 	"openflux/transport"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
 	"openflux/tunnel"
 	"openflux/utils"
 )
 
 // ---- log ring buffer piped into the app UI ----
 
-type ringLog struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-func (r *ringLog) Write(p []byte) (int, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.lines = append(r.lines, strings.TrimRight(string(p), "\n"))
-	if len(r.lines) > 1000 {
-		r.lines = r.lines[len(r.lines)-1000:]
-	}
-	return len(p), nil
-}
-
-func (r *ringLog) drain() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.lines) == 0 {
-		return ""
-	}
-	out := strings.Join(r.lines, "\n")
-	r.lines = r.lines[:0]
-	return out
-}
-
-var logbuf = &ringLog{}
+var logbuf = mobilelog.New()
 
 // ---- running client state ----
 
@@ -120,11 +94,12 @@ const (
 	startTransportError = 3
 	startAddrInUse      = 4 // SOCKS5 port could not be bound (e.g. already in use)
 	startPanic          = 5
+	startBadConfig      = 6
 )
 
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
 //
-// transportType: "yandex" or "oneme".
+// transportType: "yandex", "vyandex" or "oneme".
 // url:           Yandex.Docs document URL (yandex transport).
 // socksAddr:     e.g. "127.0.0.1:1080".
 // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
@@ -133,16 +108,23 @@ const (
 //
 //export OpenFluxStartClient
 func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char) (rc C.int) {
-	tt := C.GoString(transportType)
-	docURL := C.GoString(url)
-	addr := C.GoString(socksAddr)
-	mToken := C.GoString(maxToken)
-	mUid := C.GoString(maxUid)
+	return startClient(C.GoString(transportType), C.GoString(url), C.GoString(socksAddr),
+		C.GoString(maxToken), C.GoString(maxUid), transportstack.Legacy, "")
+}
 
+// OpenFluxStartClientV2 adds codec and optional encryption without changing V1.
+//
+//export OpenFluxStartClientV2
+func OpenFluxStartClientV2(transportType, url, socksAddr, maxToken, maxUid, codec, encryptionSecret *C.char) C.int {
+	return startClient(C.GoString(transportType), C.GoString(url), C.GoString(socksAddr),
+		C.GoString(maxToken), C.GoString(maxUid), C.GoString(codec), C.GoString(encryptionSecret))
+}
+
+func startClient(tt, docURL, addr, mToken, mUid, codec, secret string) (rc C.int) {
 	// Never let a panic unwind into the C/Swift caller and crash the app.
 	defer func() {
 		if r := recover(); r != nil {
-			utils.Debugf("[BRIDGE] Recovered from panic in start: %v", r)
+			utils.Debugf("[BRIDGE] Recovered from panic in start")
 			rc = C.int(startPanic)
 		}
 	}()
@@ -153,6 +135,7 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		utils.Debugf("[BRIDGE] Start ignored: already running")
 		return C.int(startAlreadyRunning)
 	}
+	logbuf.SetSecrets(docURL, mToken, secret)
 
 	// Bind the SOCKS5 port up front so "address already in use" is reported
 	// cleanly to the UI instead of failing later in a background goroutine.
@@ -163,21 +146,18 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	}
 	probe.Close()
 
-	config := transport.DefaultConfig()
-	var t transport.Transport
-	switch tt {
-	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
-	case "oneme":
-		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
-	default:
-		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
+	o, err := mobileOptions(tt, docURL, mToken, mUid, codec, secret)
+	if err != nil {
 		return C.int(startBadTransport)
+	}
+	t, err := transportstack.New(o)
+	if err != nil {
+		return C.int(startBadConfig)
 	}
 
 	if err := t.Start(); err != nil {
-		utils.Debugf("[BRIDGE] Failed to start transport: %v", err)
+		utils.Debugf("[BRIDGE] Failed to start transport")
+		t.Stop()
 		return C.int(startTransportError)
 	}
 
@@ -196,7 +176,7 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				utils.Debugf("[BRIDGE] Recovered from panic in SOCKS5 loop: %v", r)
+				utils.Debugf("[BRIDGE] Recovered from panic in SOCKS5 loop")
 			}
 		}()
 		utils.Debugf("[BRIDGE] Client running (SOCKS5 on %s, transport %s)", addr, tt)
@@ -277,7 +257,7 @@ func OpenFluxStatsJSON() *C.char {
 //
 //export OpenFluxReadLog
 func OpenFluxReadLog() *C.char {
-	return C.CString(logbuf.drain())
+	return C.CString(logbuf.Drain())
 }
 
 // OpenFluxFreeString frees a string returned by this library.
@@ -293,4 +273,19 @@ func OpenFluxFreeString(s *C.char) {
 //export OpenFluxSetDebug
 func OpenFluxSetDebug(on C.int) {
 	utils.SetDebug(on != 0)
+}
+
+// OpenFluxDeriveEncryptionKey prepares the SAME v1 key as the CLI. Call in the
+// containing app, store only in Keychain; never invoke inside the extension.
+// The returned base64 key must be released with OpenFluxFreeString.
+//
+//export OpenFluxDeriveEncryptionKey
+func OpenFluxDeriveEncryptionKey(transportType, url, secret *C.char) *C.char {
+	key, err := transport.DeriveEncryptionKey(strings.TrimSpace(C.GoString(secret)),
+		transportstack.EncryptionContext(C.GoString(transportType), C.GoString(url)))
+	if err != nil {
+		return nil
+	}
+	defer clear(key)
+	return C.CString(base64.StdEncoding.EncodeToString(key))
 }

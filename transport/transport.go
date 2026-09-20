@@ -1,12 +1,18 @@
 package transport
 
 import (
+	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+type DialContextFunc func(context.Context, string, string) (net.Conn, error)
+
 type TransportConfig struct {
+	// Optional carrier-only dialer. Never used for tunneled user destinations.
+	DialContext          DialContextFunc
 	MaxReconnectAttempts int
 	ReconnectDelay       time.Duration
 	ReconnectMultiplier  float64
@@ -137,7 +143,6 @@ func (b *BaseTransport) RecordReceive(bytes int) {
 func (b *BaseTransport) RecordReconnect() {
 	b.reconnectAttempts.Add(1)
 }
-
 
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/scrypt"
 )
@@ -51,7 +52,19 @@ func NewEncryptedTransport(inner Transport, secret, context string, exitNode boo
 	if inner == nil {
 		return nil, errors.New("inner transport is nil")
 	}
-	if len(secret) < 16 {
+	master, err := DeriveEncryptionKey(secret, context)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(master)
+	return NewEncryptedTransportWithKey(inner, master, exitNode)
+}
+
+// DeriveEncryptionKey uses the existing v1 scrypt KDF unchanged. The returned
+// 32-byte key is as sensitive as the secret. Mobile apps may prepare and store
+// it in shared Keychain outside their memory-constrained Network Extension.
+func DeriveEncryptionKey(secret, context string) ([]byte, error) {
+	if !utf8.ValidString(secret) || utf8.RuneCountInString(secret) < 16 {
 		return nil, errors.New("encryption secret must contain at least 16 characters")
 	}
 
@@ -59,6 +72,15 @@ func NewEncryptedTransport(inner Transport, secret, context string, exitNode boo
 	master, err := scrypt.Key([]byte(secret), salt[:], 32768, 8, 1, 32)
 	if err != nil {
 		return nil, fmt.Errorf("derive encryption key: %w", err)
+	}
+	return master, nil
+}
+
+// NewEncryptedTransportWithKey consumes a previously derived v1 master key.
+// It shares all direction, nonce, replay and framing logic with the secret API.
+func NewEncryptedTransportWithKey(inner Transport, master []byte, exitNode bool) (*EncryptedTransport, error) {
+	if inner == nil || len(master) != 32 {
+		return nil, errors.New("invalid encrypted transport configuration")
 	}
 	clientToExit := deriveDirectionalKey(master, "client-to-exit")
 	exitToClient := deriveDirectionalKey(master, "exit-to-client")
@@ -117,7 +139,6 @@ func (e *EncryptedTransport) Send(data []byte) error {
 	packet = e.sendAEAD.Seal(packet, nonce, data, header)
 	return e.Transport.Send(packet)
 }
-
 
 func (e *EncryptedTransport) Receive(callback func([]byte)) {
 	e.Transport.Receive(func(packet []byte) {

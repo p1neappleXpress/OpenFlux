@@ -9,7 +9,8 @@ settings:
   base:
     MARKETING_VERSION: "1.0.0"
     CURRENT_PROJECT_VERSION: "17"
-    DEVELOPMENT_TEAM: "8GQH8GQ252"
+    # Set DEVELOPMENT_TEAM locally; never commit signing credentials.
+    OPENFLUX_KEYCHAIN_GROUP: "$(AppIdentifierPrefix)com.p1neapplexpress-saharev.openflux.shared"
 
 targets:
   OpenFlux:
@@ -17,6 +18,7 @@ targets:
     platform: iOS
     sources:
       - path: OpenFlux
+      - path: Shared
       - path: Lib
         buildPhase: none
     dependencies:
@@ -29,6 +31,7 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        OpenFluxKeychainGroup: $(OPENFLUX_KEYCHAIN_GROUP)
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -40,6 +43,8 @@ targets:
       properties:
         com.apple.developer.networking.networkextension:
           - packet-tunnel-provider
+        keychain-access-groups:
+          - $(OPENFLUX_KEYCHAIN_GROUP)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux
@@ -67,6 +72,7 @@ targets:
     platform: iOS
     sources:
       - path: OpenFluxTunnel
+      - path: Shared
       - path: Lib
         buildPhase: none
     dependencies:
@@ -77,6 +83,7 @@ targets:
       properties:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        OpenFluxKeychainGroup: $(OPENFLUX_KEYCHAIN_GROUP)
         CFBundleDisplayName: OpenFlux Tunnel
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
@@ -86,6 +93,8 @@ targets:
       properties:
         com.apple.developer.networking.networkextension:
           - packet-tunnel-provider
+        keychain-access-groups:
+          - $(OPENFLUX_KEYCHAIN_GROUP)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux.tunnel

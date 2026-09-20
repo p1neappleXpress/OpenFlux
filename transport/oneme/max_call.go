@@ -15,7 +15,7 @@ var (
 	useICEInjection = true
 )
 
-func (h *CallHandler) SetOnConnected(cb func())    { h.onConnected = cb }
+func (h *CallHandler) SetOnConnected(cb func())     { h.onConnected = cb }
 func (h *CallHandler) SetDCInbound(cb func([]byte)) { h.dcInbound = cb }
 
 func (h *CallHandler) Send(data []byte) {
@@ -69,7 +69,7 @@ func (h *CallHandler) readLoop() {
 			continue
 		}
 		if t, _ := data["type"].(string); t == "error" {
-			logError("[%s] SIGNALING ERROR: %v", h.tag, data["message"])
+			logError("[%s] signaling error", h.tag)
 			continue
 		}
 
@@ -153,7 +153,8 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
 			jsonC, _ := json.Marshal(c.ToJSON())
-			logInfo("[%s] Local ICE: %s", h.tag, string(jsonC))
+			logInfo("[%s] local ICE candidate", h.tag)
+			_ = jsonC
 			h.sendICE(string(jsonC))
 		} else {
 			logInfo("[%s] ICE gathering complete", h.tag)
@@ -180,7 +181,7 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 		logInfo("[%s] Remote DC: %s (id=%d)", h.tag, dc.Label(), dcID)
 		h.dc = dc
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			logInfo("[%s] RECV: %s", h.tag, string(msg.Data))
+			logInfo("[%s] received %d bytes", h.tag, len(msg.Data))
 			h.dcInbound(msg.Data)
 		})
 	})
@@ -215,13 +216,9 @@ func (h *CallHandler) sendSDP(sdp string, sdpType string) {
 	if h.conn == nil {
 		return
 	}
-	escaped, _ := json.Marshal(sdp)
-	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"sdp":{"type":"%s","sdp":%s},"animojiVersion":1},"participantType":"USER"}`,
-		h.seq, h.localID, sdpType, string(escaped))
 	h.seq++
-	logInfo("[%s] Sent SDP %s (%d bytes)", h.tag, sdpType, len(sdp))
-	fmt.Println(msg)
-	//h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	// This path intentionally does not send SDP; do not print its ICE credentials.
+	logInfo("[%s] Prepared SDP %s (%d bytes)", h.tag, sdpType, len(sdp))
 }
 
 func (h *CallHandler) injectICE(payload []byte) {
