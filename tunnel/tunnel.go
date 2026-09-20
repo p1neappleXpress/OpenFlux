@@ -1,12 +1,18 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/proxy"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -49,14 +55,40 @@ func ParseExitMode(s string) (ExitMode, error) {
 	}
 }
 
+func parseSOCKS5(proxyStr string) (string, *proxy.Auth, error) {
+	if !strings.Contains(proxyStr, "://") {
+		proxyStr = "socks5://" + proxyStr
+	}
+	u, err := url.Parse(proxyStr)
+	if err != nil {
+		return "", nil, err
+	}
+	var auth *proxy.Auth
+	if u.User != nil {
+		auth = &proxy.Auth{
+			User: u.User.Username(),
+		}
+		if pass, ok := u.User.Password(); ok {
+			auth.Password = pass
+		}
+	}
+	host := u.Host
+	if strings.HasPrefix(host, ":") {
+		host = "127.0.0.1" + host
+	}
+	return host, auth, nil
+}
+
 type TCPTunnel struct {
-	gvisorStack *stack.Stack
-	tunnelEP    *TunnelLinkEndpoint
-	transport   transport.Transport
-	isExitNode  bool
-	exitMode    ExitMode
-	startTime   time.Time
-	packetCount atomic.Uint64
+	gvisorStack   *stack.Stack
+	tunnelEP      *TunnelLinkEndpoint
+	transport     transport.Transport
+	isExitNode    bool
+	exitMode      ExitMode
+	upstreamProxy string
+	dialer        proxy.Dialer
+	startTime     time.Time
+	packetCount   atomic.Uint64
 }
 
 // TCP buffer size range for gvisor stacks.
@@ -78,16 +110,25 @@ func SetTCPBuffers(s *stack.Stack) {
 	}
 }
 
-func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
-	return NewTCPTunnelMode(trans, isExitNode, ExitModeL4)
+func NewTCPTunnel(trans transport.Transport, isExitNode bool, upstreamProxy ...string) *TCPTunnel {
+	proxy := ""
+	if len(upstreamProxy) > 0 {
+		proxy = upstreamProxy[0]
+	}
+	return NewTCPTunnelModeWithProxy(trans, isExitNode, ExitModeL4, proxy)
 }
 
 func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode) *TCPTunnel {
+	return NewTCPTunnelModeWithProxy(trans, isExitNode, mode, "")
+}
+
+func NewTCPTunnelModeWithProxy(trans transport.Transport, isExitNode bool, mode ExitMode, upstreamProxy string) *TCPTunnel {
 	t := &TCPTunnel{
-		transport:  trans,
-		isExitNode: isExitNode,
-		exitMode:   mode,
-		startTime:  time.Now(),
+		transport:     trans,
+		isExitNode:    isExitNode,
+		exitMode:      mode,
+		upstreamProxy: upstreamProxy,
+		startTime:     time.Now(),
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
@@ -128,7 +169,30 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 // ---- exit node: proxy ----
 
 func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
-	utils.Debugf("[TUNNEL] EXIT NODE - proxy mode (no raw sockets)")
+	baseDialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	if t.upstreamProxy == "" || strings.ToLower(t.upstreamProxy) == "direct" {
+		t.dialer = baseDialer
+		utils.Debugf("[TUNNEL] EXIT NODE - proxy mode (direct connection, no upstream SOCKS5)")
+	} else {
+		proxyHost, auth, err := parseSOCKS5(t.upstreamProxy)
+		if err != nil {
+			utils.Debugf("[TUNNEL] Invalid upstream proxy %q: %v", t.upstreamProxy, err)
+			t.dialer = baseDialer
+		} else {
+			d, err := proxy.SOCKS5("tcp", proxyHost, auth, baseDialer)
+			if err != nil {
+				utils.Debugf("[TUNNEL] Failed to create SOCKS5 dialer for %s: %v", proxyHost, err)
+				t.dialer = baseDialer
+			} else {
+				t.dialer = d
+				utils.Debugf("[TUNNEL] EXIT NODE - Routing via SOCKS5 proxy %s", proxyHost)
+			}
+		}
+	}
 
 	t.gvisorStack.SetPromiscuousMode(tunnelNIC, true)
 	t.gvisorStack.SetSpoofing(tunnelNIC, true)
@@ -142,26 +206,45 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 }
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
-	id := r.ID()
-	dest := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
-
-	var wq waiter.Queue
-	ep, tErr := r.CreateEndpoint(&wq)
-	if tErr != nil {
-		utils.Debugf("[EXIT] CreateEndpoint %s: %v", dest, tErr)
-		r.Complete(true)
-		return
-	}
-	r.Complete(false)
-	local := gonet.NewTCPConn(&wq, ep)
+	reqID := r.ID()
+	dest := net.JoinHostPort(reqID.LocalAddress.String(), strconv.Itoa(int(reqID.LocalPort)))
 
 	utils.SafeGo("exit.flow", func() {
-		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+		dialer := t.dialer
+		if dialer == nil {
+			dialer = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		var remote net.Conn
+		var err error
+		if cd, ok := dialer.(proxy.ContextDialer); ok {
+			remote, err = cd.DialContext(ctx, "tcp", dest)
+		} else {
+			remote, err = dialer.Dial("tcp", dest)
+		}
+
 		if err != nil {
 			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
-			local.Close()
+			r.Complete(true)
 			return
 		}
+		defer remote.Close()
+
+		var wq waiter.Queue
+		ep, tErr := r.CreateEndpoint(&wq)
+		if tErr != nil {
+			utils.Debugf("[EXIT] CreateEndpoint %s: %v", dest, tErr)
+			r.Complete(true)
+			return
+		}
+		r.Complete(false)
+
+		local := gonet.NewTCPConn(&wq, ep)
+		defer local.Close()
+
 		if tc, ok := remote.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 			_ = tc.SetReadBuffer(16 * 1024 * 1024)
@@ -169,16 +252,28 @@ func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 		}
 		utils.Debugf("[EXIT] %s connected", dest)
 
+		var wg sync.WaitGroup
+		wg.Add(2)
+
 		go func() {
+			defer wg.Done()
 			buf := make([]byte, 256*1024)
-			io.CopyBuffer(remote, local, buf)
-			remote.Close()
-			local.Close()
+			_, _ = io.CopyBuffer(remote, local, buf)
+			if tc, ok := remote.(interface{ CloseWrite() error }); ok {
+				_ = tc.CloseWrite()
+			} else {
+				remote.Close()
+			}
 		}()
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(local, remote, buf)
-		local.Close()
-		remote.Close()
+
+		go func() {
+			defer wg.Done()
+			defer local.Close()
+			buf := make([]byte, 256*1024)
+			_, _ = io.CopyBuffer(local, remote, buf)
+		}()
+
+		wg.Wait()
 	})
 }
 

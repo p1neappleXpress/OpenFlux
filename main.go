@@ -100,6 +100,7 @@ func main() {
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
+	upstreamProxy := flag.String("upstream-proxy", "", "Upstream SOCKS5 proxy for exit node (e.g. 127.0.0.1:10808, socks5://127.0.0.1:10808, or 'direct')")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
@@ -150,6 +151,9 @@ MODE  (only with --role=exit)
   -m, --mode=l3                Packet forwarding (SNAT/DNAT). Default.
   -m, --mode=l4                Stream proxy (TCP termination + re-dial).
   -l, --local-ip=<ip>          Egress IP for SNAT. Auto-detected.
+      --upstream-proxy=<addr>  Upstream SOCKS5 proxy for exit node (forces l4 mode,
+                               e.g. 127.0.0.1:10808, socks5://127.0.0.1:10808, or direct).
+                               Auto-detected from -s/--socks5 if specified with --role=exit.
 
 TRANSPORT MODIFIERS
   -c, --codec=batched          zstd + coalescing. Default.
@@ -226,6 +230,27 @@ DEPRECATED (removed in v2)
 	}
 	if *mode == "" {
 		*mode = "l3"
+	}
+
+	if *role == roleExit && *upstreamProxy == "" {
+		socks5Explicit := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "socks5" {
+				socks5Explicit = true
+			}
+		})
+		if socks5Explicit && *socksAddr != "" {
+			*upstreamProxy = *socksAddr
+		}
+	}
+
+	if *role == roleExit && *upstreamProxy != "" {
+		if *mode == "" || *mode == "l3" {
+			if *mode == "l3" {
+				log.Printf("info: upstream proxy requires l4 mode, switching from l3 to l4")
+			}
+			*mode = "l4"
+		}
 	}
 
 	if *codec != codecBatched && *codec != codecLegacy {
@@ -351,7 +376,7 @@ DEPRECATED (removed in v2)
 
 	switch *role {
 	case roleExit:
-		runExit(trans, exitMode)
+		runExit(trans, exitMode, *upstreamProxy)
 	case roleClient:
 		runClient(trans, *inbound, *socksAddr, exitMode)
 	default:
@@ -359,12 +384,16 @@ DEPRECATED (removed in v2)
 	}
 }
 
-func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
-	ex, err := tunnel.NewExitNode(trans, exitMode.String())
+func runExit(trans transport.Transport, exitMode tunnel.ExitMode, upstreamProxy string) {
+	ex, err := tunnel.NewExitNode(trans, exitMode.String(), upstreamProxy)
 	if err != nil {
 		log.Fatalf("exit node: %v", err)
 	}
-	log.Printf("Running as EXIT NODE (mode=%s)", ex.Mode())
+	if upstreamProxy != "" {
+		log.Printf("Running as EXIT NODE with upstream proxy (%s) - mode=%s", upstreamProxy, ex.Mode())
+	} else {
+		log.Printf("Running as EXIT NODE (mode=%s)", ex.Mode())
+	}
 	if err := ex.Start(); err != nil {
 		log.Fatalf("exit start: %v", err)
 	}

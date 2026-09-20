@@ -322,6 +322,7 @@ Measure raw goodput through the transport, without touching the host network:
 | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
 | `--url` | `-u` | `http://#` | Document URL |
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
+| `--upstream-proxy` | | | Upstream SOCKS5 proxy for exit node (forces l4, auto-detected from -s/--socks5) |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
 | `--debug` | `-d` | `false` | Verbose per-packet logging |
 | `--encryption-key-file` | | | AES-256-GCM shared secret file |

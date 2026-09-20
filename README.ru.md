@@ -326,6 +326,7 @@ LZ4-кодека передайте `--codec=legacy`:
 | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
 | `--url` | `-u` | `http://#` | URL документа |
 | `--socks5` | `-s` | `:1080` | Адрес SOCKS5-прокси |
+| `--upstream-proxy` | | | Вышестоящий SOCKS5-прокси для exit node (включает l4, авто-определение из -s/--socks5) |
 | `--local-ip` | `-l` | (авто) | Egress IP для l3 SNAT / фильтра RST |
 | `--debug` | `-d` | `false` | Подробное per-packet логирование |
 | `--encryption-key-file` | | | Файл с общим секретом для AES-256-GCM |
