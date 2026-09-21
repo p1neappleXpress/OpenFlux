@@ -131,8 +131,10 @@ the kernel rule above is only needed for kernel-generated RSTs.
 - **iOS packet tunnel** - NEPacketTunnelProvider, pure L3 forwarding.
 - **Legacy codec** - `--codec=legacy` reverts to the old per-packet LZ4 codec
   (compatible with older clients).
-- **Optional encryption** - `--encryption-key-file` wraps the transport in
-  AES-256-GCM. Both peers must share the secret.
+- **Optional encryption** - `--exit-key-file` on the exit node and `--peer-key`
+  on the client run a Noise `NKpsk0` handshake (X25519 + AES-256-GCM) over the
+  channel; session keys rotate every 2 minutes. `--psk-file` on both sides
+  closes the node to clients without the secret.
 - **Benchmark modes** - `--role=bench-send --bench-bytes=N` / `--role=bench-sink`
   measure raw goodput through the transport without touching the host network.
 
@@ -160,7 +162,9 @@ OpenFlux/
     batched.go                     # BatchedTransport (coalescing + zstd)
     framing.go                     # Wire framing for batched frames
     compressor.go                  # Legacy per-packet LZ4 codec
-    encrypted.go                   # Optional AES-256-GCM wrapper
+    encrypted.go                   # Optional encrypted session layer (Noise NKpsk0)
+    noise_keys.go                  # Exit static key file, peer key parsing, PSK derivation
+    replay.go                      # Anti-replay window for the encrypted layer
     yandex/                        # Yandex.Docs + Volga backends
     oneme/                         # MAX Messenger backend
     cupsonline/                    # Cups.online backend
@@ -271,12 +275,51 @@ format. Client and exit node must both use the same codec (both new, or both
 
 ### Encryption (optional)
 
+The encrypted transport is a Noise `NKpsk0` handshake (X25519, AES-256-GCM,
+SHA-256) between the client and the exit node, carried over the same channel
+as the data. The exit node owns a static key pair; the client only needs its
+public key. Every handshake makes fresh session keys and the client
+re-handshakes every 2 minutes on WireGuard's schedule while the old session
+keeps flowing, so a key that leaks later does not expose recorded traffic.
+Data frames carry a 64-bit counter that is the AEAD nonce and feeds a sliding
+anti-replay window.
+
+**Exit node:** pick a file for the static key. It is created on the first run
+and the public key is printed at startup:
+
 ```
-./openflux ... --encryption-key-file=/path/to/secret.txt
+./openflux --role=exit ... --exit-key-file=/etc/openflux/exit.key
+```
+```
+=== EXIT PUBLIC KEY (generated and saved to /etc/openflux/exit.key) ===
+<base64 key>
+Start clients with --peer-key=<base64 key>
 ```
 
-Both peers must use the same secret file. AES-256-GCM, directional keys.
-Unset means unencrypted, unchanged behavior.
+**Client:** pass that public key:
+
+```
+./openflux --role=client ... --peer-key=<base64 key>
+```
+
+**Closed node (optional):** a shared secret of 16+ characters in a file on
+both sides is mixed into the handshake as a pre-shared key. The exit node then
+silently ignores clients that do not have it:
+
+```
+./openflux --role=exit   ... --exit-key-file=exit.key --psk-file=secret.txt
+./openflux --role=client ... --peer-key=<base64 key> --psk-file=secret.txt
+```
+
+Notes:
+- The encrypted layer sits under the codec: one AEAD covers a whole batch and
+  compression keeps working. Overhead is 33 bytes per batch.
+- One client per document. A second client handshaking on the same document
+  takes it over (without encryption it would corrupt the traffic instead).
+  Give every client its own document.
+- Unset means unencrypted, unchanged behavior. The old `--encryption-key-file`
+  is accepted as an alias of `--psk-file` but no longer turns encryption on by
+  itself, and the v1 wire format is not accepted.
 
 ### Benchmarks
 
@@ -324,7 +367,9 @@ Measure raw goodput through the transport, without touching the host network:
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
 | `--debug` | `-d` | `false` | Verbose per-packet logging |
-| `--encryption-key-file` | | | AES-256-GCM shared secret file |
+| `--exit-key-file` | | | Exit: static key file for the encrypted transport (created on first run) |
+| `--peer-key` | | | Client: the exit node's public key; turns encryption on |
+| `--psk-file` | | | Both, optional: shared secret file (16+ chars) that closes the node |
 | `--maxToken` | | | MAX auth token (`--transport=oneme`) |
 | `--maxUid` | | | MAX user id (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | MB to push (`--role=bench-send`) |

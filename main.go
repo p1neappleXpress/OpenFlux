@@ -91,9 +91,13 @@ func main() {
 	mode := flag.String("mode", "", "Exit-node mode: l3 (default, Linux only) or l4 (works everywhere)")
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
-	encryptionKeyFile := flag.String("encryption-key-file", "",
-		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
-			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+	exitKeyFile := flag.String("exit-key-file", "",
+		"Exit node: X25519 static key file for the encrypted transport, created on first run. "+
+			"The public key is printed at startup for clients")
+	peerKey := flag.String("peer-key", "",
+		"Client: the exit node's public key (from its startup banner). Turns the encrypted transport on")
+	pskFile := flag.String("psk-file", "",
+		"Optional, both peers: file with a shared secret (16+ characters). The exit node then refuses clients without it")
 
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
@@ -114,6 +118,7 @@ func main() {
 	depLegacy := flag.Bool("legacy", false, "DEPRECATED: use --codec=legacy")
 	depBenchSend := flag.Int("bench-send", 0, "DEPRECATED: use --role=bench-send --bench-bytes=N")
 	depBenchSink := flag.Bool("bench-sink", false, "DEPRECATED: use --role=bench-sink")
+	depEncryptionKeyFile := flag.String("encryption-key-file", "", "DEPRECATED: use --psk-file with --exit-key-file / --peer-key")
 
 	// Override the default flag.PrintDefaults so -h prints a structured
 	// usage message with axes, modifiers, and examples instead of a flat
@@ -154,8 +159,13 @@ MODE  (only with --role=exit)
 TRANSPORT MODIFIERS
   -c, --codec=batched          zstd + coalescing. Default.
   -c, --codec=legacy           Per-packet LZ4. A/B only.
-      --encryption-key-file=<path>
-                               AES-256-GCM wrapper. Both peers must share the same key.
+
+ENCRYPTION  (Noise NKpsk0: X25519 + AES-256-GCM, session keys rotate every 2 min)
+      --exit-key-file=<path>   Exit: static key file, created on first run. The public
+                               key is printed at startup; give it to clients.
+      --peer-key=<base64>      Client: the exit node's public key. Turns encryption on.
+      --psk-file=<path>        Both, optional: shared secret (16+ chars). The exit then
+                               refuses clients that do not have it.
 
 BENCHMARK  (only with --role=bench-*)
       --bench-bytes=<MB>       MB to push (bench-send).
@@ -169,6 +179,7 @@ DEPRECATED (removed in v2)
   -tun, -socks5-mode       -> --inbound=tun|socks5
   -legacy                  -> --codec=legacy
   -bench-send, -bench-sink -> --role=bench-send|bench-sink
+  -encryption-key-file     -> --psk-file (plus --exit-key-file / --peer-key)
 `)
 	}
 
@@ -213,6 +224,11 @@ DEPRECATED (removed in v2)
 	if *depBenchSink {
 		log.Printf("warning: -bench-sink is deprecated, use --role=bench-sink")
 		*role = roleBenchSink
+	}
+	if *depEncryptionKeyFile != "" && *pskFile == "" {
+		log.Printf("warning: -encryption-key-file is deprecated, use --psk-file; " +
+			"the encrypted transport now also needs --exit-key-file on the exit node and --peer-key on the client")
+		*pskFile = *depEncryptionKeyFile
 	}
 
 	// Platform defaults. The recommended client path is utun on macOS and
@@ -297,6 +313,33 @@ DEPRECATED (removed in v2)
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
 
+	// Optional encryption sits directly on the raw transport: the codec above
+	// it batches and compresses plaintext, and one AEAD covers a whole batch.
+	// The client (and bench-send) initiates handshakes, the exit node (and
+	// bench-sink) answers them.
+	var psk string
+	if *pskFile != "" {
+		secret, err := readSecretFile(*pskFile)
+		if err != nil {
+			log.Fatalf("--psk-file: %v", err)
+		}
+		psk = secret
+	}
+	initiator := *role == roleClient || *role == roleBenchSend
+	enc, err := newEncryptionSetup(encryptionOptions{ExitKeyFile: *exitKeyFile, PeerKey: *peerKey, PSK: psk}, initiator)
+	if err != nil {
+		log.Fatalf("Encryption: %v", err)
+	}
+	if enc != nil {
+		encrypted, err := enc.wrap(inner)
+		if err != nil {
+			log.Fatalf("Configure encrypted transport: %v", err)
+		}
+		inner = encrypted
+		log.Printf("Transport encryption: %s", enc.label)
+		fmt.Print(enc.banner)
+	}
+
 	// App-layer codec, outermost. Default is the new batching+zstd layer;
 	// --codec=legacy selects the old per-packet LZ4 path so the two can be
 	// compared over the same channel. Client and exit node must use the same one.
@@ -307,26 +350,6 @@ DEPRECATED (removed in v2)
 	case codecLegacy:
 		log.Printf("Codec: legacy (per-packet LZ4, no batching)")
 		inner = transport.NewCompressedTransport(inner)
-	}
-
-	// Optional AES-256-GCM encryption sits closest to the raw transport, so on
-	// send we batch/compress first and encrypt the result (ciphertext would not
-	// compress). Both peers must use the same secret.
-	if *encryptionKeyFile != "" {
-		secretBytes, err := os.ReadFile(*encryptionKeyFile)
-		if err != nil {
-			log.Fatalf("Read encryption key file: %v", err)
-		}
-		context := *transportType
-		if globalDocUrl != "" {
-			context = globalDocUrl
-		}
-		encrypted, err := transport.NewEncryptedTransport(inner, strings.TrimSpace(string(secretBytes)), context, *role == roleExit)
-		if err != nil {
-			log.Fatalf("Configure encrypted transport: %v", err)
-		}
-		inner = encrypted
-		log.Printf("Transport encryption: AES-256-GCM enabled")
 	}
 
 	trans := inner

@@ -63,6 +63,11 @@ var (
 	running bool
 	socks   *socks5.SOCKS5Server
 	trans   transport.Transport
+
+	// Encryption settings for the next OpenFluxStartClient, set through
+	// OpenFluxSetPeerKey / OpenFluxSetPSK. Empty = plaintext.
+	bridgePeerKey string
+	bridgePSK     string
 )
 
 func init() {
@@ -120,6 +125,7 @@ const (
 	startTransportError = 3
 	startAddrInUse      = 4 // SOCKS5 port could not be bound (e.g. already in use)
 	startPanic          = 5
+	startBadEncryption  = 6 // peer key or PSK from OpenFluxSetPeerKey / OpenFluxSetPSK is unusable
 )
 
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
@@ -164,17 +170,34 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	probe.Close()
 
 	config := transport.DefaultConfig()
-	var t transport.Transport
+	var raw transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		raw = yandex.NewYandexDocsTransport(docURL, config)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		raw = oneme.NewOneMeTransport(false, mToken, uidint, config)
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)
 	}
+
+	// Optional encryption sits on the raw transport, under the codec, the
+	// same way main.go wires it.
+	enc, err := newEncryptionSetup(encryptionOptions{PeerKey: bridgePeerKey, PSK: bridgePSK}, true)
+	if err != nil {
+		utils.Debugf("[BRIDGE] Encryption: %v", err)
+		return C.int(startBadEncryption)
+	}
+	if enc != nil {
+		raw, err = enc.wrap(raw)
+		if err != nil {
+			utils.Debugf("[BRIDGE] Configure encrypted transport: %v", err)
+			return C.int(startBadEncryption)
+		}
+		utils.Debugf("[BRIDGE] Transport encryption: %s", enc.label)
+	}
+	t := transport.NewCompressedTransport(raw)
 
 	if err := t.Start(); err != nil {
 		utils.Debugf("[BRIDGE] Failed to start transport: %v", err)
@@ -293,4 +316,26 @@ func OpenFluxFreeString(s *C.char) {
 //export OpenFluxSetDebug
 func OpenFluxSetDebug(on C.int) {
 	utils.SetDebug(on != 0)
+}
+
+// OpenFluxSetPeerKey sets the exit node's public key (base64, from the exit
+// node's startup banner) for the encrypted transport. Call it before
+// OpenFluxStartClient; an empty string turns encryption off.
+//
+//export OpenFluxSetPeerKey
+func OpenFluxSetPeerKey(key *C.char) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	bridgePeerKey = strings.TrimSpace(C.GoString(key))
+}
+
+// OpenFluxSetPSK sets the optional shared secret (16+ characters) that a
+// closed exit node requires from its clients. Call it before
+// OpenFluxStartClient; an empty string clears it.
+//
+//export OpenFluxSetPSK
+func OpenFluxSetPSK(secret *C.char) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	bridgePSK = strings.TrimSpace(C.GoString(secret))
 }
