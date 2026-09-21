@@ -36,6 +36,9 @@ type BatchedTransport struct {
 	maxBatchCount int
 
 	running atomic.Bool
+	stop    chan struct{}
+	stopMu  sync.Mutex
+	flushWG sync.WaitGroup
 
 	mu     sync.RWMutex
 	userCb func([]byte)
@@ -54,6 +57,7 @@ func NewBatchedTransport(inner Transport) *BatchedTransport {
 	return &BatchedTransport{
 		Transport:     inner,
 		queue:         make(chan []byte, batchQueueDepth),
+		stop:          make(chan struct{}),
 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
 		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
 		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
@@ -65,12 +69,27 @@ func (b *BatchedTransport) Start() error {
 		return err
 	}
 	b.running.Store(true)
-	go b.flushLoop()
+	b.flushWG.Add(1)
+	go func() {
+		defer b.flushWG.Done()
+		b.flushLoop()
+	}()
 	return nil
 }
 
+// Stop ends the flush loop and waits for it before stopping the inner
+// transport, so no goroutine outlives the transport. Packets still queued are
+// dropped; the tunnel is going away.
 func (b *BatchedTransport) Stop() error {
 	b.running.Store(false)
+	b.stopMu.Lock()
+	select {
+	case <-b.stop:
+	default:
+		close(b.stop)
+	}
+	b.stopMu.Unlock()
+	b.flushWG.Wait()
 	return b.Transport.Stop()
 }
 
@@ -113,8 +132,10 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 
 func (b *BatchedTransport) flushLoop() {
 	for b.running.Load() {
-		first, ok := <-b.queue
-		if !ok {
+		var first []byte
+		select {
+		case first = <-b.queue:
+		case <-b.stop:
 			return
 		}
 		batch := [][]byte{first}
@@ -155,6 +176,9 @@ func (b *BatchedTransport) flushLoop() {
 					size += 2 + len(p)
 				case <-timer.C:
 					break linger
+				case <-b.stop:
+					timer.Stop()
+					return
 				}
 			}
 			timer.Stop()

@@ -1027,6 +1027,7 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
 		Reconnects:    t.stats.WSReconnects.Load(),
 		Connected:     t.IsConnected(),
 		Uptime:        base.Uptime,
+		LastRecv:      base.LastRecv,
 	}
 }
 

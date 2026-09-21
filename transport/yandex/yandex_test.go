@@ -1,6 +1,7 @@
 package yandex
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ func TestFetchDocInfoVolgaConfigReturnsError(t *testing.T) {
 
 	url := serveConfig(t, clientConfigPage(config))
 
-	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
+	info, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001")
 	if err == nil {
 		t.Fatalf("expected an error for a config without balancer_url, got info %+v", info)
 	}
@@ -44,7 +45,7 @@ func TestFetchDocInfoVolgaConfigReturnsError(t *testing.T) {
 func TestFetchDocInfoMissingOfficeActionDataReturnsError(t *testing.T) {
 	url := serveConfig(t, clientConfigPage(`{"somethingElse":true}`))
 
-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
 		t.Fatal("expected an error when officeActionData is absent")
 	}
 }
@@ -55,7 +56,7 @@ func TestFetchDocInfoMissingDocumentReturnsError(t *testing.T) {
 
 	url := serveConfig(t, clientConfigPage(config))
 
-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
 		t.Fatal("expected an error when editor_config.document is absent")
 	}
 }
@@ -66,7 +67,7 @@ func TestFetchDocInfoMissingTokenReturnsError(t *testing.T) {
 
 	url := serveConfig(t, clientConfigPage(config))
 
-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
 		t.Fatal("expected an error when editor_config.token is absent")
 	}
 }
@@ -74,7 +75,7 @@ func TestFetchDocInfoMissingTokenReturnsError(t *testing.T) {
 func TestFetchDocInfoInvalidJSONReturnsError(t *testing.T) {
 	url := serveConfig(t, clientConfigPage(`{not valid json`))
 
-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
 		t.Fatal("expected an error when client-config is not valid JSON")
 	}
 }
@@ -82,7 +83,7 @@ func TestFetchDocInfoInvalidJSONReturnsError(t *testing.T) {
 func TestFetchDocInfoMissingConfigReturnsError(t *testing.T) {
 	url := serveConfig(t, `<!DOCTYPE html><html><body>no config here</body></html>`)
 
-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
 		t.Fatal("expected an error when client-config is absent")
 	}
 }
@@ -95,7 +96,7 @@ func TestFetchDocInfoValidConfig(t *testing.T) {
 
 	url := serveConfig(t, clientConfigPage(config))
 
-	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
+	info, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -135,7 +136,7 @@ func TestFetchDocInfoMissingPermissionsFallsBack(t *testing.T) {
 
 	url := serveConfig(t, clientConfigPage(config))
 
-	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
+	info, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

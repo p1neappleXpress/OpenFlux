@@ -150,6 +150,7 @@ the kernel rule above is only needed for kernel-generated RSTs.
 ```
 OpenFlux/
   main.go                          # CLI entry (client / exit / benches)
+  multistream.go                   # --url list parsing, multi-stream status log
   bench.go                         # Benchmark helpers
   tun_darwin.go                    # macOS utun L3 client
   tun_watch.go                     # Socket watcher for bypass routes
@@ -161,6 +162,8 @@ OpenFlux/
     framing.go                     # Wire framing for batched frames
     compressor.go                  # Legacy per-packet LZ4 codec
     encrypted.go                   # Optional AES-256-GCM wrapper
+    multistream.go                 # One tunnel over several documents
+    flowhash.go                    # Per-connection hash for multi-stream
     yandex/                        # Yandex.Docs + Volga backends
     oneme/                         # MAX Messenger backend
     cupsonline/                    # Cups.online backend
@@ -278,6 +281,51 @@ format. Client and exit node must both use the same codec (both new, or both
 Both peers must use the same secret file. AES-256-GCM, directional keys.
 Unset means unencrypted, unchanged behavior.
 
+### Multi-stream (several documents)
+
+Pass a comma-separated list to `--url` (`yandex`, `vyandex`) to run one tunnel
+over several documents at once. If one document dies, or the relay stops
+delivering on it, the tunnel keeps working over the others (issue #50).
+
+```
+# exit node
+./openflux --role=exit --mode=l3 \
+    --url="https://disk.yandex.ru/i/AAA,https://disk.yandex.ru/i/BBB" \
+    --multistream-status=10s
+
+# client: the same documents, in any order
+./openflux --role=client \
+    --url="https://disk.yandex.ru/i/BBB,https://disk.yandex.ru/i/AAA" \
+    --multistream-status=10s
+```
+
+How it works:
+
+- Every document is a complete stream of its own (transport, codec,
+  encryption), so each one carries the single-document wire format.
+- Each TCP connection is pinned to one document; different connections spread
+  over the documents. Spreading the packets of one connection over documents
+  would reorder them and collapse its throughput.
+- A document is preferred while the peer's keepalives arrive on it. A
+  disconnected document stops getting traffic immediately; so does one whose
+  participant list shows nobody but us (the peer left). One that is connected
+  but silent for another reason (e.g. the peer landed on another document
+  backend) is dropped after 25s.
+- A connection's packets are sent over the document its packets last arrived
+  on. When one side moves a connection to another document, the other side
+  follows at once instead of sending its ACKs into the lost document.
+- A single URL keeps the exact single-document behavior.
+
+`--multistream-status` logs one line per interval:
+
+```
+[MULTI] connected=2/2 peer=1/2 s0[AAA]=UP(peer=3s,rx=812,tx=790,rc=0) s1[BBB]=NOPEER(peer=41s,rx=15,tx=9,rc=2)
+```
+
+`UP`: connected and the peer was heard from recently; `NOPEER`: connected but
+the peer is silent; `DOWN`: not connected. On iOS, enter the comma-separated
+list in the URL field.
+
 ### Benchmarks
 
 Measure raw goodput through the transport, without touching the host network:
@@ -320,7 +368,8 @@ Measure raw goodput through the transport, without touching the host network:
 | `--transport` | `-t` | `yandex` | `yandex` \| `vyandex` \| `oneme` \| `cupsonline` \| `mailru` |
 | `--mode` | `-m` | `l3` | Exit-node mode: `l3` \| `l4` |
 | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
-| `--url` | `-u` | `http://#` | Document URL |
+| `--url` | `-u` | `http://#` | Document URL; comma-separated list for multi-stream |
+| `--multistream-status` | | `0` | Log per-document state on this interval (e.g. `10s`) |
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
 | `--debug` | `-d` | `false` | Verbose per-packet logging |

@@ -122,10 +122,22 @@ const (
 	startPanic          = 5
 )
 
+// newBridgeDocStreams builds the iOS client transport for one or several
+// comma-separated documents: one legacy-codec stream per document, combined
+// into a MultiStreamTransport when there is more than one.
+func newBridgeDocStreams(transportType, docURL string, config transport.TransportConfig) transport.Transport {
+	return newDocStreams(splitURLs(docURL), func(u string) transport.Transport {
+		if transportType == "vyandex" {
+			return transport.NewCompressedTransport(yandex.NewYandexVolgaTransport(u, config))
+		}
+		return transport.NewCompressedTransport(yandex.NewYandexDocsTransport(u, config))
+	})
+}
+
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
 //
-// transportType: "yandex" or "oneme".
-// url:           Yandex.Docs document URL (yandex transport).
+// transportType: "yandex", "vyandex", or "oneme".
+// url:           Yandex.Docs document URL(s). Comma-separated for multi-stream.
 // socksAddr:     e.g. "127.0.0.1:1080".
 // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
 //
@@ -166,8 +178,8 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
-	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+	case "yandex", "", "vyandex":
+		t = newBridgeDocStreams(tt, docURL, config)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))

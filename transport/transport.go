@@ -31,6 +31,12 @@ type TransportStats struct {
 	Reconnects    uint64
 	Connected     bool
 	Uptime        time.Duration
+	// LastRecv is when anything last arrived from the remote peer: a data
+	// frame or a transport-level keepalive. Zero if nothing has arrived yet,
+	// or since the transport learned that the peer left.
+	// MultiStreamTransport uses it to tell a stream that is merely connected
+	// to its relay from one that actually reaches the peer.
+	LastRecv time.Time
 }
 
 func DefaultConfig() TransportConfig {
@@ -54,6 +60,7 @@ type BaseTransport struct {
 	Mu              sync.RWMutex
 
 	reconnectAttempts atomic.Int32
+	lastRecv          atomic.Int64 // unix nanos; 0 = never
 }
 
 func NewBaseTransport(config TransportConfig) *BaseTransport {
@@ -121,7 +128,17 @@ func (b *BaseTransport) Stats() TransportStats {
 		Reconnects:    uint64(b.reconnectAttempts.Load()),
 		Connected:     b.IsConnected(),
 		Uptime:        time.Since(b.startTime),
+		LastRecv:      b.LastRecv(),
 	}
+}
+
+// LastRecv reports when the peer was last heard from (see TransportStats).
+func (b *BaseTransport) LastRecv() time.Time {
+	ns := b.lastRecv.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func (b *BaseTransport) RecordSend(bytes int) {
@@ -132,6 +149,19 @@ func (b *BaseTransport) RecordSend(bytes int) {
 func (b *BaseTransport) RecordReceive(bytes int) {
 	atomic.AddUint64(&b.stats.BytesReceived, uint64(bytes))
 	atomic.AddUint64(&b.stats.PacketsRecv, 1)
+	b.RecordPeerActivity()
+}
+
+// RecordPeerActivity marks the peer as heard from without counting a data
+// frame, for transport-level keepalives that carry no tunnel payload.
+func (b *BaseTransport) RecordPeerActivity() {
+	b.lastRecv.Store(time.Now().UnixNano())
+}
+
+// ForgetPeer clears LastRecv when the transport learns that the peer has left,
+// so the peer counts as not heard from until it sends again.
+func (b *BaseTransport) ForgetPeer() {
+	b.lastRecv.Store(0)
 }
 
 func (b *BaseTransport) RecordReconnect() {

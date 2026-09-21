@@ -22,7 +22,6 @@ import (
 	"openflux/network"
 	"openflux/transport"
 	"openflux/transport/oneme"
-	"openflux/transport/yandex"
 	"openflux/utils"
 )
 
@@ -75,8 +74,8 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
-	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+	case "yandex", "", "vyandex":
+		t = newBridgeDocStreams(tt, docURL, config)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
