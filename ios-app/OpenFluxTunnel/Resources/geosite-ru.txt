@@ -1,146 +1,91 @@
 # OpenFlux GeoSite: Russian domains routed DIRECT (split tunneling, phase 2).
 # One domain suffix per line; matches the domain and all its subdomains.
-# Complements the GeoIP RU set — useful for RU services on foreign CDNs whose
-# IPs are not in geoip:ru. Extend freely.
+# Complements the GeoIP RU set for RU services whose IPs are foreign (CDNs).
+#
+# STRATEGY: nearly all Russian sites live under a Russian TLD, so the TLD block
+# below routes the entire .ru / .рф / .su / .moscow / .москва / .tatar space
+# direct in a handful of lines — broader and cleaner than a multi-thousand list
+# of individual .ru domains (which are all covered by the "ru" suffix anyway).
+# IDN TLDs are listed in punycode because DNS carries names that way.
+# The curated block after it covers RU services that sit on a foreign TLD.
+
+# ===== Russian TLDs (covers the bulk of geosite:ru) =====
+ru
+su
+xn--p1ai
+moscow
+xn--80adxhks
+tatar
+xn--d1acj3b
+xn--90ais
+
+# ===== RU services on foreign TLDs (not caught by the TLD block) =====
 
 # --- Yandex ---
-yandex.ru
-yandex.net
 yandex.com
-ya.ru
+yandex.net
+yandex.eu
+yandex.kz
+yandex.by
+yandex.uz
+yandex.com.tr
 yastatic.net
-yandex-team.ru
-dzen.ru
-kinopoisk.ru
+yandexcloud.net
+yandex.st
 kinopoisk.gt
-market.yandex.ru
-taxi.yandex.ru
 
-# --- VK / Mail.ru group ---
+# --- VK / Mail.ru (VK Group) ---
 vk.com
-vk.ru
-vkontakte.ru
-vk-cdn.net
+vk.cc
+vkontakte.com
 userapi.com
-mycdn.me
-mail.ru
-list.ru
-ok.ru
-odnoklassniki.ru
-mradar.mail.ru
-imgsmail.ru
+vk-cdn.net
 vkuser.net
-vkvideo.ru
-vkplay.ru
+vkuservideo.net
+vkuserlive.net
+mycdn.me
+mradx.net
+my.com
+my.games
+mail.com.ua
 
-# --- banks / fintech ---
-sberbank.ru
-sber.ru
-online.sberbank.ru
-sberbank-online.ru
-tinkoff.ru
-tbank.ru
-alfabank.ru
-alfabank.servicecdn.ru
-vtb.ru
-gazprombank.ru
-raiffeisen.ru
-open.ru
-psbank.ru
-sovcombank.ru
-mkb.ru
-pochtabank.ru
-rshb.ru
-mironline.ru
-nspk.ru
-sbp.nspk.ru
-
-# --- government / public services ---
-gosuslugi.ru
-mos.ru
-nalog.ru
-nalog.gov.ru
-pfr.gov.ru
-sfr.gov.ru
-gu.spb.ru
-mvd.ru
-rosreestr.ru
-gibdd.ru
-fssp.gov.ru
-kremlin.ru
-government.ru
-cbr.ru
-edu.gov.ru
-
-# --- ecommerce ---
-ozon.ru
-ozone.ru
-wildberries.ru
-wb.ru
-wbbasket.ru
-avito.ru
-avito.st
-market.yandex.ru
-citilink.ru
-dns-shop.ru
-mvideo.ru
-eldorado.ru
-lamoda.ru
-sbermegamarket.ru
-megamarket.ru
-
-# --- media / news ---
-rbc.ru
-ria.ru
-tass.ru
-lenta.ru
-gazeta.ru
-kommersant.ru
+# --- media / state ---
 rt.com
-vesti.ru
-1tv.ru
-smotrim.ru
+sputniknews.com
+sputnikglobe.com
+tass.com
 championat.com
-sports.ru
-sport-express.ru
-mk.ru
-iz.ru
-rg.ru
+habr.com
+gazeta.com
 
-# --- telecom ---
-mts.ru
-beeline.ru
-megafon.ru
-tele2.ru
-rostelecom.ru
-rt.ru
-domru.ru
+# --- maps / travel / services ---
+2gis.com
+2gis.ae
+aviasales.com
+jetradar.com
+wayaway.io
+
+# --- fintech ---
+qiwi.com
+tinkoff.com
+sberbank.com
+gazprombank.com
 
 # --- streaming / video ---
-rutube.ru
-ivi.ru
 okko.tv
 premier.one
-start.ru
-wink.ru
-vk.video
-kion.ru
+more.tv
 
-# --- misc / infra ---
-gismeteo.ru
-2gis.ru
-2gis.com
-hh.ru
-drom.ru
-auto.ru
-cian.ru
-domclick.ru
-aviasales.ru
-tutu.ru
-rzd.ru
-pochta.ru
-sberdevices.ru
-selectel.ru
-timeweb.ru
-reg.ru
-mail.yandex.ru
+# --- weather / infra ---
+gismeteo.com
+gismeteo.net
+
+# --- ecommerce ---
+ozon.com
+wildberries.eu
+lamoda.com
+
+# --- corporate ---
+gazprom.com
+lukoil.com
+rosneft.com
