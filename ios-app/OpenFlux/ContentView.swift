@@ -18,6 +18,9 @@ struct ContentView: View {
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
+    // Split tunneling: when on, Russian (GeoIP RU) destinations bypass the exit
+    // node and go direct — faster local access, less load on the covert channel.
+    @AppStorage("splitRU") private var splitRU: Bool = false
     @AppStorage("dnsPreset") private var dnsPreset: String = "default"
     @AppStorage("dnsCustom") private var dnsCustom: String = ""
     @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
@@ -356,7 +359,7 @@ struct ContentView: View {
                     tunnel.stop()
                     vpn.start(transport: transport.rawValue, url: effectiveURL,
                               maxToken: maxToken, maxUid: maxUid, dns: dnsSpec,
-                              tunnelUDP: tunnelUDP)
+                              tunnelUDP: tunnelUDP, split: splitRU ? "ru-direct" : "")
                 } label: {
                     Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
                 }
@@ -370,6 +373,12 @@ struct ContentView: View {
             }
             .disabled(vpn.active)
             Text("Off = QUIC falls back to TCP (works on any node). On = tunnel UDP — needs a UDP-capable exit node.")
+                .font(.caption2).foregroundColor(.secondary)
+            Toggle(isOn: $splitRU) {
+                Text("Split tunneling — Russian sites direct").font(.caption)
+            }
+            .disabled(vpn.active)
+            Text("On = Russian destinations bypass the exit node (direct) — by GeoIP RU and by known RU domains (GeoSite, incl. RU services on foreign CDNs). Faster local access, less load on the channel; foreign/blocked traffic still goes through the exit.")
                 .font(.caption2).foregroundColor(.secondary)
         }
     }

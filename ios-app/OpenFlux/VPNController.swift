@@ -27,7 +27,7 @@ final class VPNController: ObservableObject {
     }
 
     func start(transport: String, url: String, maxToken: String, maxUid: String,
-               dns: String, tunnelUDP: Bool) {
+               dns: String, tunnelUDP: Bool, split: String = "") {
         Task {
             let m = manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
@@ -38,6 +38,7 @@ final class VPNController: ObservableObject {
                 "maxToken": maxToken, "maxUid": maxUid,
                 "dns": dns,
                 "udp": tunnelUDP ? "1" : "0",
+                "split": split,   // "ru-direct" = GeoIP RU bypasses the tunnel
             ]
             m.protocolConfiguration = proto
             m.localizedDescription = "OpenFlux"

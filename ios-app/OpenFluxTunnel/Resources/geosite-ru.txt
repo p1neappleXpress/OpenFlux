@@ -1,0 +1,146 @@
+# OpenFlux GeoSite: Russian domains routed DIRECT (split tunneling, phase 2).
+# One domain suffix per line; matches the domain and all its subdomains.
+# Complements the GeoIP RU set — useful for RU services on foreign CDNs whose
+# IPs are not in geoip:ru. Extend freely.
+
+# --- Yandex ---
+yandex.ru
+yandex.net
+yandex.com
+ya.ru
+yastatic.net
+yandex-team.ru
+dzen.ru
+kinopoisk.ru
+kinopoisk.gt
+market.yandex.ru
+taxi.yandex.ru
+
+# --- VK / Mail.ru group ---
+vk.com
+vk.ru
+vkontakte.ru
+vk-cdn.net
+userapi.com
+mycdn.me
+mail.ru
+list.ru
+ok.ru
+odnoklassniki.ru
+mradar.mail.ru
+imgsmail.ru
+vkuser.net
+vkvideo.ru
+vkplay.ru
+
+# --- banks / fintech ---
+sberbank.ru
+sber.ru
+online.sberbank.ru
+sberbank-online.ru
+tinkoff.ru
+tbank.ru
+alfabank.ru
+alfabank.servicecdn.ru
+vtb.ru
+gazprombank.ru
+raiffeisen.ru
+open.ru
+psbank.ru
+sovcombank.ru
+mkb.ru
+pochtabank.ru
+rshb.ru
+mironline.ru
+nspk.ru
+sbp.nspk.ru
+
+# --- government / public services ---
+gosuslugi.ru
+mos.ru
+nalog.ru
+nalog.gov.ru
+pfr.gov.ru
+sfr.gov.ru
+gu.spb.ru
+mvd.ru
+rosreestr.ru
+gibdd.ru
+fssp.gov.ru
+kremlin.ru
+government.ru
+cbr.ru
+edu.gov.ru
+
+# --- ecommerce ---
+ozon.ru
+ozone.ru
+wildberries.ru
+wb.ru
+wbbasket.ru
+avito.ru
+avito.st
+market.yandex.ru
+citilink.ru
+dns-shop.ru
+mvideo.ru
+eldorado.ru
+lamoda.ru
+sbermegamarket.ru
+megamarket.ru
+
+# --- media / news ---
+rbc.ru
+ria.ru
+tass.ru
+lenta.ru
+gazeta.ru
+kommersant.ru
+rt.com
+vesti.ru
+1tv.ru
+smotrim.ru
+championat.com
+sports.ru
+sport-express.ru
+mk.ru
+iz.ru
+rg.ru
+
+# --- telecom ---
+mts.ru
+beeline.ru
+megafon.ru
+tele2.ru
+rostelecom.ru
+rt.ru
+domru.ru
+
+# --- streaming / video ---
+rutube.ru
+ivi.ru
+okko.tv
+premier.one
+start.ru
+wink.ru
+vk.video
+kion.ru
+
+# --- misc / infra ---
+gismeteo.ru
+2gis.ru
+2gis.com
+hh.ru
+drom.ru
+auto.ru
+cian.ru
+domclick.ru
+aviasales.ru
+tutu.ru
+rzd.ru
+pochta.ru
+sberdevices.ru
+selectel.ru
+timeweb.ru
+reg.ru
+mail.yandex.ru

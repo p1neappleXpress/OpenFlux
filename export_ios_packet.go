@@ -289,6 +289,29 @@ func OpenFluxPacketTunnelConnected() C.int {
 	return 0
 }
 
+// OpenFluxSetGeositeDirect loads the newline-separated domain-suffix list whose
+// traffic must go direct (GeoSite). Call before/at start.
+//
+//export OpenFluxSetGeositeDirect
+func OpenFluxSetGeositeDirect(list *C.char) {
+	setGeositeDirect(C.GoString(list))
+}
+
+// OpenFluxDrainDirectIPs copies pending GeoSite direct IPs (newline-joined) into
+// buf, up to max bytes, clears them, and returns the byte count. The provider
+// polls this and adds the IPs to excludedRoutes. Overflow is re-queued.
+//
+//export OpenFluxDrainDirectIPs
+func OpenFluxDrainDirectIPs(buf *C.char, max C.int) C.int {
+	s := drainDirectIPsCapped(int(max))
+	if s == "" {
+		return 0
+	}
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(max))
+	n := copy(dst, s)
+	return C.int(n)
+}
+
 //export OpenFluxStopPacketTunnel
 func OpenFluxStopPacketTunnel() {
 	ptMu.Lock()
@@ -330,6 +353,9 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 		utils.Debugf("[DNS] resolve failed: %v", err)
 		return
 	}
+	// GeoSite split tunneling: if this domain is in the direct set, remember its
+	// resolved IPs so the provider can route them around the tunnel.
+	geositeNoteAnswer(query, answer)
 
 	// Build the response: swap addresses/ports (dst<->src), UDP checksum 0.
 	udpLen := 8 + len(answer)
