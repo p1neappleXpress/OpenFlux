@@ -94,6 +94,7 @@ func main() {
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+	yandexCookiesFile := flag.String("yandex-cookies-file", "", "Netscape cookies.txt for the vyandex transport")
 
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
@@ -156,6 +157,8 @@ TRANSPORT MODIFIERS
   -c, --codec=legacy           Per-packet LZ4. A/B only.
       --encryption-key-file=<path>
                                AES-256-GCM wrapper. Both peers must share the same key.
+      --yandex-cookies-file=<path>
+                               Netscape cookies.txt for vyandex authentication.
 
 BENCHMARK  (only with --role=bench-*)
       --bench-bytes=<MB>       MB to push (bench-send).
@@ -231,6 +234,9 @@ DEPRECATED (removed in v2)
 	if *codec != codecBatched && *codec != codecLegacy {
 		log.Fatalf("--codec: unknown value %q (want batched|legacy)", *codec)
 	}
+	if *yandexCookiesFile != "" && *transportType != "vyandex" {
+		log.Fatal("--yandex-cookies-file requires --transport=vyandex")
+	}
 
 	switch *role {
 	case roleClient:
@@ -283,7 +289,7 @@ DEPRECATED (removed in v2)
 
 	switch *transportType {
 	case "vyandex":
-		inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
+		inner = yandex.NewYandexVolgaTransport(globalDocUrl, *yandexCookiesFile, config)
 	case "yandex":
 		inner = yandex.NewYandexDocsTransport(globalDocUrl, config)
 	case "oneme":

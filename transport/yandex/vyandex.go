@@ -76,7 +76,7 @@ func DefaultVolgaConfig() VolgaConfig {
 	}
 }
 
-const volgaUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+const volgaUserAgent = "Mozilla/5.0"
 
 var reClientConfig = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 
@@ -135,10 +135,15 @@ type volgaAuth struct {
 	Cookies     []*http.Cookie
 }
 
-func authorize(docURL string) (*volgaAuth, error) {
+func authorize(docURL, cookieFile string) (*volgaAuth, error) {
 	utils.Debugf("[VOLGA] authorize(%s)", docURL)
 
 	jar, _ := cookiejar.New(nil)
+	if cookieFile != "" {
+		if err := loadYandexCookies(cookieFile, jar); err != nil {
+			return nil, err
+		}
+	}
 	session := &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
@@ -925,9 +930,10 @@ func decodeBatch(decoded []byte) [][]byte {
 type YandexVolgaTransport struct {
 	*transport.BaseTransport
 
-	docURL string
-	config VolgaConfig
-	stats  *VolgaStats
+	docURL     string
+	cookieFile string
+	config     VolgaConfig
+	stats      *VolgaStats
 
 	auth  *volgaAuth
 	relay *relayClient
@@ -939,10 +945,11 @@ type YandexVolgaTransport struct {
 	keepAliveStop chan struct{}
 }
 
-func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
+func NewYandexVolgaTransport(docURL, cookieFile string, cfg transport.TransportConfig) *YandexVolgaTransport {
 	return &YandexVolgaTransport{
 		BaseTransport: transport.NewBaseTransport(cfg),
 		docURL:        docURL,
+		cookieFile:    cookieFile,
 		config:        DefaultVolgaConfig(),
 		stats:         &VolgaStats{},
 		keepAliveStop: make(chan struct{}),
@@ -955,7 +962,7 @@ func (t *YandexVolgaTransport) Start() error {
 	}
 
 	utils.Debugf("[VOLGA] authorizing...")
-	auth, err := authorize(t.docURL)
+	auth, err := authorize(t.docURL, t.cookieFile)
 	if err != nil {
 		return fmt.Errorf("auth: %w", err)
 	}
