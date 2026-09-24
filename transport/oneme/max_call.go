@@ -76,7 +76,14 @@ func (h *CallHandler) readLoop() {
 		if pid, ok := data["participantId"].(float64); ok {
 			h.remoteID = int64(pid)
 		}
-		go h.msgHandler(text)
+		go func(msg string) {
+			defer func() {
+				if r := recover(); r != nil {
+					logError("[%s] recovered in msgHandler: %v", h.tag, r)
+				}
+			}()
+			h.msgHandler(msg)
+		}(text)
 	}
 }
 
@@ -476,16 +483,19 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			if conv, ok := data["conversation"].(map[string]interface{}); ok {
 				if parts, ok := conv["participants"].([]interface{}); ok {
 					for _, p := range parts {
-						part := p.(map[string]interface{})
+						part, ok := p.(map[string]interface{})
+						if !ok {
+							continue
+						}
 						roles, _ := part["roles"].([]interface{})
 						isCreator := false
 						for _, r := range roles {
-							if r.(string) == "CREATOR" {
+							if rs, ok := r.(string); ok && rs == "CREATOR" {
 								isCreator = true
 							}
 						}
-						if isCreator {
-							h.localID = int64(part["id"].(float64))
+						if id, ok := part["id"].(float64); isCreator && ok {
+							h.localID = int64(id)
 							logInfo("[%s] Local ID: %d", h.tag, h.localID)
 						}
 					}
@@ -502,7 +512,13 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			return
 		}
 		if sdp, ok := d["sdp"].(map[string]interface{}); ok {
-			h.handleSDP(sdp["type"].(string), sdp["sdp"].(string))
+			sdpType, typeOK := sdp["type"].(string)
+			sdpBody, bodyOK := sdp["sdp"].(string)
+			if !typeOK || !bodyOK {
+				logError("[%s] Malformed sdp message, ignoring", h.tag)
+				return
+			}
+			h.handleSDP(sdpType, sdpBody)
 			return
 		}
 		if c, ok := d["candidate"].(map[string]interface{}); ok {

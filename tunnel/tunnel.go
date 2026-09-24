@@ -78,11 +78,11 @@ func SetTCPBuffers(s *stack.Stack) {
 	}
 }
 
-func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
+func NewTCPTunnel(trans transport.Transport, isExitNode bool) (*TCPTunnel, error) {
 	return NewTCPTunnelMode(trans, isExitNode, ExitModeL4)
 }
 
-func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode) *TCPTunnel {
+func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode) (*TCPTunnel, error) {
 	t := &TCPTunnel{
 		transport:  trans,
 		isExitNode: isExitNode,
@@ -108,7 +108,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	tunnelNIC := tcpip.NICID(1)
 	if err := t.gvisorStack.CreateNIC(tunnelNIC, tunnelEP); err != nil {
-		utils.Debugf("[TUNNEL] CreateNIC tunnel error: %v", err)
+		return nil, fmt.Errorf("create NIC: %v", err)
 	}
 
 	if isExitNode {
@@ -122,7 +122,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	})
 
 	utils.SafeGo("tunnel.printStats", t.printStats)
-	return t
+	return t, nil
 }
 
 // ---- exit node: proxy ----
@@ -250,24 +250,3 @@ func (t *TCPTunnel) printStats() {
 	}
 }
 
-// ---- local IP helpers (only needed for raw mode) ----
-
-// localIPOverride, when set, is the address the exit node uses as its egress
-// IP (both for source rewriting and the return-packet filter).
-var localIPOverride string
-
-// SetLocalIP overrides the auto-detected egress IP for the exit node.
-func SetLocalIP(ip string) { localIPOverride = ip }
-
-func getLocalIP() string {
-	if localIPOverride != "" {
-		return localIPOverride
-	}
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "192.168.1.100"
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
-}

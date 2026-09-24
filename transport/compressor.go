@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 
 	"github.com/pierrec/lz4/v4"
@@ -10,6 +11,10 @@ import (
 const (
 	MinCompressSize   = 200
 	CompressionMarker = 0x1F
+	// maxDecompressedSize bounds legacy-codec decompression the same way
+	// framing.go's zstd path bounds its decoder, so a malformed/hostile
+	// LZ4 block can't force unbounded memory allocation.
+	maxDecompressedSize = 8 << 20
 )
 
 type CompressedTransport struct {
@@ -72,5 +77,12 @@ func decompress(data []byte) ([]byte, error) {
 	}
 
 	r := lz4.NewReader(bytes.NewReader(data[1:]))
-	return io.ReadAll(r)
+	out, err := io.ReadAll(io.LimitReader(r, maxDecompressedSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxDecompressedSize {
+		return nil, fmt.Errorf("decompressed size exceeds %d byte limit", maxDecompressedSize)
+	}
+	return out, nil
 }

@@ -120,6 +120,7 @@ const (
 	startTransportError = 3
 	startAddrInUse      = 4 // SOCKS5 port could not be bound (e.g. already in use)
 	startPanic          = 5
+	startTunnelError    = 6
 )
 
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
@@ -181,7 +182,12 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		return C.int(startTransportError)
 	}
 
-	tun := tunnel.NewTCPTunnel(t, false)
+	tun, err := tunnel.NewTCPTunnel(t, false)
+	if err != nil {
+		utils.Debugf("[BRIDGE] Failed to init tunnel: %v", err)
+		t.Stop()
+		return C.int(startTunnelError)
+	}
 	srv := socks5.NewSOCKS5Server(addr, tun)
 	if err := srv.Bind(); err != nil {
 		utils.Debugf("[BRIDGE] Cannot bind %s: %v", addr, err)

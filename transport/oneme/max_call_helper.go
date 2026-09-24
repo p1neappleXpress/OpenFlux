@@ -14,6 +14,9 @@ func decodeCallDetails(vcp string) (string, error) {
 	}
 	var size int
 	fmt.Sscanf(vcp[:3], "%d", &size)
+	if size < 0 {
+		return "", fmt.Errorf("invalid vcp size prefix %q", vcp[:3])
+	}
 	decoded, err := base64.StdEncoding.DecodeString(vcp[4:])
 	if err != nil {
 		return "", err

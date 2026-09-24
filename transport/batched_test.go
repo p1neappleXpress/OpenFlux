@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -15,13 +16,19 @@ type fakeTransport struct {
 	sent     [][]byte
 	cb       func([]byte)
 	loopback bool
+	sendErr  error // when set, Send fails instead of delivering
 }
 
 func (f *fakeTransport) Start() error { return nil }
 func (f *fakeTransport) Stop() error  { return nil }
 func (f *fakeTransport) Send(data []byte) error {
-	cp := append([]byte(nil), data...)
 	f.mu.Lock()
+	if f.sendErr != nil {
+		err := f.sendErr
+		f.mu.Unlock()
+		return err
+	}
+	cp := append([]byte(nil), data...)
 	f.sent = append(f.sent, cp)
 	cb := f.cb
 	lb := f.loopback
@@ -121,5 +128,27 @@ func TestBatchedTransportCoalescesBurstIntoOneMessage(t *testing.T) {
 	}
 	if len(pkts) != n {
 		t.Fatalf("expected %d packets in the batch, got %d", n, len(pkts))
+	}
+}
+
+// Before this fix, flushLoop discarded the error from every
+// b.Transport.Send(encodeBatch(batch)) call: a transport hiccup mid-flush
+// silently dropped the whole batch with no counter and no log line.
+func TestBatchedTransportRecordsSendErrors(t *testing.T) {
+	inner := &fakeTransport{sendErr: fmt.Errorf("write: connection reset")}
+	bt := NewBatchedTransport(inner)
+
+	bt.sendBatch([][]byte{[]byte("lost packet")})
+
+	if got := bt.SendErrors(); got != 1 {
+		t.Fatalf("SendErrors() = %d, want 1", got)
+	}
+	if inner.sendCount() != 0 {
+		t.Fatalf("expected the failed send to record nothing, got %d entries", inner.sendCount())
+	}
+
+	bt.sendBatch([][]byte{[]byte("also lost")})
+	if got := bt.SendErrors(); got != 2 {
+		t.Fatalf("SendErrors() = %d after two failures, want 2", got)
 	}
 }

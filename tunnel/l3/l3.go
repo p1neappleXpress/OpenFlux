@@ -75,12 +75,10 @@ func (t *L3Exit) handleFromTransport(pkt []byte) {
 	}
 	pkt = sl
 
-	if isTCPRST(pkt) {
-		t.dropRST.Add(1)
-		utils.Debugf("[L3] drop: outbound RST")
-		return
-	}
-
+	// A client-originated RST must reach the real destination like any other
+	// packet (dropping it here left the real server's connection half-open);
+	// isTCPClosing below already recognizes RST and marks the conntrack
+	// entry as dying so it expires in the short "closing" bucket.
 	rewriteSNAT(pkt, t.backend.EgressIP())
 	fixChecksums(pkt)
 

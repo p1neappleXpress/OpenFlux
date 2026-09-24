@@ -39,6 +39,25 @@ type BatchedTransport struct {
 
 	mu     sync.RWMutex
 	userCb func([]byte)
+
+	// sendErrors counts batches dropped because the wrapped transport's
+	// Send failed (e.g. mid-reconnect). flushLoop used to ignore this
+	// return value entirely, so a transport hiccup silently dropped
+	// whole batches with no signal anywhere.
+	sendErrors atomic.Uint64
+}
+
+// SendErrors returns the number of flushed batches lost to a Send error on
+// the wrapped transport since the transport started.
+func (b *BatchedTransport) SendErrors() uint64 { return b.sendErrors.Load() }
+
+// sendBatch flushes one coalesced batch and records/logs a failure instead
+// of discarding it silently.
+func (b *BatchedTransport) sendBatch(batch [][]byte) {
+	if err := b.Transport.Send(encodeBatch(batch)); err != nil {
+		b.sendErrors.Add(1)
+		utils.Debugf("[BATCH] flush send error, dropped %d packets: %v", len(batch), err)
+	}
 }
 
 func envInt(name string, def int) int {
@@ -127,7 +146,7 @@ func (b *BatchedTransport) flushLoop() {
 			select {
 			case p, ok := <-b.queue:
 				if !ok {
-					b.Transport.Send(encodeBatch(batch))
+					b.sendBatch(batch)
 					return
 				}
 				batch = append(batch, p)
@@ -148,7 +167,7 @@ func (b *BatchedTransport) flushLoop() {
 				case p, ok := <-b.queue:
 					if !ok {
 						timer.Stop()
-						b.Transport.Send(encodeBatch(batch))
+						b.sendBatch(batch)
 						return
 					}
 					batch = append(batch, p)
@@ -160,6 +179,6 @@ func (b *BatchedTransport) flushLoop() {
 			timer.Stop()
 		}
 
-		b.Transport.Send(encodeBatch(batch))
+		b.sendBatch(batch)
 	}
 }

@@ -615,9 +615,15 @@ type flowKey struct {
 }
 
 type flowSender struct {
-	seq   atomic.Uint64
-	chIdx int
+	seq      atomic.Uint64
+	chIdx    int
+	lastSeen atomic.Int64 // unix nano; touched on every Send, read by the flow sweep
 }
+
+const (
+	flowIdleTimeout  = 5 * time.Minute
+	flowSweepInterval = 30 * time.Second
+)
 
 // ---- Transport ----
 
@@ -741,7 +747,36 @@ func (t *CupsonlineTransport) Start() error {
 	t.SetConnected(true)
 
 	go t.statsLoop()
+	go t.sweepFlowsLoop()
 	return nil
+}
+
+// sweepFlowsLoop periodically expires idle entries from t.flows. Without
+// this, every distinct TCP flow ever seen accumulates in the map for the
+// life of the process — unlike tunnel/l3/conntrack.go's analogous table,
+// which has always had this sweep.
+func (t *CupsonlineTransport) sweepFlowsLoop() {
+	ticker := time.NewTicker(flowSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-ticker.C:
+			t.sweepFlows(time.Now())
+		}
+	}
+}
+
+func (t *CupsonlineTransport) sweepFlows(now time.Time) {
+	cutoff := now.Add(-flowIdleTimeout).UnixNano()
+	t.flowMu.Lock()
+	for k, fs := range t.flows {
+		if fs.lastSeen.Load() < cutoff {
+			delete(t.flows, k)
+		}
+	}
+	t.flowMu.Unlock()
 }
 
 func (t *CupsonlineTransport) Stop() error {
@@ -785,6 +820,7 @@ func (t *CupsonlineTransport) Send(data []byte) error {
 		t.flowMu.Unlock()
 	}
 
+	fs.lastSeen.Store(time.Now().UnixNano())
 	fs.seq.Add(1)
 	return t.wss[fs.chIdx].Send(data)
 }

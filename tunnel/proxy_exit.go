@@ -14,7 +14,11 @@ func newProxyExit(trans transport.Transport) *proxyExit {
 func (p *proxyExit) Mode() string { return "proxy" }
 
 func (p *proxyExit) Start() error {
-	p.tun = NewTCPTunnelMode(p.trans, true, ExitModeL4)
+	tun, err := NewTCPTunnelMode(p.trans, true, ExitModeL4)
+	if err != nil {
+		return err
+	}
+	p.tun = tun
 	return nil
 }
 

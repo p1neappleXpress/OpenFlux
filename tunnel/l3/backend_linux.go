@@ -21,7 +21,7 @@ type rawBackend struct {
 }
 
 func newBackend() (L3Backend, error) {
-	egress, err := detectEgressIPv4()
+	egress, err := resolveEgressIP(detectEgressIPv4)
 	if err != nil {
 		return nil, err
 	}

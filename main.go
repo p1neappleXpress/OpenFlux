@@ -18,6 +18,7 @@ import (
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
 	"openflux/tunnel"
+	"openflux/tunnel/l3"
 	"openflux/utils"
 )
 
@@ -257,6 +258,9 @@ DEPRECATED (removed in v2)
 	if err != nil {
 		log.Fatalf("--mode: %v", err)
 	}
+	if localIP != "" {
+		l3.SetLocalIP(localIP)
+	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
 	// (GC aggressively). Set GOMEMLIMIT in the environment for a hard soft-cap.
@@ -386,7 +390,14 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 		}
 	}
 
-	select {}
+	sigCh := make(chan os.Signal, 1)
+	notifySignals(sigCh)
+	<-sigCh
+	log.Printf("Shutting down exit node...")
+	if err := ex.Stop(); err != nil {
+		log.Printf("exit stop: %v", err)
+	}
+	log.Printf("Shutdown complete")
 }
 
 func runClient(trans transport.Transport, inbound, socksAddr string, exitMode tunnel.ExitMode) {
@@ -397,7 +408,10 @@ func runClient(trans transport.Transport, inbound, socksAddr string, exitMode tu
 		// Explicit opt-in to the legacy SOCKS5+gVisor client. Kept as a fallback
 		// for platforms without a tun client (see README).
 		log.Printf("Running as CLIENT (SOCKS5 on %s, legacy gVisor path)", socksAddr)
-		tun := tunnel.NewTCPTunnelMode(trans, false, exitMode)
+		tun, err := tunnel.NewTCPTunnelMode(trans, false, exitMode)
+		if err != nil {
+			log.Fatalf("tunnel init: %v", err)
+		}
 		socks5Server := socks5.NewSOCKS5Server(socksAddr, tun)
 		log.Fatal(socks5Server.Start())
 	default:

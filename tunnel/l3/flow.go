@@ -55,17 +55,6 @@ func isTCPClosing(pkt []byte) bool {
 	return flags&0x01 != 0 || flags&0x04 != 0
 }
 
-func isTCPRST(pkt []byte) bool {
-	if len(pkt) < 20 || pkt[0]>>4 != 4 || pkt[9] != 6 {
-		return false
-	}
-	ihl := int(pkt[0]&0x0f) * 4
-	if len(pkt) < ihl+14 {
-		return false
-	}
-	return pkt[ihl+13]&0x04 != 0
-}
-
 func fixChecksums(pkt []byte) {
 	if len(pkt) < 20 || pkt[0]>>4 != 4 {
 		return
