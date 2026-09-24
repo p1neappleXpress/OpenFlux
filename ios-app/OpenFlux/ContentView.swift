@@ -94,7 +94,9 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 28) {
-                Text("Выберите профиль и нажмите кнопку подключения")
+                Text(store.profiles.isEmpty
+                     ? "Добавьте профиль: вставьте ссылку на документ или отсканируйте QR"
+                     : "Выберите профиль и нажмите кнопку подключения")
                     .font(.footnote).foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
@@ -184,7 +186,22 @@ struct ContentView: View {
 
     // MARK: profile dropdown
 
+    @ViewBuilder
     private var profilePicker: some View {
+        if store.profiles.isEmpty {
+            Button {
+                editing = nil; showEditor = true
+            } label: {
+                Label("Добавить профиль", systemImage: "plus.circle.fill")
+                    .frame(maxWidth: .infinity).padding(.vertical, 6)
+            }
+            .buttonStyle(.borderedProminent)
+        } else {
+            profileMenu
+        }
+    }
+
+    private var profileMenu: some View {
         Menu {
             ForEach(store.profiles) { p in
                 Button {
@@ -312,13 +329,15 @@ struct ProfileEditorView: View {
                     Button {
                         importFromClipboard()
                     } label: {
-                        Label("Вставить ссылку из буфера (OFLUX1)", systemImage: "doc.on.clipboard")
+                        Label("Вставить из буфера", systemImage: "doc.on.clipboard")
                     }
                     Button {
                         showScanner = true
                     } label: {
                         Label("Сканировать QR-код", systemImage: "qrcode.viewfinder")
                     }
+                    Text("Подойдёт обычная ссылка на документ (disk.yandex.ru / cloud.mail.ru) или конфиг OFLUX1.")
+                        .font(.caption2).foregroundColor(.secondary)
                     if let m = importMsg {
                         Text(m).font(.caption2).foregroundColor(.secondary)
                     }
@@ -327,10 +346,10 @@ struct ProfileEditorView: View {
             .sheet(isPresented: $showScanner) {
                 QRScannerView { code in
                     showScanner = false
-                    if applyParsed(parseOFLUX(code)) {
+                    if ingest(code) {
                         importMsg = "QR распознан: \(transport.title)."
                     } else {
-                        importMsg = "QR не содержит корректной OFLUX1-ссылки."
+                        importMsg = "QR не содержит ссылки или конфига."
                     }
                 }
             }
@@ -373,11 +392,31 @@ struct ProfileEditorView: View {
     }
 
     private func importFromClipboard() {
-        if applyParsed(parseOFLUX(UIPasteboard.general.string ?? "")) {
-            importMsg = "Ссылка вставлена: \(transport.title)."
+        if ingest(UIPasteboard.general.string ?? "") {
+            importMsg = "Вставлено: \(transport.title)."
         } else {
-            importMsg = "В буфере нет корректной OFLUX1-ссылки."
+            importMsg = "В буфере нет ссылки или OFLUX1-конфига."
         }
+    }
+
+    /// Accept EITHER an OFLUX1 config OR a plain document link. A plain link goes
+    /// into the field of the currently selected transport (Mail.ru is detected by
+    /// host); the name is auto-filled if empty. Returns false if it is neither.
+    @discardableResult
+    private func ingest(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if applyParsed(parseOFLUX(s)) { return true }
+        guard s.lowercased().hasPrefix("http") else { return false }
+        if s.lowercased().contains("cloud.mail.ru") {
+            transportRaw = TransportKind.mail.rawValue
+        }
+        switch transport {
+        case .yandex: url1 = s
+        case .volga, .mail: single = s
+        case .max: return false
+        }
+        if name.trimmingCharacters(in: .whitespaces).isEmpty { name = transport.title }
+        return true
     }
 
     /// Fill the editor fields from a parsed OFLUX config. Returns false if nil.

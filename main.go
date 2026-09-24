@@ -98,6 +98,10 @@ func main() {
 	var trans transport.Transport
 
 	switch *transportType {
+	case "boards":
+		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
+			return yandex.NewBoardsTransport(u, config)
+		})
 	case "yandex":
 		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
 			return yandex.NewYandexDocsTransport(u, config)

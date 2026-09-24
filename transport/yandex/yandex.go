@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"regexp"
 	"strings"
 	"sync"
@@ -404,24 +405,80 @@ func reconnectBackoff(n int) time.Duration {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
+	jar, _ := cookiejar.New(nil)
 	client := &http.Client{
-		// Cap redirects so an auth/login redirect loop fails fast instead of
-		// hanging until the timeout (a private doc redirects to passport).
+		Jar: jar,
+		// НЕ следуем редиректам автоматически — иначе редирект на капчу
+		// отработает молча и мы получим её HTML вместо документа.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects (login required? doc not public?)")
-			}
-			return nil
+			return http.ErrUseLastResponse
 		},
 		Timeout: 15 * time.Second,
 	}
 
-	utils.Debugf("[YDOCS] fetchDocInfo GET %s", url)
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return YandexDocsInfo{}, err
+	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+
+	// Явно следуем по редиректам: до 10 хопов (auth/login-петля на приватном
+	// документе тогда падает быстро, а не висит до таймаута).
+	currentURL := url
+	var resp *http.Response
+	var err error
+
+	for hop := 0; hop < 10; hop++ {
+		utils.Debugf("[YDOCS] hop %d: GET %s", hop, shortStr(currentURL, 120))
+
+		req, _ := http.NewRequest("GET", currentURL, nil)
+		req.Header.Set("User-Agent", ua)
+		resp, err = client.Do(req)
+		if err != nil {
+			return YandexDocsInfo{}, fmt.Errorf("GET %s: %w", currentURL, err)
+		}
+
+		utils.Debugf("[YDOCS]   status=%d location=%s",
+			resp.StatusCode, shortStr(resp.Header.Get("Location"), 120))
+
+		// 200 — дошли до документа
+		if resp.StatusCode == 200 {
+			break
+		}
+
+		// 3xx — редирект
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			loc := resp.Header.Get("Location")
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			if loc == "" {
+				return YandexDocsInfo{}, fmt.Errorf("redirect without Location from %s", currentURL)
+			}
+
+			// Капча — проходим и повторяем ИСХОДНЫЙ url (не loc).
+			if strings.Contains(loc, "showcaptchafast") {
+				utils.Debugf("[YDOCS] captcha detected, solving...")
+				if _, cerr := solveCaptcha(currentURL, jar, ua); cerr != nil {
+					return YandexDocsInfo{}, fmt.Errorf("captcha solve: %w", cerr)
+				}
+				utils.Debugf("[YDOCS] captcha solved, retrying original url")
+				currentURL = url
+				continue
+			}
+
+			// Обычный редирект — идём по нему.
+			currentURL = loc
+			continue
+		}
+
+		// Другой статус — ошибка
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return YandexDocsInfo{}, fmt.Errorf("unexpected status %d at %s", resp.StatusCode, currentURL)
+	}
+
+	if resp == nil {
+		return YandexDocsInfo{}, fmt.Errorf("no response after redirects")
+	}
+	if resp.StatusCode != 200 {
+		return YandexDocsInfo{}, fmt.Errorf("stopped after 10 redirects (login required? doc not public?)")
 	}
 	defer resp.Body.Close()
 
@@ -431,6 +488,9 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	var cookies []string
 	for _, c := range resp.Cookies() {
+		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
+	}
+	for _, c := range jar.Cookies(resp.Request.URL) {
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 
