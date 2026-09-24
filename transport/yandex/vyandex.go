@@ -161,7 +161,7 @@ func authorize(docURL, cookieFile string) (*volgaAuth, error) {
 	var finalURL string
 	currentURL := docURL
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 15; i++ {
 		req, _ := http.NewRequest("GET", currentURL, nil)
 		req.Header.Set("User-Agent", volgaUserAgent)
 		req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
@@ -179,11 +179,28 @@ func authorize(docURL, cookieFile string) (*volgaAuth, error) {
 
 		utils.Debugf("[VOLGA] GET %s -> %d (%d bytes)", currentURL, resp.StatusCode, len(body))
 
+		if resp.StatusCode == 200 {
+			finalBody = body
+			finalURL = currentURL
+			break
+		}
+
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			loc := resp.Header.Get("Location")
 			if loc == "" {
 				return nil, fmt.Errorf("redirect without Location from %s", currentURL)
 			}
+
+			if strings.Contains(loc, "showcaptchafast") {
+				utils.Debugf("[VOLGA] captcha required, solving...")
+				if _, cerr := solveCaptcha(docURL, jar, volgaUserAgent); cerr != nil {
+					return nil, fmt.Errorf("captcha solve: %w", cerr)
+				}
+				utils.Debugf("[VOLGA] captcha solved, retrying from %s", docURL)
+				currentURL = docURL
+				continue
+			}
+
 			if strings.HasPrefix(loc, "/") {
 				u, _ := url.Parse(currentURL)
 				loc = u.Scheme + "://" + u.Host + loc
@@ -192,9 +209,7 @@ func authorize(docURL, cookieFile string) (*volgaAuth, error) {
 			continue
 		}
 
-		finalBody = body
-		finalURL = currentURL
-		break
+		return nil, fmt.Errorf("unexpected status %d at %s", resp.StatusCode, currentURL)
 	}
 
 	if finalBody == nil {

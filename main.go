@@ -288,6 +288,8 @@ DEPRECATED (removed in v2)
 	var inner transport.Transport
 
 	switch *transportType {
+        case "boards":
+    		inner = yandex.NewBoardsTransport(globalDocUrl, config)
 	case "vyandex":
 		inner = yandex.NewYandexVolgaTransport(globalDocUrl, *yandexCookiesFile, config)
 	case "yandex":
