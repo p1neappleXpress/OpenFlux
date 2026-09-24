@@ -4,6 +4,7 @@ import Combine
 enum TransportKind: String, CaseIterable, Identifiable {
     case yandex = "yandex"
     case volga = "volga"
+    case boards = "boards"
     case mail = "mailru"
     case max = "oneme"
     var id: String { rawValue }
@@ -11,12 +12,13 @@ enum TransportKind: String, CaseIterable, Identifiable {
         switch self {
         case .yandex: return "Yandex Docs"
         case .volga:  return "VOLGA"
+        case .boards: return "Yandex Boards"
         case .mail:   return "Mail.ru"
         case .max:    return "MAX"
         }
     }
     /// Document-based transports that take a public document URL / weblink.
-    var usesDocURL: Bool { self == .yandex || self == .volga || self == .mail }
+    var usesDocURL: Bool { self == .yandex || self == .volga || self == .boards || self == .mail }
 }
 
 /// Swift wrapper around the OpenFlux Go static library (liboflux.a).

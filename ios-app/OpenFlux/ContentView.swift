@@ -255,6 +255,7 @@ struct ContentView: View {
         switch t {
         case "mailru": return "envelope"
         case "volga":  return "waveform"
+        case "boards": return "rectangle.3.group"
         case "oneme":  return "m.square"
         default:       return "doc.text"
         }
@@ -270,6 +271,8 @@ struct ContentView: View {
             let b = docURL2.trimmingCharacters(in: .whitespaces)
             url = b.isEmpty ? a : "\(a),\(b)"
         case .volga: url = volgaURL.trimmingCharacters(in: .whitespaces)
+        // boards появился уже после профилей — легаси-конфига для него не бывает
+        case .boards: break
         case .mail:  url = mailURL.trimmingCharacters(in: .whitespaces)
         case .max:   break
         }
@@ -317,6 +320,8 @@ struct ProfileEditorView: View {
                         TextField("второй документ (необязательно)", text: $url2).autocapitalization(.none).disableAutocorrection(true)
                     case .volga:
                         TextField("https://disk.yandex.ru/i/…", text: $single).autocapitalization(.none).disableAutocorrection(true)
+                    case .boards:
+                        TextField("https://boards.yandex.ru/whiteboard/?hash=…", text: $single).autocapitalization(.none).disableAutocorrection(true)
                     case .mail:
                         TextField("https://cloud.mail.ru/public/…", text: $single).autocapitalization(.none).disableAutocorrection(true)
                     case .max:
@@ -336,7 +341,7 @@ struct ProfileEditorView: View {
                     } label: {
                         Label("Сканировать QR-код", systemImage: "qrcode.viewfinder")
                     }
-                    Text("Подойдёт обычная ссылка на документ (disk.yandex.ru / cloud.mail.ru) или конфиг OFLUX1.")
+                    Text("Подойдёт обычная ссылка на документ (disk.yandex.ru / boards.yandex.ru / cloud.mail.ru) или конфиг OFLUX1.")
                         .font(.caption2).foregroundColor(.secondary)
                     if let m = importMsg {
                         Text(m).font(.caption2).foregroundColor(.secondary)
@@ -371,7 +376,7 @@ struct ProfileEditorView: View {
         guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         switch transport {
         case .yandex: return !url1.trimmingCharacters(in: .whitespaces).isEmpty
-        case .volga, .mail: return !single.trimmingCharacters(in: .whitespaces).isEmpty
+        case .volga, .boards, .mail: return !single.trimmingCharacters(in: .whitespaces).isEmpty
         case .max: return !maxToken.isEmpty && !maxUid.isEmpty
         }
     }
@@ -385,7 +390,7 @@ struct ProfileEditorView: View {
         case .yandex:
             url1 = parts.first ?? ""
             if parts.count > 1 { url2 = parts[1] }
-        case .volga, .mail:
+        case .volga, .boards, .mail:
             single = parts.first ?? p.url
         case .max: break
         }
@@ -409,10 +414,12 @@ struct ProfileEditorView: View {
         guard s.lowercased().hasPrefix("http") else { return false }
         if s.lowercased().contains("cloud.mail.ru") {
             transportRaw = TransportKind.mail.rawValue
+        } else if s.lowercased().contains("boards.yandex.ru") {
+            transportRaw = TransportKind.boards.rawValue
         }
         switch transport {
         case .yandex: url1 = s
-        case .volga, .mail: single = s
+        case .volga, .boards, .mail: single = s
         case .max: return false
         }
         if name.trimmingCharacters(in: .whitespaces).isEmpty { name = transport.title }
@@ -428,7 +435,7 @@ struct ProfileEditorView: View {
         case .yandex:
             url1 = parsed.urls.first ?? ""
             url2 = parsed.urls.count > 1 ? parsed.urls[1] : ""
-        case .volga, .mail:
+        case .volga, .boards, .mail:
             single = parsed.urls.first ?? ""
         case .max: break
         }
@@ -445,7 +452,7 @@ struct ProfileEditorView: View {
             let a = url1.trimmingCharacters(in: .whitespaces)
             let b = url2.trimmingCharacters(in: .whitespaces)
             url = b.isEmpty ? a : "\(a),\(b)"
-        case .volga, .mail:
+        case .volga, .boards, .mail:
             url = single.trimmingCharacters(in: .whitespaces)
         case .max:
             url = ""

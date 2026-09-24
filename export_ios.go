@@ -295,6 +295,10 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return yandex.NewYandexVolgaTransportWithConfig(u, config, yandex.SlimVolgaConfig())
 		})
+	case "boards":
+		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
+			return yandex.NewBoardsTransport(u, config)
+		})
 	case "mailru", "mail":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return mailru.NewMailruDocsTransport(u, config)
