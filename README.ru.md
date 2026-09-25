@@ -1,5 +1,7 @@
 # OpenFlux
 
+Этот репозиторий основан на [OpenFlux от p1neappleXpress](https://github.com/p1neappleXpress/OpenFlux).
+
 Практическая инструкция для VPS, Android и ПК: [docs/CONNECT.ru.md](docs/CONNECT.ru.md).
 
 [English](README.md) | **Русский**
