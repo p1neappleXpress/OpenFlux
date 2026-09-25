@@ -68,6 +68,15 @@ func connectedManagers(t *testing.T, exitProvider CookieProvider) (client, exit 
 	if err := client.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// Control messages need a negotiated session; on a slow runner the
+	// handshake can outlast a caller that starts sending right away.
+	deadline := time.Now().Add(10 * time.Second)
+	for !client.IsConnected() || !exit.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("managers did not connect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	return client, exit
 }
 
