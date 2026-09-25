@@ -324,22 +324,27 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
 	return nil
 }
 
-func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
+// apiRequest builds a POST /api call: the action and its content (JSON,
+// base64-encoded) in a JSON body. The API used to take a form and now
+// answers 415 "Request body must use a JSON Content-Type" to one.
+func apiRequest(hash, action string, content interface{}) *http.Request {
 	raw, _ := json.Marshal(content)
-	contentB64 := base64.StdEncoding.EncodeToString(raw)
-	form := url.Values{}
-	form.Set("action", action)
-	form.Set("content", contentB64)
-
-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
-		strings.NewReader(form.Encode()))
+	body, _ := json.Marshal(map[string]string{
+		"action":  action,
+		"content": base64.StdEncoding.EncodeToString(raw),
+	})
+	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(body))
 	req.Header.Set("User-Agent", boardsUA)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
 	req.Header.Set("Origin", "https://"+boardsBase)
-	resp, err := client.Do(req)
+	return req
+}
+
+func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
+	resp, err := client.Do(apiRequest(hash, action, content))
 	if err != nil {
 		return err
 	}
@@ -356,21 +361,7 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
 }
 
 func (t *BoardsTransport) getWhiteboardInfo(client *http.Client, hash string) (map[string]string, error) {
-	raw, _ := json.Marshal(map[string]string{"hash": hash})
-	contentB64 := base64.StdEncoding.EncodeToString(raw)
-	form := url.Values{}
-	form.Set("action", "get-whiteboard-info")
-	form.Set("content", contentB64)
-
-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
-		strings.NewReader(form.Encode()))
-	req.Header.Set("User-Agent", boardsUA)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
-	req.Header.Set("Origin", "https://"+boardsBase)
-	resp, err := client.Do(req)
+	resp, err := client.Do(apiRequest(hash, "get-whiteboard-info", map[string]string{"hash": hash}))
 	if err != nil {
 		return nil, err
 	}
