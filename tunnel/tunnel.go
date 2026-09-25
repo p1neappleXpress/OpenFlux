@@ -105,6 +105,16 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	SetTCPBuffers(t.gvisorStack)
 
+	// Detect loss only by duplicate ACKs and the RTO, without RACK-TLP. The
+	// document relay delivers every message in order but sometimes holds them
+	// for hundreds of milliseconds; RACK-TLP takes each hold for a loss and
+	// halves the window, and gVisor never undoes that, which kept uploads
+	// through the tunnel at ~100 KB/s.
+	recovery := tcpip.TCPRecovery(0)
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		utils.Debugf("[TUNNEL] disable RACK-TLP: %v", err)
+	}
+
 	tunnelEP := NewTunnelLinkEndpoint()
 	if n, ok := trans.(transport.PeerParameterProvider); ok {
 		if p, ready := n.PeerParameters(); ready {
