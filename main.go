@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-        _ "github.com/wlynxg/anet"
+	_ "github.com/wlynxg/anet"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/transport/mailru"
@@ -58,7 +58,7 @@ func buildMuxTransport(urlSpec string, factory func(string) transport.Transport)
 
 func main() {
 	//os.Setenv("GODEBUG", "netdns=go")
-        fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress\n")
 
 	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
 	client := flag.Bool("client", false, "Run as client")
@@ -69,6 +69,17 @@ func main() {
 	flag.StringVar(&maxToken, "maxToken", "", "MAX call user id. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX Web token. If u use MAX transport")
 	localIP := flag.String("local-ip", "", "Exit node egress IP (use a dedicated alias IP so the RST-drop rule can be scoped with -s)")
+	directAddr := flag.String("direct-addr", "",
+		"host:port for --transport=direct. Exit node listens on it, client dials it. "+
+			"Requires --encryption-key-file: a plain TCP carrier exposes the node, so it "+
+			"must never run unencrypted.")
+	cookiesFile := flag.String("cookies-file", "",
+		"Path to a file with cookies (\"a=1; b=2\") for the yandex transport. Watched "+
+			"live: solve an interactive captcha in a browser, drop the cookies here, and "+
+			"the node picks them up without a restart.")
+	encryptionKeyFile := flag.String("encryption-key-file", "",
+		"Path to a file holding the shared secret for end-to-end AES-256-GCM. "+
+			"Both peers must pass the same secret; empty = no encryption.")
 	flag.Parse()
 
 	if *localIP != "" {
@@ -102,9 +113,27 @@ func main() {
 		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
 			return yandex.NewBoardsTransport(u, config)
 		})
+	case "direct":
+		// Обычный TCP до ноды. Не скрытый канал: адрес ноды виден и режется
+		// тривиально — зато он доступен, когда носитель с документом упёрся в
+		// капчу, и по нему можно доставить ноде куки. Шифрование обязательно.
+		if *directAddr == "" {
+			log.Fatalf("--transport=direct requires --direct-addr host:port")
+		}
+		if *encryptionKeyFile == "" {
+			log.Fatalf("--transport=direct requires --encryption-key-file (a plain TCP carrier must not run unencrypted)")
+		}
+		dcfg := transport.DefaultDirectConfig()
+		dcfg.IsExit = *exitNode
+		if *exitNode {
+			dcfg.ListenAddr = *directAddr
+		} else {
+			dcfg.DialAddr = *directAddr
+		}
+		trans = transport.NewAdaptiveTransport(transport.NewDirectTransport(config, dcfg))
 	case "yandex":
 		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
-			return yandex.NewYandexDocsTransport(u, config)
+			return newYandexDocs(u, config)
 		})
 	case "vyandex", "volga":
 		trans = buildMuxTransport(globalDocUrl, func(u string) transport.Transport {
@@ -121,6 +150,48 @@ func main() {
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
 
+	// Optional AES-256-GCM, outermost — the same position the upstream CLI uses,
+	// so a node built from this branch and one built from upstream master speak
+	// the same wire format: each tunnel packet is sealed first, and the codec
+	// layer below batches the ciphertext.
+	//
+	// The context string is a public KDF salt, not a secret — but both peers must
+	// derive from the SAME one, and upstream derives it from the document URL.
+	// Keep that rule identical here: a differing URL silently yields a different
+	// key and every packet is dropped as unauthenticated.
+	if *encryptionKeyFile != "" {
+		secretBytes, err := os.ReadFile(*encryptionKeyFile)
+		if err != nil {
+			log.Fatalf("Read encryption key file: %v", err)
+		}
+		// Контекст — публичная соль вывода ключа, но обе стороны обязаны взять
+		// ОДНУ И ТУ ЖЕ строку. Для доковых транспортов это URL документа, он у
+		// клиента и ноды одинаков. Для direct так нельзя: нода слушает
+		// 0.0.0.0:9443, а клиент набирает 64.118.154.75:9443 — строки разные, и
+		// ключи молча разъехались бы (каждый пакет не проходит аутентификацию,
+		// снаружи это выглядит как таймауты). Поэтому у direct контекст — имя
+		// транспорта, единственное, в чём стороны заведомо согласны.
+		context := *transportType
+		if globalDocUrl != "" && *transportType != "direct" {
+			context = globalDocUrl
+		}
+		encrypted, err := transport.NewEncryptedTransport(
+			trans, strings.TrimSpace(string(secretBytes)), context, *exitNode)
+		if err != nil {
+			log.Fatalf("Configure encrypted transport: %v", err)
+		}
+		trans = encrypted
+		log.Printf("Transport encryption: AES-256-GCM enabled (KDF context=%q)", context)
+	}
+
+	// Контрольный канал: обмен куками для обхода интерактивной капчи. Оборачивает
+	// уже собранный стек, поэтому его кадры проходят через слой шифрования ниже и
+	// уезжают зашифрованными наравне с данными туннеля.
+	trans = wrapControl(trans, *exitNode)
+	if !*exitNode {
+		startCookieOffering()
+	}
+
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
@@ -128,6 +199,14 @@ func main() {
 	// service manager can detect a healthy start by scanning the journal.
 	log.Printf("OPENFLUX_READY transport=%s mode=%s", *transportType,
 		map[bool]string{true: "exit-node", false: "client"}[*exitNode])
+
+	// Живое подхватывание кук: единственный путь пройти интерактивную капчу на
+	// ноде, где нет браузера. Запускаем после Start, чтобы транспорты успели
+	// зарегистрироваться.
+	if *cookiesFile != "" {
+		setCookiesFilePath(*cookiesFile)
+		utils.SafeGo("cookiesFileWatch", func() { watchCookiesFile(*cookiesFile) })
+	}
 
 	tun := tunnel.NewTCPTunnel(trans, *exitNode)
 

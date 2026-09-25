@@ -96,7 +96,8 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	}
 	utils.Debugf("[CAPTCHA] showcaptcha: %d bytes", len(body))
 
-	ssr, formAction, err := parseCaptchaHTML(string(body))
+	origin := captchaOrigin(captchaURL)
+	ssr, formAction, err := parseCaptchaHTML(string(body), origin)
 	if err != nil {
 		return "", err
 	}
@@ -123,7 +124,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	req2, _ := http.NewRequest("POST", formAction, strings.NewReader(form.Encode()))
 	setBrowserHeaders(req2, userAgent)
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req2.Header.Set("Origin", "https://docs.yandex.ru")
+	req2.Header.Set("Origin", origin)
 	req2.Header.Set("Referer", captchaURL)
 
 	resp2, err := client.Do(req2)
@@ -166,7 +167,18 @@ var (
 	reFormAction = regexp.MustCompile(`<form[^>]*id="tmgrdfrend-form"[^>]*action="([^"]+)"`)
 )
 
-func parseCaptchaHTML(html string) (*captchaSSRData, string, error) {
+// captchaOrigin возвращает scheme://host страницы капчи. Домен НЕЛЬЗЯ
+// хардкодить: документ может жить и на docs.yandex.ru, и на docs.yandex.com —
+// POST формы на чужой домен сервер отвергает с 400.
+func captchaOrigin(pageURL string) string {
+	u, err := url.Parse(pageURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "https://docs.yandex.ru"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func parseCaptchaHTML(html, origin string) (*captchaSSRData, string, error) {
 	m := reSSRData.FindStringSubmatch(html)
 	if len(m) < 2 {
 		return nil, "", fmt.Errorf("captcha: __SSR_DATA__ not found")
@@ -186,7 +198,7 @@ func parseCaptchaHTML(html string) (*captchaSSRData, string, error) {
 	}
 	formAction := strings.ReplaceAll(m2[1], "&amp;", "&")
 	if strings.HasPrefix(formAction, "/") {
-		formAction = "https://docs.yandex.ru" + formAction
+		formAction = origin + formAction
 	}
 
 	return &ssr, formAction, nil

@@ -3,12 +3,14 @@ package yandex
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	neturl "net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -68,6 +70,18 @@ func (s *DocSession) forceClose() {
 	})
 }
 
+// Яндекс отдаёт капчу двух разных видов, и путать их нельзя.
+//
+// showcaptchafast — PoW-челлендж, его решает solveCaptcha прямо здесь.
+// showcaptcha?cc=1 — SmartCaptcha, интерактивная: PoW-солвер её не берёт, и
+// повторные попытки лишь упираются в неё снова. Нужны свежие куки, полученные
+// снаружи (браузер/WebView) и переданные через ApplyCookies.
+var ErrCaptchaRequired = errors.New("yandex docs: captcha required")
+
+// ErrLoginRequired — редирект на паспорт: документ не публичен с этого IP.
+// Тоже не лечится повтором.
+var ErrLoginRequired = errors.New("yandex docs: login required")
+
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
@@ -76,15 +90,138 @@ type YandexDocsTransport struct {
 
 	userCounter atomic.Int32
 	baseUserID  string
+
+	// cookieJar переживает реконнекты и может быть заменён из ApplyCookies:
+	// в этом весь смысл внешнего решения капчи — куки, добытые снаружи,
+	// должны попасть в следующий fetchDocInfo.
+	cookieJar *cookiejar.Jar
+	jarMu     sync.RWMutex
+
+	errNotifier func(err error, transportName, url, reason string)
+
+	// cookiesApplied будит ожидание в scheduleReconnectNoCaptcha досрочно.
+	// Небуферизованный намеренно: отправка проходит только если кто-то ждёт.
+	cookiesApplied chan struct{}
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
+	jar, _ := cookiejar.New(nil)
 	t := &YandexDocsTransport{
-		BaseTransport: transport.NewBaseTransport(config),
-		url:           url,
+		BaseTransport:  transport.NewBaseTransport(config),
+		url:            url,
+		cookieJar:      jar,
+		cookiesApplied: make(chan struct{}),
 	}
 	t.baseUserID = randUserID()
 	return t
+}
+
+// URL возвращает адрес документа этого транспорта.
+func (t *YandexDocsTransport) URL() string { return t.url }
+
+// SetErrorNotifier ставит колбэк для ошибок, которые транспорт сам не решит
+// (ErrCaptchaRequired / ErrLoginRequired) — чтобы UI мог сказать пользователю,
+// что именно требуется, вместо молчаливого реконнект-цикла.
+func (t *YandexDocsTransport) SetErrorNotifier(fn func(err error, transportName, url, reason string)) {
+	t.errNotifier = fn
+}
+
+// ---- CookieExchanger ----
+//
+// Сигнатуры намеренно повторяют flx-kernel (map[string]string), чтобы этот
+// транспорт подошёл под тамошний интерфейс CookieExchanger без правок, когда
+// ветки будут сводиться.
+
+// FetchCookies отдаёт снимок текущей банки кук как name -> value.
+func (t *YandexDocsTransport) FetchCookies() (map[string]string, error) {
+	t.jarMu.RLock()
+	jar := t.cookieJar
+	t.jarMu.RUnlock()
+	if jar == nil {
+		return nil, fmt.Errorf("ydocs: cookie jar is nil")
+	}
+	u := mustParseURL(t.url)
+	out := make(map[string]string)
+	for _, c := range jar.Cookies(u) {
+		out[c.Name] = c.Value
+	}
+	return out, nil
+}
+
+// ApplyCookies подменяет банку кук на добытые снаружи (например, после того как
+// пользователь прошёл SmartCaptcha в браузере) и роняет текущую сессию, чтобы
+// следующий fetchDocInfo пошёл уже с новыми куками. Идемпотентна.
+func (t *YandexDocsTransport) ApplyCookies(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	u := mustParseURL(t.url)
+	jar, _ := cookiejar.New(nil)
+	cookies := siteCookies(u, values)
+	jar.SetCookies(u, cookies)
+
+	t.jarMu.Lock()
+	t.cookieJar = jar
+	t.jarMu.Unlock()
+
+	utils.Debugf("[YDOCS] applied %d cookies, forcing reconnect", len(cookies))
+
+	t.Mu.Lock()
+	session := t.session
+	t.session = nil
+	t.SetConnected(false)
+	t.Mu.Unlock()
+	if session != nil && session.Conn != nil {
+		_ = session.Conn.Close()
+	}
+	if t.IsRunning() {
+		select {
+		case t.cookiesApplied <- struct{}{}:
+			// Ожидающий капча-реконнект проснулся и пойдёт сам; второй
+			// реконнект здесь открыл бы дублирующую сессию к документу.
+		default:
+			// Никто не ждал — реконнектим сами, но в фоне: бэкофф спит, а
+			// ApplyCookies зовут из UI-потока и блокировать его нельзя.
+			utils.SafeGo("yandex.applyCookiesReconnect", func() { t.scheduleReconnect(0) })
+		}
+	}
+	return nil
+}
+
+// siteCookies раскладывает пары в куки, привязанные к домену второго уровня,
+// чтобы они действовали и на редиректных хостах (disk → docs).
+func siteCookies(u *neturl.URL, values map[string]string) []*http.Cookie {
+	domain := ""
+	if u != nil {
+		if labels := strings.Split(u.Hostname(), "."); len(labels) >= 3 {
+			domain = strings.Join(labels[1:], ".")
+		}
+	}
+	cookies := make([]*http.Cookie, 0, len(values))
+	for k, v := range values {
+		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/", Domain: domain})
+	}
+	return cookies
+}
+
+func mustParseURL(rawURL string) *neturl.URL {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+func (t *YandexDocsTransport) jar() *cookiejar.Jar {
+	t.jarMu.RLock()
+	defer t.jarMu.RUnlock()
+	if t.cookieJar == nil {
+		// Транспорт мог быть собран литералом структуры (так делают тесты) —
+		// не роняем запрос из-за отсутствующей банки.
+		jar, _ := cookiejar.New(nil)
+		return jar
+	}
+	return t.cookieJar
 }
 
 func (t *YandexDocsTransport) Start() error {
@@ -148,6 +285,20 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		info, err := t.fetchDocInfo(t.url, userID)
 		if err != nil {
+			// SmartCaptcha и логин повтором не лечатся — обычный бэкофф здесь
+			// выродится в бесконечную долбёжку по той же стене.
+			if errors.Is(err, ErrCaptchaRequired) || errors.Is(err, ErrLoginRequired) {
+				reason := "smartcaptcha"
+				if errors.Is(err, ErrLoginRequired) {
+					reason = "login"
+				}
+				utils.Debugf("[YDOCS] needs external help (%s): %v", reason, err)
+				if t.errNotifier != nil {
+					t.errNotifier(err, "yandex", t.url, reason)
+				}
+				t.scheduleReconnectNoCaptcha(attempt)
+				return
+			}
 			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
 			t.scheduleReconnect(attempt)
 			return
@@ -377,13 +528,41 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	// turn into a tight connect/close loop (previously reconnect was instant).
 	d := reconnectBackoff(next)
 	utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, next)
-	time.Sleep(d)
+	select {
+	case <-time.After(d):
+	case <-t.Done():
+		return
+	}
 	if !t.IsRunning() {
 		return
 	}
 
 	t.RecordReconnect()
 	t.connectToDoc(next)
+}
+
+// scheduleReconnectNoCaptcha — путь для ошибок, которые повтор не чинит
+// (SmartCaptcha, логин). Обычный бэкофф упрётся в ту же капчу через секунду,
+// поэтому ждём фиксированно долго и надеемся на внешние куки; ApplyCookies
+// будит это ожидание досрочно.
+func (t *YandexDocsTransport) scheduleReconnectNoCaptcha(attempt int) {
+	if !t.IsRunning() {
+		return
+	}
+	const longDelay = 30 * time.Second
+	utils.Debugf("[YDOCS] external solver needed; waiting %v (or until cookies arrive)", longDelay)
+	select {
+	case <-time.After(longDelay):
+	case <-t.cookiesApplied:
+		utils.Debugf("[YDOCS] cookies arrived, retrying immediately")
+	case <-t.Done():
+		return
+	}
+	if !t.IsRunning() {
+		return
+	}
+	t.RecordReconnect()
+	t.connectToDoc(attempt + 1)
 }
 
 // reconnectBackoff returns an exponential backoff with jitter, capped at 15s.
@@ -405,7 +584,9 @@ func reconnectBackoff(n int) time.Duration {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
-	jar, _ := cookiejar.New(nil)
+	// Общая банка кук транспорта, а не локальная: иначе куки, добытые снаружи
+	// через ApplyCookies, не дожили бы до этого запроса.
+	jar := t.jar()
 	client := &http.Client{
 		Jar: jar,
 		// НЕ следуем редиректам автоматически — иначе редирект на капчу
@@ -450,6 +631,20 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 			if loc == "" {
 				return YandexDocsInfo{}, fmt.Errorf("redirect without Location from %s", currentURL)
+			}
+
+			// SmartCaptcha (showcaptcha?cc=1) — второй тип, PoW-солвер её не
+			// берёт. Проверяем ПЕРВОЙ: подстрока "showcaptcha" содержится и в
+			// "showcaptchafast", так что обратный порядок увёл бы SmartCaptcha
+			// в солвер, который на ней всегда падает.
+			if strings.Contains(loc, "showcaptcha") && !strings.Contains(loc, "showcaptchafast") {
+				utils.Debugf("[YDOCS] SmartCaptcha detected, external solver required")
+				return YandexDocsInfo{}, ErrCaptchaRequired
+			}
+
+			// Страница логина: не капча и в этом канале не лечится.
+			if strings.Contains(loc, "passport.yandex") {
+				return YandexDocsInfo{}, ErrLoginRequired
 			}
 
 			// Капча — проходим и повторяем ИСХОДНЫЙ url (не loc).

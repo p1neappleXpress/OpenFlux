@@ -30,6 +30,11 @@ const mailruUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWe
 
 var cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
 
+// mailruAPIURL is Mail.ru's public-document editor endpoint. A var rather than
+// a const purely so tests can point the transport at a local stub instead of
+// dialing cloud.mail.ru for real.
+var mailruAPIURL = "https://cloud.mail.ru/api/v4/r7/edit"
+
 type MailruDocsInfo struct {
 	Token        string
 	DocKey       string
@@ -437,7 +442,7 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	}
 	jsonData, _ := json.Marshal(reqBody)
 
-	apiURL := "https://cloud.mail.ru/api/v4/r7/edit"
+	apiURL := mailruAPIURL
 	utils.Debugf("[M-DOCS] fetchDocInfo POST %s", apiURL)
 
 	req, _ := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
@@ -496,7 +501,7 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 		editorUserID, _ = userObj["id"].(string)
 	}
 
-	wsBase := strings.Replace(apiBase, "https://", "wss://", 1)
+	wsBase := wsBaseFrom(apiBase)
 	wsURL := fmt.Sprintf("%s/doc/%s/c/?EIO=4&transport=websocket", wsBase, docKey)
 
 	return MailruDocsInfo{
@@ -510,6 +515,19 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 		CallbackURL:  callbackURL,
 		EditorUserID: editorUserID,
 	}, nil
+}
+
+// wsBaseFrom maps the API base returned by the editor API onto its WebSocket
+// scheme. Production always hands back https; http is accepted so a local stub
+// can be dialed in tests.
+func wsBaseFrom(apiBase string) string {
+	switch {
+	case strings.HasPrefix(apiBase, "https://"):
+		return "wss://" + strings.TrimPrefix(apiBase, "https://")
+	case strings.HasPrefix(apiBase, "http://"):
+		return "ws://" + strings.TrimPrefix(apiBase, "http://")
+	}
+	return apiBase
 }
 
 func randUserID() string {

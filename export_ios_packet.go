@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
 	"runtime/debug"
 	"strconv"
@@ -90,12 +91,13 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	// multiplexed this is a real slice of the 50 MB budget, and 512 still absorbs
 	// a normal burst. Peak memory, not raw throughput, is the binding constraint
 	// inside the extension.
+	resetYandexRegistry()
 	config.MaxQueueSize = 512
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
-			return yandex.NewYandexDocsTransport(u, config)
+			return newYandexDocs(u, config)
 		})
 	case "volga", "vyandex":
 		// Slim VOLGA profile so the relay worker pool + queues stay under the
@@ -108,6 +110,17 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return yandex.NewBoardsTransport(u, config)
 		})
+	case "direct":
+		// Обычный TCP до узла: адрес узла виден, зато канал доступен, когда
+		// носитель с документом упёрся в капчу. Шифрование обязательно.
+		if encSecretSet() {
+			dcfg := transport.DefaultDirectConfig()
+			dcfg.DialAddr = docURL
+			t = transport.NewAdaptiveTransport(transport.NewDirectTransport(config, dcfg))
+		} else {
+			utils.Debugf("[PKT] direct requires an encryption key")
+			return C.int(startBadEncryption)
+		}
 	case "mailru", "mail":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return mailru.NewMailruDocsTransport(u, config)
@@ -118,6 +131,20 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	default:
 		return C.int(startBadTransport)
 	}
+
+	// Outermost AES-256-GCM, same position as the CLI's.
+	t, encErr := wrapEncryption(t, tt, docURL)
+	if encErr != nil {
+		utils.Debugf("[PKT] encryption: %v", encErr)
+		return C.int(startBadEncryption)
+	}
+
+	// Контрольный канал: отдаём ноде куки, чтобы она не упиралась в капчу.
+	// Телефон здесь всегда клиент. Обязательно ДО t.Receive: иначе колбэк
+	// повесится на внутренний транспорт и контрольные кадры уедут в очередь
+	// пакетов как мусор.
+	t = wrapControl(t, false)
+	startCookieOffering()
 
 	// Device-bound packet queue. 1024 was too shallow: a download burst fills it
 	// faster than the device drains, packets get dropped, and the tunneled TCP
@@ -143,7 +170,7 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	ptOutQ = outQ
 	ptCtx, ptCancel = context.WithCancel(context.Background())
 	ptOn = true
-	utils.Debugf("[PKT] L3 packet tunnel started (transport %s)", tt)
+	log.Printf("Packet tunnel started, transport=%s", tt)
 	return C.int(startOK)
 }
 
@@ -231,8 +258,8 @@ func sendICMPPortUnreachable(orig []byte, outQ chan []byte) {
 	ip := make([]byte, total)
 	ip[0] = 0x45
 	binary.BigEndian.PutUint16(ip[2:4], uint16(total))
-	ip[8] = 64 // TTL
-	ip[9] = 1  // ICMP
+	ip[8] = 64                   // TTL
+	ip[9] = 1                    // ICMP
 	copy(ip[12:16], orig[16:20]) // src = original destination
 	copy(ip[16:20], orig[12:16]) // dst = original source (the device)
 	ck2 := network.IPChecksum(ip[:20])
@@ -369,8 +396,8 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 	resp[0] = req[0]
 	resp[1] = req[1]
 	binary.BigEndian.PutUint16(resp[2:4], uint16(total))
-	resp[8] = 64 // TTL
-	resp[9] = 17 // UDP
+	resp[8] = 64              // TTL
+	resp[9] = 17              // UDP
 	copy(resp[12:16], dstIP)  // src = original destination (the resolver)
 	copy(resp[16:20], srcIP)  // dst = the device
 	resp[10], resp[11] = 0, 0 // checksum field

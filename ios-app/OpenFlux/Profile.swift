@@ -11,6 +11,12 @@ struct Profile: Identifiable, Codable, Equatable {
     var maxToken: String = ""
     var maxUid: String = ""
 
+    /// Адрес узла (host:port) для прямого канала, которым проходится капча.
+    /// ОПЦИОНАЛЬНОЕ намеренно: синтезированный Decodable требует все
+    /// необязательные-по-смыслу ключи, а декодирование идёт через `try?` —
+    /// новое обязательное поле молча стёрло бы все сохранённые профили.
+    var nodeAddr: String?
+
     var transportKind: TransportKind { TransportKind(rawValue: transport) ?? .yandex }
 
     var isValid: Bool {

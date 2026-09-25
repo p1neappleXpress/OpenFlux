@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -209,7 +210,77 @@ const (
 	startTransportError = 3
 	startAddrInUse      = 4 // SOCKS5 port could not be bound (e.g. already in use)
 	startPanic          = 5
+	startBadEncryption  = 6 // secret set but unusable (too short / key derivation failed)
 )
+
+// ---- end-to-end encryption ----
+//
+// The secret is handed in separately from the start call (like the DoT resolver
+// and the UDP switch) so the existing C exports keep their signatures and an
+// older caller keeps working unchanged.
+
+var (
+	encMu     sync.Mutex
+	encSecret string
+)
+
+// OpenFluxSetEncryption sets (or clears, with "") the shared secret for
+// end-to-end AES-256-GCM. Call before starting; it applies to the next start.
+//
+//export OpenFluxSetEncryption
+func OpenFluxSetEncryption(secret *C.char) {
+	s := ""
+	if secret != nil {
+		s = strings.TrimSpace(C.GoString(secret))
+	}
+	encMu.Lock()
+	encSecret = s
+	encMu.Unlock()
+	if s == "" {
+		utils.Debugf("[BRIDGE] encryption: off")
+	} else {
+		utils.Debugf("[BRIDGE] encryption: secret set (%d chars)", len(s))
+	}
+}
+
+// encSecretSet — задан ли секрет шифрования. Нужен для транспорта direct:
+// открытый TCP до узла без шифрования запускать нельзя.
+func encSecretSet() bool {
+	encMu.Lock()
+	defer encMu.Unlock()
+	return encSecret != ""
+}
+
+// wrapEncryption puts the AES-256-GCM layer outermost when a secret is set,
+// which is exactly where the CLI puts it — so this client interoperates with an
+// exit node run as `--encryption-key-file=...`.
+//
+// The KDF context is derived HERE rather than passed in from Swift, because it
+// must match the peer bit for bit and the CLI's rule is fixed: the document URL,
+// falling back to the transport name when there is none. Letting the UI supply
+// it would add a silent-failure mode where a stray character yields a different
+// key and every packet is dropped as unauthenticated.
+func wrapEncryption(inner transport.Transport, transportType, docURL string) (transport.Transport, error) {
+	encMu.Lock()
+	secret := encSecret
+	encMu.Unlock()
+	if secret == "" {
+		return inner, nil
+	}
+	// Та же развилка, что в CLI: у direct контекстом служит имя транспорта,
+	// потому что адрес прослушивания на узле и адрес набора у клиента — разные
+	// строки, и ключи бы разъехались.
+	context := transportType
+	if docURL != "" && transportType != "direct" {
+		context = docURL
+	}
+	enc, err := transport.NewEncryptedTransport(inner, secret, context, false)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Encryption: AES-256-GCM enabled (KDF context=%q)", context)
+	return enc, nil
+}
 
 // buildDocTransport turns a document-URL spec into a transport. A single URL
 // yields one channel; a comma-separated list yields a MultiplexTransport that
@@ -246,7 +317,9 @@ func buildDocTransport(spec string, config transport.TransportConfig, factory fu
 //
 // transportType: "yandex" or "oneme".
 // url:           Yandex.Docs document URL (yandex transport). A comma-separated
-//                list multiplexes across those documents.
+//
+//	list multiplexes across those documents.
+//
 // socksAddr:     e.g. "127.0.0.1:1080".
 // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
 //
@@ -284,12 +357,13 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	}
 	probe.Close()
 
+	resetYandexRegistry()
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
-			return yandex.NewYandexDocsTransport(u, config)
+			return newYandexDocs(u, config)
 		})
 	case "volga", "vyandex":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
@@ -299,6 +373,17 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return yandex.NewBoardsTransport(u, config)
 		})
+	case "direct":
+		// Обычный TCP до узла: адрес узла виден, зато канал доступен, когда
+		// носитель с документом упёрся в капчу. Шифрование обязательно.
+		if encSecretSet() {
+			dcfg := transport.DefaultDirectConfig()
+			dcfg.DialAddr = docURL
+			t = transport.NewAdaptiveTransport(transport.NewDirectTransport(config, dcfg))
+		} else {
+			utils.Debugf("[BRIDGE] direct requires an encryption key")
+			return C.int(startBadEncryption)
+		}
 	case "mailru", "mail":
 		t = buildDocTransport(docURL, config, func(u string) transport.Transport {
 			return mailru.NewMailruDocsTransport(u, config)
@@ -310,6 +395,17 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)
 	}
+
+	t, encErr := wrapEncryption(t, tt, docURL)
+	if encErr != nil {
+		utils.Debugf("[BRIDGE] encryption: %v", encErr)
+		return C.int(startBadEncryption)
+	}
+
+	// Контрольный канал: отдаём ноде куки, чтобы она не упиралась в капчу.
+	// Телефон здесь всегда клиент.
+	t = wrapControl(t, false)
+	startCookieOffering()
 
 	if err := t.Start(); err != nil {
 		utils.Debugf("[BRIDGE] Failed to start transport: %v", err)
@@ -413,6 +509,71 @@ func OpenFluxStatsJSON() *C.char {
 //export OpenFluxReadLog
 func OpenFluxReadLog() *C.char {
 	return C.CString(logbuf.drain())
+}
+
+// ---- интерактивная капча (SmartCaptcha) ----
+//
+// PoW-солвер её не проходит, поэтому её решает человек в WebView, а приложение
+// возвращает сюда свежие куки. Оба экспорта работают в том процессе, где живёт
+// ядро: в приложении — для локального SOCKS, в расширении — через IPC от
+// приложения (см. handleAppMessage в PacketTunnelProvider).
+
+// OpenFluxCaptchaPending возвращает URL документа, упёршегося в интерактивную
+// капчу, или пустую строку. Результат C-аллоцирован; освобождать
+// OpenFluxFreeString.
+//
+//export OpenFluxCaptchaPending
+func OpenFluxCaptchaPending() *C.char {
+	return C.CString(pendingCaptchaURL())
+}
+
+// OpenFluxApplyCaptchaCookies принимает куки в формате заголовка Cookie
+// ("a=1; b=2"), полученные после того как пользователь прошёл капчу, и
+// раздаёт их живым Yandex.Docs транспортам. Возвращает число транспортов,
+// которым куки применились.
+//
+//export OpenFluxApplyCaptchaCookies
+func OpenFluxApplyCaptchaCookies(cookies *C.char) C.int {
+	if cookies == nil {
+		return C.int(0)
+	}
+	return C.int(applyCookiesToYandex(C.GoString(cookies)))
+}
+
+// OpenFluxRemoteCaptchaPending возвращает адрес, проверку для которого должен
+// пройти ЭТОТ клиент в интересах узла, или пустую строку.
+//
+// Отличается от OpenFluxCaptchaPending принципиально: эту проверку надо
+// проходить, НЕ отключая туннель, потому что куки должны быть выданы на адрес
+// узла. Результат C-аллоцирован; освобождать OpenFluxFreeString.
+//
+//export OpenFluxRemoteCaptchaPending
+func OpenFluxRemoteCaptchaPending() *C.char {
+	return C.CString(pendingRemoteCaptchaURL())
+}
+
+// OpenFluxOfferCaptchaCookies отдаёт узлу куки, добытые через туннель.
+// Возвращает число переданных кук.
+//
+//export OpenFluxOfferCaptchaCookies
+func OpenFluxOfferCaptchaCookies(cookies *C.char) C.int {
+	if cookies == nil {
+		return C.int(0)
+	}
+	return C.int(offerCookiesToPeer(C.GoString(cookies)))
+}
+
+// OpenFluxSetInitialCookies передаёт куки, добытые до старта туннеля (капча
+// пройдена при выключенном VPN). Вызывать ПЕРЕД стартом: они попадут в банку
+// транспорта при создании, до первого запроса к документу.
+//
+//export OpenFluxSetInitialCookies
+func OpenFluxSetInitialCookies(cookies *C.char) {
+	s := ""
+	if cookies != nil {
+		s = C.GoString(cookies)
+	}
+	setInitialCookies(s)
 }
 
 // OpenFluxFreeString frees a string returned by this library.

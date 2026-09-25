@@ -7,6 +7,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Networks that must NOT go through the tunnel: the Yandex backend the
     /// transport talks to, plus the DoT DNS resolvers. Otherwise the
     /// extension's own traffic loops back into itself.
+    /// Домены, которые всегда идут мимо туннеля: собственный бэкенд транспорта
+    /// и всё, из чего состоит страница капчи (её скрипты и статика живут на
+    /// отдельных хостах). Попадают в тот же GeoSite-путь, что и RU-список, то
+    /// есть их IP добавляются в excludedRoutes по факту DNS-ответа.
+    static let alwaysDirectHosts = """
+    yandex.ru
+    yandex.com
+    yandex.net
+    yastatic.net
+    captcha-api.yandex.ru
+    smartcaptcha.yandexcloud.net
+    passport.yandex.ru
+    passport.yandex.com
+    """
+
+    /// Литерал IPv4 или имя хоста — от этого зависит, можно ли добавить
+    /// статический /32 или надо ждать DNS-ответа.
+    static func isIPv4(_ s: String) -> Bool {
+        let parts = s.split(separator: ".")
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { p in
+            guard let v = Int(p), v >= 0, v <= 255, !p.isEmpty else { return false }
+            return true
+        }
+    }
+
     static let bypassRoutes: [NEIPv4Route] = {
         let cidrs: [(String, String)] = [
             ("5.45.192.0", "255.255.192.0"),
@@ -71,6 +97,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var dynamicDirectSeen = Set<String>()
     private var dynamicDirectRoutes: [NEIPv4Route] = []
     private var geoTimer: Timer?
+    /// True when there is any direct-domain list at all — the bundled RU set,
+    /// the user's own suffixes, or both. Gates the GeoSite poller, which used to
+    /// hang off the RU split alone.
+    private var geoSiteActive = false
+
+    /// Rolling tail of the Go core's log, drained on a timer so the app can pull
+    /// it over IPC. The extension runs in its own process, so without this the
+    /// app's log panel would only ever show its own lines.
+    private var logTail: [String] = []
+    private var logTimer: Timer?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
@@ -81,6 +117,37 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let dnsSpec = (conf["dns"] as? String) ?? ""
         let tunnelUDP = (conf["udp"] as? String) == "1"
         let splitRU = (conf["split"] as? String) == "ru-direct"
+        // User-added direct domains (newline-separated suffixes). They ride the
+        // same GeoSite path as the bundled list, so they work with the RU split
+        // off as well — hence they are read independently of `splitRU`.
+        let customDirect = ((conf["directDomains"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // End-to-end encryption: the secret never rides in providerConfiguration
+        // (which is persisted with the VPN profile), only the profile id does —
+        // the secret itself comes from the Keychain group shared with the app.
+        // Must be set before the core builds its transport stack.
+        // Слот ключа: у докового профиля их два — свой ключ доков и ключ прямого
+        // канала до узла. Спутать их значит отдать доковому транспорту чужой
+        // ключ и молча ронять все пакеты.
+        var encryptionKey = ""
+        if let idString = conf["profileID"] as? String, let id = UUID(uuidString: idString) {
+            if (conf["keySlot"] as? String) == "direct" {
+                encryptionKey = Secrets.directKey(for: id) ?? ""
+            } else {
+                encryptionKey = Secrets.encryptionKey(for: id) ?? ""
+            }
+        }
+        encryptionKey.withCString { k in
+            OpenFluxSetEncryption(UnsafeMutablePointer(mutating: k))
+        }
+
+        // Куки капчи, пройденной с выключенным туннелем. Отдаём ДО старта, чтобы
+        // первый же запрос к документу пошёл с ними и не упёрся в ту же капчу.
+        let savedCookies = Secrets.captchaCookies() ?? ""
+        savedCookies.withCString { c in
+            OpenFluxSetInitialCookies(UnsafeMutablePointer(mutating: c))
+        }
 
         // Override the DNS-over-TLS upstream if the user configured one (empty =
         // built-in defaults). Must run in the extension process before start.
@@ -101,7 +168,29 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // servers so the extension's own connections bypass the tunnel instead
         // of looping back into it. With split tunneling on, also exclude the
         // GeoIP RU set so Russian destinations go direct.
-        self.baseExcluded = Self.bypassRoutes + (splitRU ? Self.ruDirectRoutes : [])
+        // КРИТИЧНО для транспорта direct: адрес самого узла обязан идти мимо
+        // туннеля. Иначе соединение расширения к узлу захватывается туннелем,
+        // который оно же и поднимает, — петля, и не соединяется ничего. На маке
+        // это не проявляется: там CLI-клиент отдаёт SOCKS5 без системного
+        // туннеля, поэтому проверка проходила, а на телефоне всё вставало.
+        var nodeRoutes: [NEIPv4Route] = []
+        var nodeHostForDNS = ""
+        if transport == "direct" {
+            let hostPart = url.split(separator: ":").first.map(String.init) ?? url
+            let host = hostPart.trimmingCharacters(in: .whitespaces)
+            if !host.isEmpty {
+                if Self.isIPv4(host) {
+                    nodeRoutes.append(NEIPv4Route(destinationAddress: host,
+                                                  subnetMask: "255.255.255.255"))
+                } else {
+                    // Имя, а не адрес: пустим его через тот же GeoSite-путь —
+                    // маршрут добавится по DNS-ответу.
+                    nodeHostForDNS = host
+                }
+            }
+        }
+
+        self.baseExcluded = Self.bypassRoutes + nodeRoutes + (splitRU ? Self.ruDirectRoutes : [])
         ipv4.excludedRoutes = self.baseExcluded
         settings.ipv4Settings = ipv4
         settings.mtu = 1500
@@ -114,10 +203,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // GeoSite: load the direct-domain list so the DNS proxy tags matching
         // answers; the poller (started after the core is up) routes them direct.
+        // The bundled RU set comes in only under the RU split; the user's own
+        // suffixes are always appended, so they work on their own too.
+        // Всегда напрямую — хосты, нужные самому транспорту и странице капчи.
+        //
+        // Без этого интерактивная капча нерешаема в принципе: она появляется
+        // именно тогда, когда туннель НЕ работает, а весь трафик телефона идёт
+        // в туннель. HTML ещё мог прийти через жёсткий список IP-диапазонов
+        // ниже, но её скрипты с yastatic.net — уже нет, и WebView показывал
+        // белый лист. Домены, а не IP: CDN меняет адреса, а имена стабильны.
+        var geoLines: [String] = [Self.alwaysDirectHosts]
+        if !nodeHostForDNS.isEmpty { geoLines.append(nodeHostForDNS) }
         if splitRU, let url = Bundle(for: PacketTunnelProvider.self)
             .url(forResource: "geosite-ru", withExtension: "txt"),
            let list = try? String(contentsOf: url, encoding: .utf8) {
-            list.withCString { OpenFluxSetGeositeDirect(UnsafeMutablePointer(mutating: $0)) }
+            geoLines.append(list)
+        }
+        if !customDirect.isEmpty { geoLines.append(customDirect) }
+        self.geoSiteActive = !geoLines.isEmpty
+        if self.geoSiteActive {
+            let merged = geoLines.joined(separator: "\n")
+            merged.withCString { OpenFluxSetGeositeDirect(UnsafeMutablePointer(mutating: $0)) }
         }
 
         setTunnelNetworkSettings(settings) { error in
@@ -146,7 +252,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.startReadLoop()
             self.startWriteLoop()
             self.startHealthMonitor()
-            if splitRU { self.startGeoSiteMonitor() }
+            if self.geoSiteActive { self.startGeoSiteMonitor() }
+            self.startLogDrain()
             completionHandler(nil)
         }
     }
@@ -154,8 +261,91 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         stopHealthMonitor()
         stopGeoSiteMonitor()
+        stopLogDrain()
         OpenFluxStopPacketTunnel()
         completionHandler()
+    }
+
+    // MARK: - Log relay to the app
+    //
+    // OpenFluxReadLog() DRAINS the Go ring buffer, so it must be called from one
+    // place only — here. Letting the app call it directly would race the two
+    // readers and each would see half the lines.
+
+    private func startLogDrain() {
+        DispatchQueue.main.async {
+            self.logTimer?.invalidate()
+            self.logTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                self?.drainLog()
+            }
+        }
+    }
+
+    private func stopLogDrain() {
+        DispatchQueue.main.async {
+            self.logTimer?.invalidate()
+            self.logTimer = nil
+        }
+    }
+
+    private func drainLog() {
+        guard let c = OpenFluxReadLog() else { return }
+        let s = String(cString: c)
+        OpenFluxFreeString(c)
+        guard !s.isEmpty else { return }
+        logTail.append(contentsOf: s.split(separator: "\n").map(String.init))
+        if logTail.count > 600 {
+            logTail.removeFirst(logTail.count - 600)
+        }
+    }
+
+    /// IPC from the containing app. "log" hands back everything accumulated since
+    /// the last request and clears the tail, so the app can append incrementally.
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        let cmd = String(data: messageData, encoding: .utf8) ?? ""
+        switch cmd {
+        case "log":
+            DispatchQueue.main.async {
+                self.drainLog()                       // pick up the last second too
+                let out = self.logTail.joined(separator: "\n")
+                self.logTail.removeAll(keepingCapacity: true)
+                completionHandler?(out.data(using: .utf8) ?? Data())
+            }
+
+        // The core lives in THIS process, so only the extension can see that a
+        // SmartCaptcha is pending — and only it can hand the solved cookies to
+        // the transport. The app drives the WebView and relays through here.
+        case "remotecaptcha":
+            var url = ""
+            if let c = OpenFluxRemoteCaptchaPending() {
+                url = String(cString: c)
+                OpenFluxFreeString(c)
+            }
+            completionHandler?(url.data(using: .utf8) ?? Data())
+
+        case "captcha":
+            var url = ""
+            if let c = OpenFluxCaptchaPending() {
+                url = String(cString: c)
+                OpenFluxFreeString(c)
+            }
+            completionHandler?(url.data(using: .utf8) ?? Data())
+
+        default:
+            if cmd.hasPrefix("offer:") {
+                let raw = String(cmd.dropFirst("offer:".count))
+                let n = raw.withCString { OpenFluxOfferCaptchaCookies(UnsafeMutablePointer(mutating: $0)) }
+                completionHandler?("\(n)".data(using: .utf8) ?? Data())
+                return
+            }
+            if cmd.hasPrefix("cookies:") {
+                let raw = String(cmd.dropFirst("cookies:".count))
+                let n = raw.withCString { OpenFluxApplyCaptchaCookies(UnsafeMutablePointer(mutating: $0)) }
+                completionHandler?("\(n)".data(using: .utf8) ?? Data())
+                return
+            }
+            completionHandler?(Data())
+        }
     }
 
     /// Polls the Go DNS proxy for GeoSite-matched direct IPs and appends them to

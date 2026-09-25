@@ -54,16 +54,27 @@ type BaseTransport struct {
 	Mu              sync.RWMutex
 
 	reconnectAttempts atomic.Int32
+
+	// done закрывается в Stop(), чтобы ожидания в подклассах (бэкоффы,
+	// пауза на капче) прерывались сразу, а не досыпали свой интервал.
+	// Отдельный мьютекс, а не Mu: подклассы держат Mu вокруг своей сессии и
+	// зовут Stop() из-под него — общий мьютекс дал бы взаимную блокировку.
+	doneMu sync.Mutex
+	done   chan struct{}
 }
 
 func NewBaseTransport(config TransportConfig) *BaseTransport {
 	return &BaseTransport{
 		config:    config,
 		startTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 }
 
 func (b *BaseTransport) Start() error {
+	b.doneMu.Lock()
+	b.done = make(chan struct{})
+	b.doneMu.Unlock()
 	b.running.Store(1)
 	b.startTime = time.Now()
 	return nil
@@ -72,7 +83,28 @@ func (b *BaseTransport) Start() error {
 func (b *BaseTransport) Stop() error {
 	b.running.Store(0)
 	b.connected.Store(0)
+	b.doneMu.Lock()
+	if b.done != nil {
+		select {
+		case <-b.done: // уже закрыт
+		default:
+			close(b.done)
+		}
+	}
+	b.doneMu.Unlock()
 	return nil
+}
+
+// Done возвращает канал, который закрывается при Stop(). Подклассы селектятся
+// на нём, чтобы прервать сон.
+func (b *BaseTransport) Done() <-chan struct{} {
+	b.doneMu.Lock()
+	d := b.done
+	b.doneMu.Unlock()
+	if d == nil {
+		return make(chan struct{}) // не стартовали — блокируется навсегда
+	}
+	return d
 }
 
 func (b *BaseTransport) IsRunning() bool {

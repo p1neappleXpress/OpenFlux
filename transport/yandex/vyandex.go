@@ -198,6 +198,18 @@ func authorize(docURL string) (*volgaAuth, error) {
 				return nil, fmt.Errorf("redirect without Location from %s", currentURL)
 			}
 
+			// SmartCaptcha — PoW-солвер её не берёт. Проверяем ПЕРВОЙ:
+			// "showcaptcha" — подстрока "showcaptchafast", обратный порядок
+			// увёл бы её в солвер, который на ней всегда падает.
+			if strings.Contains(loc, "showcaptcha") && !strings.Contains(loc, "showcaptchafast") {
+				utils.Debugf("[VOLGA] SmartCaptcha detected, external solver required")
+				return nil, ErrCaptchaRequired
+			}
+
+			if strings.Contains(loc, "passport.yandex") {
+				return nil, ErrLoginRequired
+			}
+
 			// Капча — проходим и повторяем ИСХОДНЫЙ url (не loc).
 			if strings.Contains(loc, "showcaptchafast") {
 				utils.Debugf("[VOLGA] captcha required, solving...")
