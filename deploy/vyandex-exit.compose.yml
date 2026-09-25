@@ -1,0 +1,18 @@
+services:
+  exit:
+    image: openflux:local
+    restart: unless-stopped
+    cap_add: [NET_RAW, NET_ADMIN]
+    entrypoint: ["/bin/sh", "-ec"]
+    command: |
+      iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+      exec /usr/local/bin/openflux \
+        --role=exit --mode=l4 --transport=vyandex \
+        --url="$$DOC_URL" \
+        --encryption-key-file=/run/secrets/channel.key \
+        --yandex-cookies-file=/run/secrets/yandex-cookies.txt
+    environment:
+      DOC_URL: ${DOC_URL:?Set DOC_URL in .env}
+    volumes:
+      - ./channel.key:/run/secrets/channel.key:ro
+      - ./yandex-cookies.txt:/run/secrets/yandex-cookies.txt:ro

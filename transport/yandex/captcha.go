@@ -38,23 +38,23 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 		},
 	}
 
-	utils.Debugf("[CAPTCHA] solve start: url=%s", docURL)
+	utils.Debugf("[CAPTCHA] solve start: url=%s", safeVolgaURL(docURL))
 
 	captchaURL := ""
 	currentURL := docURL
 	for i := 0; i < 10; i++ {
-		utils.Debugf("[CAPTCHA] GET %s", shortStr(currentURL, 120))
+		utils.Debugf("[CAPTCHA] GET %s", safeVolgaURL(currentURL))
 		req, _ := http.NewRequest("GET", currentURL, nil)
 		setBrowserHeaders(req, userAgent)
 		resp, err := client.Do(req)
 		if err != nil {
-			return "", fmt.Errorf("captcha GET: %w", err)
+			return "", fmt.Errorf("captcha GET failed: %T", err)
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
 		utils.Debugf("[CAPTCHA]   status=%d location=%s",
-			resp.StatusCode, shortStr(resp.Header.Get("Location"), 100))
+			resp.StatusCode, safeVolgaURL(resp.Header.Get("Location")))
 
 		if resp.StatusCode == 200 {
 			utils.Debugf("[CAPTCHA] 200 OK — капча не требуется")
@@ -86,7 +86,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	setBrowserHeaders(req, userAgent)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("captcha showcaptcha GET: %w", err)
+		return "", fmt.Errorf("captcha showcaptcha GET failed: %T", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -100,13 +100,11 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	if err != nil {
 		return "", err
 	}
-	utils.Debugf("[CAPTCHA] uniqueKey=%s timestamp=%d complexity=%d prefix=%s",
-		ssr.UniqueKey, ssr.Timestamp, ssr.Pow.Complexity, shortStr(ssr.Pow.Prefix, 32))
+	utils.Debugf("[CAPTCHA] challenge timestamp=%d complexity=%d", ssr.Timestamp, ssr.Pow.Complexity)
 
 	t0 := time.Now()
 	nonceHex, attempts := solveCaptchaPoW(ssr.Pow.Prefix, ssr.Pow.Complexity)
-	utils.Debugf("[CAPTCHA] PoW solved: nonce=%s attempts=%d time=%v",
-		nonceHex, attempts, time.Since(t0))
+	utils.Debugf("[CAPTCHA] PoW solved: attempts=%d time=%v", attempts, time.Since(t0))
 
 	fp := buildCaptchaFingerprint(nonceHex, userAgent)
 	fpEncoded := encodeCaptchaFingerprint(fp)
@@ -119,7 +117,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	form.Set("chstate", "ok")
 	form.Set("fingerprint", fpEncoded)
 
-	utils.Debugf("[CAPTCHA] POST %s", shortStr(formAction, 100))
+	utils.Debugf("[CAPTCHA] POST %s", safeVolgaURL(formAction))
 	req2, _ := http.NewRequest("POST", formAction, strings.NewReader(form.Encode()))
 	setBrowserHeaders(req2, userAgent)
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -128,13 +126,13 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 
 	resp2, err := client.Do(req2)
 	if err != nil {
-		return "", fmt.Errorf("captcha POST: %w", err)
+		return "", fmt.Errorf("captcha POST failed: %T", err)
 	}
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
 
 	utils.Debugf("[CAPTCHA] POST result: status=%d location=%s",
-		resp2.StatusCode, shortStr(resp2.Header.Get("Location"), 120))
+		resp2.StatusCode, safeVolgaURL(resp2.Header.Get("Location")))
 
 	if resp2.StatusCode < 300 || resp2.StatusCode >= 400 {
 		return "", fmt.Errorf("captcha POST unexpected status %d", resp2.StatusCode)
@@ -145,7 +143,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 		retpath = docURL
 	}
 
-	utils.Debugf("[CAPTCHA] solve OK, retpath=%s", shortStr(retpath, 120))
+	utils.Debugf("[CAPTCHA] solve OK, retpath=%s", safeVolgaURL(retpath))
 	return retpath, nil
 }
 

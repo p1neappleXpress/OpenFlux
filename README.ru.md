@@ -1,5 +1,7 @@
 # OpenFlux
 
+Практическая инструкция для VPS, Android и ПК: [docs/CONNECT.ru.md](docs/CONNECT.ru.md).
+
 [English](README.md) | **Русский**
 
 Исследовательский инструмент сетевого стека. TCP-туннель с подключаемыми
