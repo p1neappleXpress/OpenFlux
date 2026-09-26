@@ -66,5 +66,3 @@ func (t *OneMeTransport) Send(data []byte) error {
 	t.ch.Send(data)
 	return nil
 }
-
-

@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	boardsBase              = "boards.yandex.ru"
-	boardsUA                = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
+	boardsBase = "boards.yandex.ru"
+	boardsUA   = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
 	boardsSocketHostDefault = "socket33.boards.yandex.ru"
 
@@ -110,14 +110,30 @@ type BoardsTransport struct {
 
 	closeOnce sync.Once
 	done      chan struct{}
+
+	cookieJar *cookiejar.Jar
+	jarMu     sync.RWMutex
+
+	errNotifier func(err error, transportName, url, reason string)
 }
 
 func NewBoardsTransport(rawURL string, config transport.TransportConfig) *BoardsTransport {
+	jar, _ := cookiejar.New(nil)
 	return &BoardsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		url:           rawURL,
 		done:          make(chan struct{}),
+		cookieJar:     jar,
 	}
+}
+
+// SetErrorNotifier installs a callback for out-of-band errors. Called once
+// by the manager. Boards currently never returns sentinel errors from
+// fetchDocInfo (its captcha path is the old showcaptchafast, which the
+// internal PoW solver handles), but the hook is wired for parity with the
+// other transports.
+func (t *BoardsTransport) SetErrorNotifier(fn func(err error, transportName, url, reason string)) {
+	t.errNotifier = fn
 }
 
 func (t *BoardsTransport) Start() error {
@@ -219,7 +235,7 @@ func (t *BoardsTransport) getAllowCaptcha(client *http.Client, u, hash string) e
 }
 
 func (t *BoardsTransport) authorize(hash, name string) (boardsInfo, error) {
-	jar, _ := cookiejar.New(nil)
+	jar := t.jar()
 	client := &http.Client{
 		Jar:     jar,
 		Timeout: 15 * time.Second,
@@ -726,9 +742,9 @@ func (t *BoardsTransport) writerLoop(sess *boardsSession) {
 
 // sendNotifyPosition — точная копия формата из Python-скрипта:
 //
-//   cmd_pos(x, y) -> send_dashboard("notify-position",
-//       {"position": {"x": x, "y": y},
-//        "vpt": {"translate": {"x": 0, "y": 0}, "scale": 1}})
+//	cmd_pos(x, y) -> send_dashboard("notify-position",
+//	    {"position": {"x": x, "y": y},
+//	     "vpt": {"translate": {"x": 0, "y": 0}, "scale": 1}})
 //
 // send_dashboard добавляет participant в envelope.
 // payload кладём в position.x как base64-строку, position.y = 123.0,
@@ -878,10 +894,12 @@ func (t *BoardsTransport) handleParticipantConnected(sess *boardsSession, raw js
 // (position.x), затем массив (data[4]).
 //
 // Объект:
-//   data.position.x — base64
+//
+//	data.position.x — base64
 //
 // Массив:
-//   data[2] — имя отправителя, data[4] — base64
+//
+//	data[2] — имя отправителя, data[4] — base64
 //
 // Своё эхо фильтруем по:
 //   - envelope.participant == наш participant (для объекта)
@@ -1065,4 +1083,60 @@ func (t *BoardsTransport) handle431(sess *boardsSession, raw []byte) {
 		sess.creatorHash.Store(&ch)
 		utils.Debugf("[BOARDS] creatorHash from 431/participantHash: %s", shortStr(ch, 8))
 	}
+}
+
+// jar returns the transport's shared cookie jar (never nil).
+func (t *BoardsTransport) jar() *cookiejar.Jar {
+	t.jarMu.RLock()
+	jar := t.cookieJar
+	t.jarMu.RUnlock()
+	if jar == nil {
+		jar, _ = cookiejar.New(nil)
+		t.jarMu.Lock()
+		t.cookieJar = jar
+		t.jarMu.Unlock()
+	}
+	return jar
+}
+
+// ---- CookieExchanger ----
+
+// FetchCookies returns a snapshot of the transport's current cookie jar as
+// name -> value for boards.yandex.ru.
+func (t *BoardsTransport) FetchCookies() (map[string]string, error) {
+	u, err := url.Parse("https://" + boardsBase + "/")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string)
+	for _, c := range t.jar().Cookies(u) {
+		out[c.Name] = c.Value
+	}
+	return out, nil
+}
+
+// ApplyCookies replaces the transport's cookie jar and forces the current WS
+// session to reconnect.
+func (t *BoardsTransport) ApplyCookies(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	u, _ := url.Parse("https://" + boardsBase + "/")
+	jar, _ := cookiejar.New(nil)
+	cookies := make([]*http.Cookie, 0, len(values))
+	for k, v := range values {
+		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/"})
+	}
+	jar.SetCookies(u, cookies)
+
+	t.jarMu.Lock()
+	t.cookieJar = jar
+	t.jarMu.Unlock()
+
+	utils.Debugf("[BOARDS] applied %d cookies, forcing reconnect", len(cookies))
+
+	if s := t.session.Load(); s != nil && s.Conn != nil {
+		_ = s.Conn.Close()
+	}
+	return nil
 }

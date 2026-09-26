@@ -15,7 +15,7 @@ var (
 	useICEInjection = true
 )
 
-func (h *CallHandler) SetOnConnected(cb func())    { h.onConnected = cb }
+func (h *CallHandler) SetOnConnected(cb func())     { h.onConnected = cb }
 func (h *CallHandler) SetDCInbound(cb func([]byte)) { h.dcInbound = cb }
 
 func (h *CallHandler) Send(data []byte) {

@@ -21,6 +21,7 @@ tunnel.txt
 *.test
 *.out
 vendor/
+.cache/
 
 .idea/
 .vscode/

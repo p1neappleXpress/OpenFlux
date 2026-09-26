@@ -54,16 +54,24 @@ type BaseTransport struct {
 	Mu              sync.RWMutex
 
 	reconnectAttempts atomic.Int32
+
+	// done is closed by Stop. Subclasses can select on Done() to
+	// interrupt sleeps and backoff loops.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func NewBaseTransport(config TransportConfig) *BaseTransport {
 	return &BaseTransport{
 		config:    config,
 		startTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 }
 
 func (b *BaseTransport) Start() error {
+	b.doneOnce = sync.Once{}
+	b.done = make(chan struct{})
 	b.running.Store(1)
 	b.startTime = time.Now()
 	return nil
@@ -72,7 +80,23 @@ func (b *BaseTransport) Start() error {
 func (b *BaseTransport) Stop() error {
 	b.running.Store(0)
 	b.connected.Store(0)
+	if b.done != nil {
+		b.doneOnce.Do(func() { close(b.done) })
+	}
 	return nil
+}
+
+// Done returns a channel that closes when the transport is stopped.
+// Subclasses and callers can select on it to interrupt sleeps.
+func (b *BaseTransport) Done() <-chan struct{} {
+	b.Mu.RLock()
+	d := b.done
+	b.Mu.RUnlock()
+	if d == nil {
+		// Never started; return a channel that blocks forever.
+		return make(chan struct{})
+	}
+	return d
 }
 
 func (b *BaseTransport) IsRunning() bool {
@@ -137,7 +161,6 @@ func (b *BaseTransport) RecordReceive(bytes int) {
 func (b *BaseTransport) RecordReconnect() {
 	b.reconnectAttempts.Add(1)
 }
-
 
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config

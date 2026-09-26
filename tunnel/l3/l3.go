@@ -14,9 +14,12 @@ const clientIP = "10.10.10.2"
 var clientIPBytes = [4]byte{10, 10, 10, 2}
 
 type L3Exit struct {
-	trans   transport.Transport
-	backend L3Backend
-	ct      *conntrack
+	trans                transport.Transport
+	backend              L3Backend
+	ct                   *conntrack
+	udp                  *udpNAT
+	fromClientFragments  reassembler
+	fromNetworkFragments reassembler
 
 	// counters
 	pktFromTransport atomic.Uint64
@@ -25,7 +28,7 @@ type L3Exit struct {
 	pktToTransport   atomic.Uint64
 
 	dropBadIPv4      atomic.Uint64
-	dropRST          atomic.Uint64
+	dropFragmented   atomic.Uint64
 	dropNoFlowKey    atomic.Uint64
 	dropNoConntrack  atomic.Uint64
 	dropNotForUs     atomic.Uint64
@@ -42,6 +45,7 @@ func New(trans transport.Transport) (*L3Exit, error) {
 		trans:   trans,
 		backend: backend,
 		ct:      newConntrack(),
+		udp:     newUDPNAT(backend.EgressIP()),
 	}, nil
 }
 
@@ -61,6 +65,7 @@ func (t *L3Exit) Start() error {
 
 func (t *L3Exit) Stop() error {
 	t.ct.Close()
+	t.udp.Close()
 	return t.backend.Close()
 }
 
@@ -75,14 +80,17 @@ func (t *L3Exit) handleFromTransport(pkt []byte) {
 	}
 	pkt = sl
 
-	if isTCPRST(pkt) {
-		t.dropRST.Add(1)
-		utils.Debugf("[L3] drop: outbound RST")
-		return
+	if isFragmentedIPv4(pkt) {
+		if ipU32([4]byte{pkt[12], pkt[13], pkt[14], pkt[15]}) != ipU32(clientIPBytes) {
+			t.dropNotForUs.Add(1)
+			return
+		}
+		pkt, ok = t.fromClientFragments.add(pkt, time.Now())
+		if !ok {
+			t.dropFragmented.Add(1)
+			return
+		}
 	}
-
-	rewriteSNAT(pkt, t.backend.EgressIP())
-	fixChecksums(pkt)
 
 	k, ok := extractFlowKey(pkt)
 	if !ok {
@@ -90,7 +98,32 @@ func (t *L3Exit) handleFromTransport(pkt []byte) {
 		utils.Debugf("[L3] drop: no flow key")
 		return
 	}
-	t.ct.Insert(k)
+	if k.srcIP != ipU32(clientIPBytes) {
+		t.dropNotForUs.Add(1)
+		return
+	}
+	original := append([]byte(nil), pkt...)
+	if k.proto == 17 {
+		if !validUDPChecksums(pkt) {
+			t.dropBadIPv4.Add(1)
+			return
+		}
+		if err := t.udp.send(pkt, k, t.sendNetwork); err != nil {
+			t.reportSendError(original, err)
+			t.sendToNetErrors.Add(1)
+			utils.Debugf("[L3] UDP send to network failed: %v", err)
+			return
+		}
+		t.pktToNetwork.Add(1)
+		return
+	}
+	rewriteSNAT(pkt, t.backend.EgressIP())
+	fixChecksums(pkt)
+	k.srcIP = ipU32(t.backend.EgressIP())
+	if !t.ct.Insert(k) {
+		t.dropNoConntrack.Add(1)
+		return
+	}
 	if isTCPClosing(pkt) {
 		t.ct.Touch(k, true)
 	}
@@ -100,7 +133,8 @@ func (t *L3Exit) handleFromTransport(pkt []byte) {
 			ipStr(k.srcIP), k.srcPort, ipStr(k.dstIP), k.dstPort, k.proto, len(pkt))
 	}
 
-	if err := t.backend.Send(pkt); err != nil {
+	if err := t.sendNetwork(pkt); err != nil {
+		t.reportSendError(original, err)
 		t.sendToNetErrors.Add(1)
 		utils.Debugf("[L3] send to network failed: %v", err)
 		return
@@ -128,25 +162,58 @@ func (t *L3Exit) handleFromInternet(pkt []byte) {
 		return
 	}
 
+	if isFragmentedIPv4(pkt) {
+		pkt, ok = t.fromNetworkFragments.add(pkt, time.Now())
+		if !ok {
+			t.dropFragmented.Add(1)
+			return
+		}
+	}
+	if pkt[9] == 1 {
+		if !t.translateICMP(pkt) {
+			t.dropNoConntrack.Add(1)
+			return
+		}
+		if err := t.trans.Send(pkt); err != nil {
+			t.sendToClientErrs.Add(1)
+		} else {
+			t.pktToTransport.Add(1)
+		}
+		return
+	}
 	k, ok := extractFlowKey(pkt)
 	if !ok {
 		t.dropNoFlowKey.Add(1)
+		return
+	}
+	if k.proto == 17 {
+		wire := append([]byte(nil), pkt...)
+		if !t.udp.translateReply(pkt, k) {
+			t.dropNoConntrack.Add(1)
+			return
+		}
+		if err := t.sendClient(pkt, wire); err != nil {
+			t.sendToClientErrs.Add(1)
+			return
+		}
+		t.pktToTransport.Add(1)
 		return
 	}
 	rk := reverseKey(k)
 	if !t.ct.Exists(rk) {
 		t.dropNoConntrack.Add(1)
 		if utils.IsVerbose() && t.dropNoConntrack.Load()%1000 == 1 {
-			utils.Debugf("[L3] noct (sampled): %s:%d -> %s:%d flags=0x%02x",
-				ipStr(k.srcIP), k.srcPort, ipStr(k.dstIP), k.dstPort, pkt[33])
+			utils.Debugf("[L3] noct (sampled): %s:%d -> %s:%d proto=%d",
+				ipStr(k.srcIP), k.srcPort, ipStr(k.dstIP), k.dstPort, k.proto)
 		}
 		return
 	}
 	t.ct.Touch(rk, isTCPClosing(pkt))
+	wire := append([]byte(nil), pkt...)
 	rewriteDNAT(pkt, clientIPBytes)
 	fixChecksums(pkt)
 
-	if err := t.trans.Send(pkt); err != nil {
+	if err := t.sendClient(pkt, wire); err != nil {
 		t.sendToClientErrs.Add(1)
 		return
 	}
@@ -159,23 +226,28 @@ func (t *L3Exit) statsLoop() {
 
 	var lastFromTr, lastToNet, lastFromNet, lastToCli uint64
 
-	for range tick.C {
+	for {
+		select {
+		case <-t.ct.stop:
+			return
+		case <-tick.C:
+		}
 		fromTr := t.pktFromTransport.Load()
 		toNet := t.pktToNetwork.Load()
 		fromNet := t.pktFromNetwork.Load()
 		toCli := t.pktToTransport.Load()
 		dropBad := t.dropBadIPv4.Load()
-		dropRST := t.dropRST.Load()
+		dropFragmented := t.dropFragmented.Load()
 		dropNoKey := t.dropNoFlowKey.Load()
 		dropNoCt := t.dropNoConntrack.Load()
 		dropNotUs := t.dropNotForUs.Load()
 
-		utils.Debugf("[L3-STATS] fromTr=%d(+%d) toNet=%d(+%d) | fromNet=%d(+%d) toCli=%d(+%d) | drops: bad=%d rst=%d notus=%d nokey=%d noct=%d | errs: toNet=%d toCli=%d",
+		utils.Debugf("[L3-STATS] fromTr=%d(+%d) toNet=%d(+%d) | fromNet=%d(+%d) toCli=%d(+%d) | drops: bad=%d fragmented=%d notus=%d nokey=%d noct=%d | errs: toNet=%d toCli=%d",
 			fromTr, fromTr-lastFromTr,
 			toNet, toNet-lastToNet,
 			fromNet, fromNet-lastFromNet,
 			toCli, toCli-lastToCli,
-			dropBad, dropRST, dropNotUs, dropNoKey, dropNoCt,
+			dropBad, dropFragmented, dropNotUs, dropNoKey, dropNoCt,
 			t.sendToNetErrors.Load(), t.sendToClientErrs.Load())
 
 		lastFromTr, lastToNet = fromTr, toNet
@@ -206,4 +278,3 @@ func sliceIPv4(pkt []byte) ([]byte, bool) {
 	}
 	return pkt[:tot], true
 }
-

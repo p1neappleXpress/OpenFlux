@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -30,10 +31,10 @@ import (
 //
 // The device is given tunnel address 10.10.10.2, which is exactly what the exit
 // node expects (it hardcodes returns to 10.10.10.2). So we forward the device's
-// raw IP packets straight over the transport — no gvisor stack on the client,
-// which keeps the extension well under its memory cap and preserves full TCP
-// throughput end-to-end. Only TCP is forwarded (the exit node is TCP-only);
-// DNS (UDP 53) is answered locally over DNS-over-TLS.
+// raw IPv4 TCP and UDP packets straight over the transport — no gVisor stack on
+// the client, which keeps the extension well under its memory cap. UDP DNS
+// retains the existing local DNS-over-TLS path for compatibility with older
+// TCP-only exits. Other UDP requires explicit opt-in for a UDP-capable exit.
 //
 // Uses startOK / start* codes and dotServers from export_ios.go.
 
@@ -106,13 +107,20 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	return C.int(startOK)
 }
 
-// OpenFluxTunWritePacket forwards one device IPv4 packet: TCP goes over the
-// transport, DNS (UDP 53) is answered locally, other UDP is dropped.
+var ptUDPEnabled atomic.Bool
+
+// OpenFluxTunSetUDPEnabled enables non-DNS UDP for a known UDP-capable exit.
+// Disabled by default: legacy exits otherwise silently blackhole QUIC traffic.
+//
+//export OpenFluxTunSetUDPEnabled
+func OpenFluxTunSetUDPEnabled(enabled C.int) { ptUDPEnabled.Store(enabled != 0) }
+
+// OpenFluxTunWritePacket forwards one device IPv4 TCP or UDP packet.
 //
 //export OpenFluxTunWritePacket
 func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 	defer func() { _ = recover() }() // never let a bad packet crash the extension
-	if buf == nil || length < 20 {
+	if buf == nil || length < 20 || length > 65535 {
 		return
 	}
 	ptMu.Lock()
@@ -126,75 +134,70 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 	if pkt[0]>>4 != 4 { // IPv4 only
 		return
 	}
+	ihl := int(pkt[0]&0x0f) * 4
+	total := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if ihl < 20 || total < ihl || total > len(pkt) {
+		return
+	}
+	pkt = pkt[:total]
 	switch pkt[9] { // protocol
 	case 6: // TCP
 		t.Send(pkt)
 	case 17: // UDP
-		ihl := int(pkt[0]&0x0f) * 4
-		if len(pkt) < ihl+8 {
+		if len(pkt) < ihl+8 || binary.BigEndian.Uint16(pkt[6:8])&0x3fff != 0 {
+			return
+		}
+		udpLen := int(binary.BigEndian.Uint16(pkt[ihl+4 : ihl+6]))
+		if udpLen < 8 || udpLen > len(pkt)-ihl {
 			return
 		}
 		dstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
-		if dstPort == 53 {
-			// Bound concurrent DNS resolutions so a burst can't spawn an
-			// unbounded pile of goroutines + TLS handshakes (memory).
-			select {
-			case dnsSem <- struct{}{}:
-				go func() { defer func() { <-dnsSem }(); handleDNSPacket(pkt, outQ) }()
-			default: // too many in flight: drop, the client retries
+		if dstPort != 53 {
+			if ptUDPEnabled.Load() {
+				_ = t.Send(pkt)
+			} else {
+				sendICMPPortUnreachable(pkt, outQ)
 			}
-		} else {
-			// We can't carry UDP (TCP-only transport). Instead of silently
-			// dropping it (which makes apps stall on QUIC/UDP:443 before
-			// falling back to TCP), reply ICMP port-unreachable so they switch
-			// to TCP immediately.
-			sendICMPPortUnreachable(pkt, outQ)
+			return
+		}
+		pkt = pkt[:ihl+udpLen]
+		select {
+		case dnsSem <- struct{}{}:
+			go func() { defer func() { <-dnsSem }(); handleDNSPacket(pkt, outQ) }()
+		default:
 		}
 	}
 }
 
-// sendICMPPortUnreachable enqueues an ICMP "destination/port unreachable" for a
-// UDP datagram we won't forward, so the sender falls back to TCP fast.
+var dnsSem = make(chan struct{}, 16)
+
 func sendICMPPortUnreachable(orig []byte, outQ chan []byte) {
 	ihl := int(orig[0]&0x0f) * 4
-	if len(orig) < ihl+8 {
-		return
-	}
-	quote := orig[:ihl+8] // original IP header + 8 bytes (per RFC 792)
+	quote := orig[:ihl+8]
 	icmp := make([]byte, 8+len(quote))
-	icmp[0] = 3 // Destination Unreachable
-	icmp[1] = 3 // Port Unreachable
+	icmp[0], icmp[1] = 3, 3
 	copy(icmp[8:], quote)
-	ck := network.IPChecksum(icmp)
-	icmp[2] = byte(ck >> 8)
-	icmp[3] = byte(ck & 0xFF)
-
-	total := 20 + len(icmp)
-	ip := make([]byte, total)
-	ip[0] = 0x45
-	binary.BigEndian.PutUint16(ip[2:4], uint16(total))
-	ip[8] = 64 // TTL
-	ip[9] = 1  // ICMP
-	copy(ip[12:16], orig[16:20]) // src = original destination
-	copy(ip[16:20], orig[12:16]) // dst = original source (the device)
-	ck2 := network.IPChecksum(ip[:20])
-	ip[10] = byte(ck2 >> 8)
-	ip[11] = byte(ck2 & 0xFF)
-	copy(ip[20:], icmp)
-
+	binary.BigEndian.PutUint16(icmp[2:4], network.IPChecksum(icmp))
+	pkt := make([]byte, 20+len(icmp))
+	pkt[0], pkt[8], pkt[9] = 0x45, 64, 1
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
+	copy(pkt[12:16], orig[16:20])
+	copy(pkt[16:20], orig[12:16])
+	binary.BigEndian.PutUint16(pkt[10:12], network.IPChecksum(pkt[:20]))
+	copy(pkt[20:], icmp)
 	select {
-	case outQ <- ip:
+	case outQ <- pkt:
 	default:
 	}
 }
-
-// dnsSem caps concurrent DNS-over-TLS resolutions.
-var dnsSem = make(chan struct{}, 16)
 
 // OpenFluxTunReadPacket blocks for the next packet destined to the device.
 //
 //export OpenFluxTunReadPacket
 func OpenFluxTunReadPacket(buf *C.char, max C.int) C.int {
+	if buf == nil || max <= 0 {
+		return 0
+	}
 	ptMu.Lock()
 	outQ := ptOutQ
 	ctx := ptCtx
@@ -258,27 +261,27 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 		return
 	}
 
-	// Build the response: swap addresses/ports (dst<->src), UDP checksum 0.
 	udpLen := 8 + len(answer)
+	if udpLen > 65535-20 {
+		return
+	}
+	// Build a fresh minimal IPv4 header; do not advertise uncopied options.
+	ihl = 20
 	total := ihl + udpLen
 	resp := make([]byte, total)
-	// IP header: copy version/IHL/TOS, set total length, TTL/proto, addresses.
-	resp[0] = req[0]
+	resp[0] = 0x45
 	resp[1] = req[1]
 	binary.BigEndian.PutUint16(resp[2:4], uint16(total))
-	resp[8] = 64 // TTL
-	resp[9] = 17 // UDP
-	copy(resp[12:16], dstIP)  // src = original destination (the resolver)
-	copy(resp[16:20], srcIP)  // dst = the device
-	resp[10], resp[11] = 0, 0 // checksum field
+	resp[8] = 64
+	resp[9] = 17
+	copy(resp[12:16], dstIP)
+	copy(resp[16:20], srcIP)
 	ipck := network.IPChecksum(resp[:20])
 	resp[10] = byte(ipck >> 8)
-	resp[11] = byte(ipck & 0xFF)
-	// UDP header
-	copy(resp[ihl:ihl+2], dstPort)   // src port = 53
-	copy(resp[ihl+2:ihl+4], srcPort) // dst port = device's
+	resp[11] = byte(ipck)
+	copy(resp[ihl:ihl+2], dstPort)
+	copy(resp[ihl+2:ihl+4], srcPort)
 	binary.BigEndian.PutUint16(resp[ihl+4:ihl+6], uint16(udpLen))
-	// checksum 0 (allowed for IPv4 UDP)
 	copy(resp[ihl+8:], answer)
 
 	select {
@@ -287,14 +290,12 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 	}
 }
 
-// dnsOverTLS sends a DNS query to a DoT resolver (RFC 7858, length-prefixed)
-// and returns the raw DNS answer, trying each server in turn.
 func dnsOverTLS(query []byte) ([]byte, error) {
 	var lastErr error
 	for _, s := range dotServers {
-		ans, err := dotQueryOne(s, query)
+		answer, err := dotQueryOne(s, query)
 		if err == nil {
-			return ans, nil
+			return answer, nil
 		}
 		lastErr = err
 	}
@@ -302,29 +303,28 @@ func dnsOverTLS(query []byte) ([]byte, error) {
 }
 
 func dotQueryOne(s dotServer, query []byte) ([]byte, error) {
-	d := tls.Dialer{
+	dialer := tls.Dialer{
 		NetDialer: &net.Dialer{Timeout: 6 * time.Second},
 		Config:    &tls.Config{ServerName: s.sni, MinVersion: tls.VersionTLS12},
 	}
-	conn, err := d.DialContext(context.Background(), "tcp", s.addr)
+	conn, err := dialer.DialContext(context.Background(), "tcp", s.addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(6 * time.Second))
 
-	var lp [2]byte
-	binary.BigEndian.PutUint16(lp[:], uint16(len(query)))
-	if _, err := conn.Write(append(lp[:], query...)); err != nil {
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(len(query)))
+	if _, err := conn.Write(append(length[:], query...)); err != nil {
 		return nil, err
 	}
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
+	if _, err := io.ReadFull(conn, length[:]); err != nil {
 		return nil, err
 	}
-	ans := make([]byte, binary.BigEndian.Uint16(hdr))
-	if _, err := io.ReadFull(conn, ans); err != nil {
+	answer := make([]byte, binary.BigEndian.Uint16(length[:]))
+	if _, err := io.ReadFull(conn, answer); err != nil {
 		return nil, err
 	}
-	return ans, nil
+	return answer, nil
 }

@@ -36,7 +36,7 @@ func (f *fakeTransport) Receive(cb func([]byte)) {
 	f.cb = cb
 	f.mu.Unlock()
 }
-func (f *fakeTransport) IsConnected() bool    { return true }
+func (f *fakeTransport) IsConnected() bool     { return true }
 func (f *fakeTransport) Stats() TransportStats { return TransportStats{} }
 
 func (f *fakeTransport) sendCount() int {
@@ -120,6 +120,46 @@ func TestBatchedTransportCoalescesBurstIntoOneMessage(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(pkts) != n {
-		t.Fatalf("expected %d packets in the batch, got %d", n, len(pkts))
+		t.Fatalf("expected exactly %d data packets without injected control records, got %d", n, len(pkts))
+	}
+}
+
+func TestBatchedTransportStaysV2WithoutPeerAdvertisement(t *testing.T) {
+	inner := &fakeTransport{}
+	bt := NewBatchedTransport(inner)
+	bt.lingerMs = 1
+	if err := bt.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bt.Stop()
+	if err := bt.Send([]byte("legacy-compatible")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := inner.firstSent(); len(got) == 0 || got[0] != batchFormatVersion {
+		t.Fatalf("wire version = %x, want v2", got)
+	}
+}
+
+func TestBatchedTransportRejectsRetiredUnauthenticatedNegotiation(t *testing.T) {
+	t.Setenv("OPENFLUX_EXPERIMENTAL_WIRE_V3", "1")
+	inner := &fakeTransport{}
+	bt := NewBatchedTransport(inner)
+	bt.lingerMs = 1
+	bt.Receive(func([]byte) {})
+	if err := bt.Start(); err == nil {
+		t.Fatal("unsafe prototype was allowed to start")
+	}
+	defer bt.Stop()
+
+	if err := bt.Send([]byte("v3")); err == nil || inner.sendCount() != 0 {
+		t.Fatal("unsafe prototype sent data")
+	}
+}
+
+func TestBatchedTransportRejectsOversizedPacket(t *testing.T) {
+	bt := NewBatchedTransport(&fakeTransport{})
+	if err := bt.Send(make([]byte, 65536)); err == nil {
+		t.Fatal("expected oversized packet error")
 	}
 }

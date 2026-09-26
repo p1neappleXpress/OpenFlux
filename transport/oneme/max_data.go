@@ -2,11 +2,11 @@ package oneme
 
 import (
 	"encoding/json"
-	"time"
-	"sync"
-	"sync/atomic"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type MaxPacket struct {
@@ -62,31 +62,31 @@ type MaxClient struct {
 }
 
 type CallHandler struct {
-        tag               string
-        role              string
-        pc                *webrtc.PeerConnection
-        dc                *webrtc.DataChannel
-        conn              *websocket.Conn
-        connMu            sync.RWMutex
-        localID           int64
-        remoteID          int64
-        seq               int64
-        seqMu             sync.Mutex
-        onConnected       func()
-        callAccepted      bool
-        acceptSent        bool
-        hasRemoteDesc     bool
-        pendingCandidates []map[string]interface{}
-        dcInbound         func([]byte)
-        msgHandler        func(string)
-        lastRecvTime      time.Time
-        lastRecvMu        sync.RWMutex
-        lastPongTime      time.Time
-        lastPongMu        sync.RWMutex
-        reconnectCh       chan struct{}
-        doneCh            chan struct{}
-        calleeID          int64
-        client            *MaxClient
-        running           atomic.Bool
-        mu					sync.Mutex
+	tag               string
+	role              string
+	pc                *webrtc.PeerConnection
+	dc                *webrtc.DataChannel
+	conn              *websocket.Conn
+	connMu            sync.RWMutex
+	localID           int64
+	remoteID          int64
+	seq               int64
+	seqMu             sync.Mutex
+	onConnected       func()
+	callAccepted      bool
+	acceptSent        bool
+	hasRemoteDesc     bool
+	pendingCandidates []map[string]interface{}
+	dcInbound         func([]byte)
+	msgHandler        func(string)
+	lastRecvTime      time.Time
+	lastRecvMu        sync.RWMutex
+	lastPongTime      time.Time
+	lastPongMu        sync.RWMutex
+	reconnectCh       chan struct{}
+	doneCh            chan struct{}
+	calleeID          int64
+	client            *MaxClient
+	running           atomic.Bool
+	mu                sync.Mutex
 }

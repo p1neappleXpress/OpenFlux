@@ -7,7 +7,8 @@ import (
 )
 
 // The fixed envelope the Yandex transport wraps every channel message in:
-//   42["message",{"type":"cursor","cursor":"18;<base64>"}]
+//
+//	42["message",{"type":"cursor","cursor":"18;<base64>"}]
 const yandexEnvelope = len(`42["message",{"type":"cursor","cursor":"18;`) + len(`"}]`)
 
 func b64len(n int) int { return base64.StdEncoding.EncodedLen(n) }

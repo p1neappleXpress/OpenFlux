@@ -14,6 +14,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -64,6 +66,9 @@ type MailruDocsTransport struct {
 
 	userCounter atomic.Int32
 	baseUserID  string
+
+	cookieJar *cookiejar.Jar
+	jarMu     sync.RWMutex
 }
 
 // NewMailruDocsTransport accepts either a bare weblink ("AbCdEfGh1/IjKlMnOp2")
@@ -75,6 +80,8 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 		weblink:       normalizeWeblink(weblink),
 	}
 	t.baseUserID = randUserID()
+	jar, _ := cookiejar.New(nil)
+	t.cookieJar = jar
 	return t
 }
 
@@ -428,7 +435,17 @@ func reconnectBackoff(n int) time.Duration {
 // fetchDocInfo POSTs to Mail.ru's public-document editor API and parses the
 // response into the fields needed to open the collaborative WebSocket.
 func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	t.jarMu.RLock()
+	jar := t.cookieJar
+	t.jarMu.RUnlock()
+	if jar == nil {
+		var err error
+		jar, err = cookiejar.New(nil)
+		if err != nil {
+			return MailruDocsInfo{}, err
+		}
+	}
+	client := &http.Client{Jar: jar, Timeout: 15 * time.Second}
 
 	reqBody := map[string]string{
 		"x-email":  "anonym",
@@ -514,4 +531,60 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 
 func randUserID() string {
 	return fmt.Sprintf("%010d", rand.New(rand.NewSource(time.Now().UnixNano())).Intn(1000000000))
+}
+
+// ---- CookieExchanger ----
+
+// FetchCookies returns a snapshot of the transport's current cookie jar as
+// name -> value. Used by the exit node to answer a SubtypeCookiesRequest.
+func (t *MailruDocsTransport) FetchCookies() (map[string]string, error) {
+	t.jarMu.RLock()
+	jar := t.cookieJar
+	t.jarMu.RUnlock()
+	if jar == nil {
+		return nil, fmt.Errorf("mailru: cookie jar is nil")
+	}
+	u, err := url.Parse("https://cloud.mail.ru/")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string)
+	for _, c := range jar.Cookies(u) {
+		out[c.Name] = c.Value
+	}
+	return out, nil
+}
+
+// ApplyCookies replaces the transport's cookie jar with the provided values
+// and forces the current session to reconnect.
+func (t *MailruDocsTransport) ApplyCookies(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	u, _ := url.Parse("https://cloud.mail.ru/")
+	jar, _ := cookiejar.New(nil)
+	cookies := make([]*http.Cookie, 0, len(values))
+	for k, v := range values {
+		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/"})
+	}
+	jar.SetCookies(u, cookies)
+
+	t.jarMu.Lock()
+	t.cookieJar = jar
+	t.jarMu.Unlock()
+
+	utils.Debugf("[M-DOCS] applied %d cookies, forcing reconnect", len(cookies))
+
+	t.Mu.Lock()
+	session := t.session
+	t.session = nil
+	t.SetConnected(false)
+	t.Mu.Unlock()
+	if session != nil && session.Conn != nil {
+		_ = session.Conn.Close()
+	}
+	if t.IsRunning() {
+		t.scheduleReconnect(0)
+	}
+	return nil
 }

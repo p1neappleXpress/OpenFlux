@@ -118,7 +118,6 @@ func (e *EncryptedTransport) Send(data []byte) error {
 	return e.Transport.Send(packet)
 }
 
-
 func (e *EncryptedTransport) Receive(callback func([]byte)) {
 	e.Transport.Receive(func(packet []byte) {
 		if len(packet) < encryptedHeader+e.receiveAEAD.NonceSize()+e.receiveAEAD.Overhead() {

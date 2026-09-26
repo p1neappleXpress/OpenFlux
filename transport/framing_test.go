@@ -108,3 +108,10 @@ func TestDecodeBatchRejectsShortFrame(t *testing.T) {
 		t.Fatal("expected error for frame shorter than header")
 	}
 }
+
+func TestDecodeBatchRejectsUnknownFlags(t *testing.T) {
+	// v2 header, unknown flag bit set.
+	if _, err := decodeBatch([]byte{batchFormatVersion, 0x80}); err == nil {
+		t.Fatal("expected unknown flags error")
+	}
+}

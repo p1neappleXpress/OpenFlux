@@ -25,7 +25,6 @@ func (c *CompressedTransport) Send(data []byte) error {
 	return c.Transport.Send(compressed)
 }
 
-
 func (c *CompressedTransport) Receive(callback func([]byte)) {
 	c.Transport.Receive(func(data []byte) {
 		decompressed, err := decompress(data)

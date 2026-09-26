@@ -36,6 +36,12 @@ func Debugf(format string, args ...interface{}) {
 	}
 }
 
+// Infof always logs, regardless of verbose mode. Used for user-facing status
+// lines (e.g. cups room open/close) that must be visible without --debug.
+func Infof(format string, args ...interface{}) {
+	log.Output(2, fmt.Sprintf(format, args...))
+}
+
 // SetDebug toggles verbose logging at runtime (off = Debugf becomes a no-op).
 func SetDebug(on bool) {
 	if on {

@@ -4,18 +4,16 @@ package main
 
 import (
 	"fmt"
+	"golang.org/x/sys/unix"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
-	"golang.org/x/sys/unix"
 
 	"openflux/transport"
 	"openflux/utils"
 )
-
-
 
 // TUNClient is a macOS utun-based L3 forwarder: no gVisor, no SOCKS5.
 // IP packets flow straight between the system utun interface and the transport.
@@ -46,10 +44,10 @@ func NewTUNClient(trans transport.Transport, mtu int) (*TUNClient, error) {
 	}
 
 	c := &TUNClient{
-		trans:    trans,
-		fd:       fd,
-		name:     name,
-		inbound:  make(chan []byte, 4096),
+		trans:   trans,
+		fd:      fd,
+		name:    name,
+		inbound: make(chan []byte, 4096),
 	}
 	return c, nil
 }
@@ -205,6 +203,7 @@ func (c *TUNClient) Close() error {
 	exec.Command("sudo", "ifconfig", c.name, "down").Run()
 	return c.fd.Close()
 }
+
 // openUtun creates a new utun interface via the PF_SYSTEM control socket.
 func openUtun() (*os.File, string, error) {
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, 2 /* SYSPROTO_CONTROL */)
@@ -240,10 +239,8 @@ func openUtun() (*os.File, string, error) {
 	return os.NewFile(uintptr(fd), name), name, nil
 }
 
-
 // Silence unused import when building only on darwin.
 var _ = net.IPv4len
-
 
 // realGateway returns the default router IP and the interface it is on.
 // It handles macOS's habit of reporting "link#N" instead of an IP address:
@@ -280,7 +277,6 @@ func realGateway() (string, string, error) {
 	}
 	return "", "", fmt.Errorf("no physical interface with IPv4 found")
 }
-
 
 // parseIfconfigIPv4 extracts the first inet + netmask from ifconfig output.
 // Handles macOS's hex netmask form (0xffffff00).
@@ -344,7 +340,6 @@ func firstUsableHost(ip net.IP, mask net.IPMask) string {
 	return network.String()
 }
 
-
 // Gateway returns the physical gateway IP resolved at SetupInterface time.
 func (c *TUNClient) Gateway() string { return c.gateway }
 
@@ -352,7 +347,6 @@ func (c *TUNClient) Gateway() string { return c.gateway }
 // physical gateway. It does NOT touch the default route.
 
 // ConfigureDefault installs 0.0.0.0/1 and 128.0.0.0/1 through utun.
-
 
 // SaveDefault records the current default route (interface + gateway) so we
 // can restore it on exit. Must be called BEFORE any tunnel routes are
