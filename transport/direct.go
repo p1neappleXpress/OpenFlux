@@ -109,9 +109,9 @@ type DirectTransport struct {
 	drops      atomic.Uint64
 
 	// Counters for verbose logging.
-	bytesIn   atomic.Uint64
-	bytesOut  atomic.Uint64
-	recordsIn atomic.Uint64
+	bytesIn    atomic.Uint64
+	bytesOut   atomic.Uint64
+	recordsIn  atomic.Uint64
 	recordsOut atomic.Uint64
 }
 

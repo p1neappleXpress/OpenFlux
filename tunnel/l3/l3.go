@@ -1,7 +1,6 @@
 package l3
 
 import (
-	"encoding/hex"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -84,12 +83,7 @@ func (t *L3Exit) handleFromTransport(pkt []byte) {
 
 	// Inbound from the client side of the tunnel: log the packet exactly
 	// as it arrived, before any SNAT, in the canonical format.
-	if utils.Level() >= 1 {
-		utils.Debugf("[L3] %s", network.FormatPacket(network.DirOutbound, pkt))
-	}
-	if utils.IsVerbose() && utils.Sensitive() {
-		utils.Debugf("[L3] ->net payload hexdump:\n%s", hex.Dump(pkt))
-	}
+	network.LogPacket("L3", network.DirOutbound, pkt)
 
 	if isFragmentedIPv4(pkt) {
 		if ipU32([4]byte{pkt[12], pkt[13], pkt[14], pkt[15]}) != ipU32(clientIPBytes) {
@@ -170,12 +164,7 @@ func (t *L3Exit) handleFromInternet(pkt []byte) {
 	}
 
 	// Inbound from the network: log before DNAT.
-	if utils.Level() >= 1 {
-		utils.Debugf("[L3] %s", network.FormatPacket(network.DirInbound, pkt))
-	}
-	if utils.IsVerbose() && utils.Sensitive() {
-		utils.Debugf("[L3] <-net payload hexdump:\n%s", hex.Dump(pkt))
-	}
+	network.LogPacket("L3", network.DirInbound, pkt)
 
 	if isFragmentedIPv4(pkt) {
 		pkt, ok = t.fromNetworkFragments.add(pkt, time.Now())

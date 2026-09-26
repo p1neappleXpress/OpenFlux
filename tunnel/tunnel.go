@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,11 +110,15 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 			tunnelEP.SetMTU(uint32(min(1500, p.MaxPacketSize)))
 		}
 	}
+	// "->" points towards the internet and "<-" back towards the device on
+	// both sides, as in the L3 and utun logs, so one flow reads the same in
+	// the client's and the exit's log.
+	toPeer, fromPeer := network.DirOutbound, network.DirInbound
+	if isExitNode {
+		toPeer, fromPeer = network.DirInbound, network.DirOutbound
+	}
 	tunnelEP.onOutgoingPacket = func(data []byte) {
-		// `->` : emitted by the local stack, going to the peer / internet.
-		if utils.Level() >= 1 {
-			utils.Debugf("[TUNNEL] %s", network.FormatPacket(network.DirOutbound, data))
-		}
+		network.LogPacket("TUNNEL", toPeer, data)
 		if err := trans.Send(data); err != nil {
 			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
 		}
@@ -132,10 +137,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	}
 
 	trans.Receive(func(data []byte) {
-		// `<-` : received from the peer / internet, going into the local stack.
-		if utils.Level() >= 1 {
-			utils.Debugf("[TUNNEL] %s", network.FormatPacket(network.DirInbound, data))
-		}
+		network.LogPacket("TUNNEL", fromPeer, data)
 		tunnelEP.InjectInbound(data)
 	})
 
@@ -223,7 +225,7 @@ func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) bool {
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	dest := net.JoinHostPort(id.LocalAddress.String(), fmt.Sprintf("%d", id.LocalPort))
+	dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
 	var wq waiter.Queue
 	ep, tErr := r.CreateEndpoint(&wq)
@@ -281,16 +283,20 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 var dialTimeout = 10 * time.Second
 
 func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
+	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, fmt.Errorf("resolve: %w", err)
+		return nil, fmt.Errorf("split address: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return nil, fmt.Errorf("bad port in %q", address)
 	}
 
-	ip := tcpAddr.IP.To4()
-	if ip == nil {
-		return nil, fmt.Errorf("IPv6 not supported")
+	ip, err := t.resolveIPv4(host)
+	if err != nil {
+		return nil, err
 	}
-	utils.Debugf("[TUNNEL] DialTCP %s -> %s:%d", address, ip.String(), tcpAddr.Port)
+	utils.Debugf("[TUNNEL] DialTCP %s -> %s:%d", address, ip.String(), port)
 
 	nic := tcpip.NICID(1)
 	if t.isExitNode && false {
@@ -302,12 +308,33 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 	conn, err := gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
 		NIC:  nic,
 		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
-		Port: uint16(tcpAddr.Port),
+		Port: uint16(port),
 	}, ipv4.ProtocolNumber)
 	if err != nil {
 		return nil, err
 	}
 	return conn, nil
+}
+
+// resolveIPv4 resolves host to an IPv4 address using the local system
+// resolver (for a literal IP this is just a parse, no lookup).
+func (t *TCPTunnel) resolveIPv4(host string) (net.IP, error) {
+	if literal := net.ParseIP(host); literal != nil {
+		if ip4 := literal.To4(); ip4 != nil {
+			return ip4, nil
+		}
+		return nil, fmt.Errorf("IPv6 not supported")
+	}
+
+	tcpAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve: %w", err)
+	}
+	ip4 := tcpAddr.IP.To4()
+	if ip4 == nil {
+		return nil, fmt.Errorf("IPv6 not supported")
+	}
+	return ip4, nil
 }
 
 func (t *TCPTunnel) DialUDP(address string) (net.Conn, error) {

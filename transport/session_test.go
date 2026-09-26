@@ -180,6 +180,10 @@ func TestSessionReplayWindow(t *testing.T) {
 		}
 	}
 
+	// The exit returns from Start before it is ready: it becomes ready
+	// when the client's echo arrives, possibly after the client returned.
+	eventually(t, "exit ready", b.IsConnected)
+
 	count := 0
 	b.Receive(func([]byte) { count++ })
 	data := func(seq uint64) []byte {

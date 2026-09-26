@@ -547,8 +547,10 @@ Measure raw goodput through the transport, without touching the host network:
 | `--url` | `-u` | `http://#` | Document URL |
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
-| `--debug` | `-d` | `false` | Verbose per-packet logging |
+| `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: one line per packet (`-> 52 bytes - UDP ...`); `2`: plus operational logs; `3`: plus hexdumps |
+| `--sensitive` | | `false` | Also log key material and, with `-ddd`, plaintext frames (cookie jars, tokens) |
 | `--encryption-key-file` | | | AES-256-GCM shared secret file |
+| `--session-context` | | (derived) | KDF context for the key; default `--url`, else the highest-priority transport URL, else `http://#` |
 | `--maxToken` | | | MAX auth token (`--transport=oneme`) |
 | `--maxUid` | | | MAX user id (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | MB to push (`--role=bench-send`) |

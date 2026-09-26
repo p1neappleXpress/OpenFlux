@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -48,15 +46,23 @@ func expandShortFlags(args []string) []string {
 		"-l": "--local-ip",
 	}
 	out := make([]string, 0, len(args))
-	for _, a := range args {
-		// Counted debug flag: -d -> --debug=1, -dd -> --debug=2, -ddd -> 2.
-		if strings.HasPrefix(a, "-d") && !strings.HasPrefix(a, "--") {
-			n := len(a) - 1
-			if n > 2 {
-				n = 2
-			}
-			out = append(out, fmt.Sprintf("--debug=%d", n))
+	for i, a := range args {
+		// Counted debug flag: -d, -dd, -ddd -> --debug=1..3. Only a run of
+		// d's counts, so single-dash long flags like -direct-listen pass.
+		if n := debugCount(a); n > 0 {
+			out = append(out, fmt.Sprintf("--debug=%d", min(n, utils.LevelHexdump)))
 			continue
+		}
+		if strings.HasPrefix(a, "-d=") {
+			out = append(out, "--debug="+a[len("-d="):])
+			continue
+		}
+		// A bare --debug means -d, unless its level follows ("--debug 2").
+		if a == "--debug" || a == "-debug" {
+			if i+1 >= len(args) || !isNumber(args[i+1]) {
+				out = append(out, "--debug=1")
+				continue
+			}
 		}
 		replaced := false
 		for short, long := range aliases {
@@ -117,26 +123,39 @@ func cookieKey(transportType, docURL, maxUid string) string {
 	}
 }
 
+// debugCount returns how many d's make up a -d, -dd, -ddd flag, or 0.
+func debugCount(a string) int {
+	if len(a) < 2 || a[0] != '-' || strings.Trim(a[1:], "d") != "" {
+		return 0
+	}
+	return len(a) - 1
+}
+
+func isNumber(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
 // pickSessionContext returns the KDF salt used to derive encryption keys.
 // The same value must be produced on both peers, regardless of how the
 // document URL was supplied (--url, --yandex-url, [Transport] URL, ...).
 //
 // Priority:
 //
-//	explicit          --session-context, if non-empty
-//	--url             globalURL, if non-empty and not the placeholder
-//	--<type>-url      first non-empty per-transport URL flag
-//	[Transport] URL   first non-empty URL from a .conf section
-//	fallback          transportType, or "openflux" if that is empty too
+//	explicit      --session-context, if non-empty
+//	--url         globalURL, if set and not the placeholder
+//	transports    URL of the highest-priority transport that has one,
+//	              cupsonline aside
+//	fallback      the placeholder "http://#"
 //
-// The placeholder "http://#" (the default value of --url) is treated as
-// "not set" so it never becomes part of the KDF input.
-func pickSessionContext(
-	explicit, globalURL string,
-	yandexURL, vyandexURL, boardsURL, mailruURL, cupsonlineURL string,
-	confTransports []transportSpec,
-	transportType string,
-) string {
+// A cupsonline "URL" is the room list the exit creates when it starts and
+// prints for clients, so the exit cannot know it beforehand; letting it
+// into the context gave the two sides different keys.
+//
+// This is what the OpenFlux-Android client derives for a Session profile,
+// and the fallback is what older builds used whenever --url was unset, so a
+// node without any document URL (direct, oneme) keeps its old key.
+func pickSessionContext(explicit, globalURL string, specs []transportSpec) string {
 	const placeholder = "http://#"
 	if explicit != "" {
 		return explicit
@@ -144,25 +163,19 @@ func pickSessionContext(
 	if globalURL != "" && globalURL != placeholder {
 		return globalURL
 	}
-	for _, u := range []string{yandexURL, vyandexURL, boardsURL, mailruURL, cupsonlineURL} {
-		if u != "" {
-			return u
+	best := -1
+	for i, s := range specs {
+		if s.Type == "cupsonline" || s.URL == "" || s.URL == placeholder {
+			continue
+		}
+		if best < 0 || s.Priority > specs[best].Priority {
+			best = i
 		}
 	}
-	for _, s := range confTransports {
-		if s.URL != "" {
-			return s.URL
-		}
+	if best >= 0 {
+		return specs[best].URL
 	}
-	if transportType != "" {
-		return transportType
-	}
-	return "openflux"
-}
-
-func sha256ShortHex(b []byte) string {
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:8])
+	return placeholder
 }
 
 // managerRefreshLoop periodically asks the exit node for a fresh cookie jar.
@@ -234,8 +247,9 @@ func main() {
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
 
-	debug := flag.Int("debug", 0, "Debug level: 1 (default with -d), 2 (hexdump with -dd)")
-	sensitive := flag.Bool("sensitive", false, "Include sensitive data (session keys, secret bytes, plaintext, cookie jars) in logs")
+	debug := flag.Int("debug", 0, "Debug level: 1 packets (-d), 2 operational logs (-dd), 3 hexdumps (-ddd)")
+	sensitive := flag.Bool("sensitive", false, "Also log key material and, with -ddd, plaintext frames (cookie jars, tokens)")
+	sensitiveAlias := flag.Bool("sensetive", false, "Alias for --sensitive")
 
 	// Deprecated aliases, kept for one release to ease migration.
 	depClient := flag.Bool("client", false, "DEPRECATED: use --role=client")
@@ -307,8 +321,9 @@ TRANSPORT MODIFIERS
                                --transports or --negotiate. Both peers
                                must share the same key.
       --session-context=<str>  Explicit KDF context for that key. Both peers
-                               must use the same value. Default: derived from
-                               the document URL, falling back to --transport.
+                               must use the same value. Default: --url, else
+                               the URL of the highest-priority transport,
+                               else "http://#".
       --negotiate              Require authenticated capability negotiation
                                on both peers. No legacy fallback.
       --max-packet-size=N      Max IPv4 packet in negotiated mode
@@ -329,7 +344,14 @@ BENCHMARK  (only with --role=bench-*)
       --bench-compressible     Repetitive payload (bench-send).
 
 LOGGING
-  -d, --debug                  Verbose per-packet logging.
+  -d, --debug=1                Packet movement: one line per IPv4 packet,
+                               "-> 52 bytes - UDP 10.10.10.2:53000 -> 8.8.8.8:53 ...".
+  -dd, --debug=2               Plus operational logs: sessions, carriers,
+                               handshakes, crypto, control, errors.
+  -ddd, --debug=3              Plus hexdumps of packets and ciphertext.
+      --sensitive              Also log key material and, with -ddd, the
+                               plaintext frames (control messages carry
+                               cookie jars and tokens). Off by default.
 
 DEPRECATED (removed in v2)
   -client, -exit-node      -> --role=client|exit
@@ -376,7 +398,7 @@ DEPRECATED (removed in v2)
 				*debug = 1
 			}
 		}
-		if v, ok := confValue(conf.Interface, "Sensitive"); ok && !setFlags["sensitive"] {
+		if v, ok := confValue(conf.Interface, "Sensitive"); ok && !setFlags["sensitive"] && !setFlags["sensetive"] {
 			*sensitive = confBool(v, *sensitive)
 		}
 
@@ -500,10 +522,8 @@ DEPRECATED (removed in v2)
 		godebug.SetGCPercent(20)
 	}
 
-	if *debug > 0 {
-		utils.SetLevel(*debug)
-	}
-	if *sensitive {
+	utils.SetLevel(*debug)
+	if *sensitive || *sensitiveAlias {
 		utils.SetSensitive(true)
 	}
 	utils.Debugf("[INIT] debug level=%d sensitive=%v", utils.Level(), utils.Sensitive())
@@ -604,20 +624,7 @@ DEPRECATED (removed in v2)
 	// Encryption secret is mandatory when --negotiate is set.
 	//
 	// The session context is the KDF salt for the encryption keys and MUST
-	// be identical on both peers. It is derived from the document URL,
-	// because two peers that use different documents cannot talk to each
-	// other anyway. pickSessionContext reads whichever way the operator
-	// actually supplied that URL, in priority order:
-	//
-	//   1. --session-context   (explicit override, highest priority)
-	//   2. --url               (single-transport and --transports)
-	//   3. any --<type>-url    (yandex/vyandex/boards/mailru/cupsonline)
-	//   4. [Transport "x"] URL from a .conf file
-	//   5. --transport          (last resort, e.g. direct or oneme)
-	//
-	// Before this, only --url was consulted, so a run using --yandex-url
-	// (or a .conf section) silently fell back to the placeholder default
-	// "http://#" and produced a different key on each side.
+	// be identical on both peers; see pickSessionContext.
 	var secret string
 	var sessionContext string
 	if *encryptionKeyFile != "" {
@@ -633,17 +640,15 @@ DEPRECATED (removed in v2)
 		if strings.ContainsAny(secret, "\r\n\t") {
 			utils.Debugf("[KEY] WARNING: secret still contains whitespace after TrimSpace; lengths may differ across platforms")
 		}
-		utils.Debugf("[KEY] loaded from %s: len=%d sha256=%s",
-			*encryptionKeyFile, len(secret), utils.Sha256Hex([]byte(secret)))
+		// No hash of the secret without --sensitive: it would let anyone
+		// with the log test guesses without paying for scrypt.
+		utils.Debugf("[KEY] loaded from %s: len=%d", *encryptionKeyFile, len(secret))
+		if utils.Sensitive() {
+			utils.Debugf("[KEY] secret sha256=%s", utils.Sha256Hex([]byte(secret)))
+		}
 	}
 
-	sessionContext = pickSessionContext(
-		*sessionContextFlag,
-		globalDocUrl,
-		*yandexURL, *vyandexURL, *boardsURL, *mailruURL, *cupsonlineURL,
-		confTransports,
-		*transportType,
-	)
+	sessionContext = pickSessionContext(*sessionContextFlag, globalDocUrl, specs)
 	if *encryptionKeyFile != "" {
 		utils.Debugf("[KEY] context=%q sha256=%s (MUST match on both peers)",
 			sessionContext, utils.Sha256Hex([]byte(sessionContext)))

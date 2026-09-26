@@ -98,15 +98,16 @@ func NewEncryptedTransport(inner Transport, secret, context string, exitNode boo
 
 	// --- Diagnostic dumps ---------------------------------------------------
 	//
-	// [KEYDUMP] digest is always emitted at debug level 1: it contains only
-	// SHA-256 prefixes, so two peers can compare derivations without
-	// revealing keys.
+	// [KEYDUMP] digest is emitted from debug level 2 (-dd): SHA-256
+	// prefixes of the context and of the derived keys, so two peers can
+	// compare derivations without revealing keys. It carries no hash of
+	// the secret itself: that would let anyone with the log test guesses
+	// without paying for scrypt.
 	//
 	// The detailed dump (secret hex, master, directional keys, send/recv
 	// keys) is printed only when --sensitive is set.
-	utils.Debugf("[KEYDUMP] digest side=%s secretSHA256=%s contextSHA256=%s masterSHA256=%s c2eSHA256=%s e2cSHA256=%s",
+	utils.Debugf("[KEYDUMP] digest side=%s contextSHA256=%s masterSHA256=%s c2eSHA256=%s e2cSHA256=%s",
 		side,
-		utils.Sha256Short([]byte(secret)),
 		utils.Sha256Short([]byte(context)),
 		utils.Sha256Short(master),
 		utils.Sha256Short(clientToExit),
@@ -173,12 +174,14 @@ func (e *EncryptedTransport) Send(data []byte) error {
 
 	utils.Debugf("[CRYPTO] Send #%d dir=%d plaintext=%d ciphertext=%d nonce=%s",
 		e.sendOK.Load()+1, e.sendDirection, len(data), len(packet), hex.EncodeToString(nonce))
-	if utils.IsVerbose() && utils.Sensitive() {
-		utils.Debugf("[CRYPTO] Send plaintext hexdump:\n%s", hex.Dump(data))
+	// Plaintext frames can carry control messages with cookie jars, so
+	// they are dumped only with --sensitive; ciphertext is what the
+	// carrier sees anyway.
+	if utils.IsVerbose() {
+		if utils.Sensitive() {
+			utils.Debugf("[CRYPTO] Send plaintext hexdump:\n%s", hex.Dump(data))
+		}
 		utils.Debugf("[CRYPTO] Send ciphertext hexdump:\n%s", hex.Dump(packet))
-	} else if utils.IsVerbose() {
-		utils.Debugf("[CRYPTO] Send dir=%d plaintext=%d ciphertext=%d (hexdump hidden; use --sensitive)",
-			e.sendDirection, len(data), len(packet))
 	}
 
 	err := e.Transport.Send(packet)
@@ -195,11 +198,7 @@ func (e *EncryptedTransport) Receive(callback func([]byte)) {
 	e.Transport.Receive(func(packet []byte) {
 		utils.Debugf("[CRYPTO] Recv raw %d ciphertext bytes", len(packet))
 		if utils.IsVerbose() {
-			if utils.Sensitive() {
-				utils.Debugf("[CRYPTO] Recv raw hexdump:\n%s", hex.Dump(packet))
-			} else {
-				utils.Debugf("[CRYPTO] Recv raw %d bytes (hexdump hidden; use --sensitive)", len(packet))
-			}
+			utils.Debugf("[CRYPTO] Recv raw hexdump:\n%s", hex.Dump(packet))
 		}
 
 		minLen := encryptedHeader + e.receiveAEAD.NonceSize() + e.receiveAEAD.Overhead()
@@ -237,7 +236,7 @@ func (e *EncryptedTransport) Receive(callback func([]byte)) {
 			e.recvFail.Add(1)
 			utils.Debugf("[CRYPTO] Recv DECRYPT FAIL dir=%d nonce=%s err=%v (recvFail=%d recvOK=%d)",
 				header[4], hex.EncodeToString(nonce), err, e.recvFail.Load(), e.recvOK.Load())
-			if utils.IsVerbose() && utils.Sensitive() {
+			if utils.IsVerbose() {
 				utils.Debugf("[CRYPTO] failed ciphertext hexdump:\n%s", hex.Dump(packet))
 			}
 			return

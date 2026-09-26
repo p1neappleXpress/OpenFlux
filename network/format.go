@@ -2,9 +2,12 @@ package network
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
+
+	"openflux/utils"
 )
 
 // PacketDirection is the arrow shown before the packet summary.
@@ -41,6 +44,19 @@ func (d PacketDirection) Arrow() string {
 // tcpdump-style output the project used before.
 func FormatPacket(dir PacketDirection, pkt []byte) string {
 	return fmt.Sprintf("%s%d bytes - %s", dir.Arrow(), len(pkt), summarize(pkt))
+}
+
+// LogPacket logs pkt as a FormatPacket line from debug level 1 (-d) up and
+// adds its hexdump at level 3 (-ddd). tag names the observer: "TUN", "L3",
+// "TUNNEL", "PKT". Each packet should be logged at one point per side.
+func LogPacket(tag string, dir PacketDirection, pkt []byte) {
+	if utils.Level() < utils.LevelPackets {
+		return
+	}
+	utils.Packetf("[%s] %s", tag, FormatPacket(dir, pkt))
+	if utils.IsVerbose() {
+		utils.Packetf("[%s] hexdump:\n%s", tag, hex.Dump(pkt))
+	}
 }
 
 // summarize is the shared body of DescribeIPv4 and FormatPacket.

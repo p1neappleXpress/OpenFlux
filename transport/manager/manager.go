@@ -248,19 +248,55 @@ func (m *Manager) UseCookieStore(store *transport.CookieStore, name, key string)
 	return nil
 }
 
-// AcceptCookies applies a jar to one transport and persists it, whether it
-// came from the peer over the control channel or from the local app (IPC).
+// AcceptCookies adds a jar to one transport's cookies and persists the
+// result, whether it came from the peer over the control channel or from
+// the local app (IPC). Incoming cookies win over kept ones of the same name,
+// but the rest stay: a check a client passed must not wipe an account
+// login the exit was given.
 func (m *Manager) AcceptCookies(name string, jar map[string]string) error {
-	if err := m.ApplyCookiesFor(name, jar); err != nil {
-		return err
-	}
 	m.mu.RLock()
 	store, key := m.store, m.cookieKeys[name]
 	m.mu.RUnlock()
+	var kept map[string]string
 	if store != nil && key != "" {
-		return store.Save(key, jar)
+		kept = store.Load(key)
+	}
+	if kept == nil {
+		kept, _ = m.FetchCookiesFor(name)
+	}
+	merged := make(map[string]string, len(kept)+len(jar))
+	for k, v := range kept {
+		merged[k] = v
+	}
+	for k, v := range jar {
+		merged[k] = v
+	}
+	if err := m.ApplyCookiesFor(name, merged); err != nil {
+		return err
+	}
+	if store != nil && key != "" {
+		return store.Save(key, merged)
 	}
 	return nil
+}
+
+// accountCookies are the Yandex cookies that carry a signed-in account.
+var accountCookies = map[string]bool{
+	"Session_id": true, "sessionid2": true, "sessar": true, "sessguard": true,
+	"L": true, "yandex_login": true, "lah": true, "mda2_beacon": true,
+}
+
+// shareableCookies is jar without account login cookies: what an exit may
+// hand to a client that asks. Clients need a passed check, never the
+// login of whoever set up the exit.
+func shareableCookies(jar map[string]string) map[string]string {
+	out := make(map[string]string, len(jar))
+	for k, v := range jar {
+		if !accountCookies[k] {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // cookieTransport resolves the transport a cookie message refers to: the
@@ -302,6 +338,7 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 			utils.Debugf("[MANAGER] fetch cookies (%s): %v", name, err)
 			return
 		}
+		jar = shareableCookies(jar)
 		body, _ := (&control.CookiesPayload{Transport: name, Jar: jar, Reason: "requested"}).Encode()
 		_ = m.SendControl(control.SubtypeCookiesResponse, body)
 	case control.SubtypeCookiesResponse, control.SubtypeCookiesOffer:
@@ -356,6 +393,9 @@ func (m *Manager) DispatchControl(sub control.Subtype, payload []byte) {
 			utils.Debugf("[MANAGER] bad AuthRequired payload: %v", err)
 			return
 		}
+		// The exit's side of that transport is stuck: stop routing through
+		// it here as well, the cookies that unstick it included.
+		m.session.MarkStalled(req.Transport)
 		m.mu.RLock()
 		cb := m.remoteAuth
 		m.mu.RUnlock()
@@ -485,6 +525,9 @@ func (m *Manager) SetCaptchaNotifier(n CaptchaNotifier) {
 // has to be passed from the exit's address anyway, so the report also goes
 // to the client over whichever carrier still reaches it.
 func (m *Manager) NotifyCaptcha(name, url, reason string) {
+	// A transport waiting on a check carries nothing; route around it,
+	// and in particular do not send its own AuthRequired through it.
+	m.session.MarkStalled(name)
 	m.mu.RLock()
 	n := m.captchaNotifier
 	m.mu.RUnlock()

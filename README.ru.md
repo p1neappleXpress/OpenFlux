@@ -537,8 +537,10 @@ URL = YOUR_YANDEX_DOC_URL
 | `--url` | `-u` | `http://#` | URL документа |
 | `--socks5` | `-s` | `:1080` | Адрес SOCKS5-прокси |
 | `--local-ip` | `-l` | (авто) | Egress IP для l3 SNAT / фильтра RST |
-| `--debug` | `-d` | `false` | Подробное per-packet логирование |
+| `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: строка на каждый пакет (`-> 52 bytes - UDP ...`); `2`: плюс рабочие логи; `3`: плюс hexdump |
+| `--sensitive` | | `false` | Ещё и ключи, а с `-ddd` — расшифрованные фреймы (куки, токены) |
 | `--encryption-key-file` | | | Файл с общим секретом для AES-256-GCM |
+| `--session-context` | | (вычисляется) | KDF-контекст ключа; по умолчанию `--url`, иначе URL транспорта с наивысшим приоритетом, иначе `http://#` |
 | `--maxToken` | | | Токен авторизации MAX (`--transport=oneme`) |
 | `--maxUid` | | | ID пользователя MAX (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | Сколько MB залить (`--role=bench-send`) |

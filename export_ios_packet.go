@@ -88,6 +88,7 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	outQ := make(chan []byte, 1024)
 	// Packets coming back from the exit node -> queue for the device.
 	t.Receive(func(data []byte) {
+		network.LogPacket("PKT", network.DirInbound, data)
 		select {
 		case outQ <- append([]byte(nil), data...):
 		default: // queue full: drop, TCP will retransmit
@@ -140,6 +141,7 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 		return
 	}
 	pkt = pkt[:total]
+	network.LogPacket("PKT", network.DirOutbound, pkt)
 	switch pkt[9] { // protocol
 	case 6: // TCP
 		t.Send(pkt)

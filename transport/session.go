@@ -27,7 +27,7 @@ type Session struct {
 	stopped          bool
 	sequence         uint64
 	highest          uint64
-	window           uint64
+	window           replayWindow
 	handshakeTimeout time.Duration
 
 	helloInterval time.Duration
@@ -53,17 +53,17 @@ type Session struct {
 	wg   sync.WaitGroup
 
 	// Counters for diagnostics.
-	cntHelloSent    atomic.Uint64
-	cntHelloRecv    atomic.Uint64
-	cntHelloAccept  atomic.Uint64
-	cntHelloReject  atomic.Uint64
-	cntDataSent     atomic.Uint64
-	cntDataRecv     atomic.Uint64
-	cntDataDrop     atomic.Uint64
-	cntCtrlSent     atomic.Uint64
-	cntCtrlRecv     atomic.Uint64
-	cntDecodeErr    atomic.Uint64
-	cntUnknownKind  atomic.Uint64
+	cntHelloSent   atomic.Uint64
+	cntHelloRecv   atomic.Uint64
+	cntHelloAccept atomic.Uint64
+	cntHelloReject atomic.Uint64
+	cntDataSent    atomic.Uint64
+	cntDataRecv    atomic.Uint64
+	cntDataDrop    atomic.Uint64
+	cntCtrlSent    atomic.Uint64
+	cntCtrlRecv    atomic.Uint64
+	cntDecodeErr   atomic.Uint64
+	cntUnknownKind atomic.Uint64
 }
 
 type candidatePeer struct {
@@ -294,6 +294,7 @@ func (s *Session) startLink(link *transportLink) error {
 
 	s.mu.Lock()
 	stopped := s.stopped
+	ready := s.ready
 	if !stopped {
 		link.started = true
 	}
@@ -302,6 +303,12 @@ func (s *Session) startLink(link *transportLink) error {
 		_ = link.batched.Stop()
 		_ = link.raw.Stop()
 		return errors.New("session stopped")
+	}
+	// A carrier that comes up in an established session (e.g. once a check
+	// was passed) is probed at once: the pong marks it heard, instead of it
+	// waiting for the next keepalive tick.
+	if ready {
+		go func() { _ = s.sendControlVia(link, control.SubtypeLinkPing, nil) }()
 	}
 	return nil
 }
@@ -425,7 +432,7 @@ func (s *Session) resetLocked() {
 	s.ready = false
 	s.peer = [32]byte{}
 	s.remote = PeerParameters{}
-	s.sequence, s.highest, s.window = 0, 0, 0
+	s.sequence, s.highest, s.window = 0, 0, replayWindow{}
 	s.peerKeepalive = false
 	s.candidate = nil
 	if _, err := rand.Read(s.local[:]); err != nil {
@@ -497,11 +504,17 @@ func (s *Session) anyLive() bool {
 	return len(s.liveLinksLocked()) > 0
 }
 
-func (s *Session) liveLocked(l *transportLink) bool {
-	if l == nil || l.dead || !l.started || !l.raw.IsConnected() {
-		return false
-	}
-	return !s.peerKeepalive || time.Since(l.lastHeard) < s.linkTimeout
+// connectedLocked reports whether a carrier is up on this side.
+// Caller holds s.mu.
+func (s *Session) connectedLocked(l *transportLink) bool {
+	return l != nil && !l.dead && l.started && l.raw.IsConnected()
+}
+
+// heardLocked reports whether the peer was heard on a carrier within
+// linkTimeout: the carrier is known to work both ways, not just to be
+// attached to its document on this side. Caller holds s.mu.
+func (s *Session) heardLocked(l *transportLink) bool {
+	return s.connectedLocked(l) && time.Since(l.lastHeard) < s.linkTimeout
 }
 
 func (s *Session) ActiveTransport() string {
@@ -638,16 +651,31 @@ func (s *Session) Send(p []byte) error {
 	if n == 1 || n%100 == 0 {
 		utils.Debugf("[SESSION] send IPv4 #%d seq=%d via %q size=%d proto=%d", n, seq, chosen.name, len(p), p[9])
 	}
-	if utils.IsVerbose() && utils.Sensitive() {
-		utils.Debugf("[SESSION] send IPv4 hexdump:\n%s", hex.Dump(p))
-	}
 	return chosen.batched.Send(raw)
 }
 
+// liveLinksLocked returns the carriers to route through, in priority order.
+//
+// Carriers the peer has been heard on come first; a carrier that is merely
+// connected on this side may be stuck on the other (a document attached
+// while the peer's side waits on a captcha), and ranking it by priority
+// alone sends everything into it until keepalives catch up. Only when no
+// carrier has been heard lately (a peer that predates keepalive and is
+// idle, or the heard ones just went away) do connected carriers stand in,
+// so sending is still tried rather than refused.
+// Caller holds s.mu.
 func (s *Session) liveLinksLocked() []*transportLink {
 	out := make([]*transportLink, 0, len(s.links))
 	for _, name := range s.order {
-		if l := s.links[name]; s.liveLocked(l) {
+		if l := s.links[name]; s.heardLocked(l) {
+			out = append(out, l)
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	for _, name := range s.order {
+		if l := s.links[name]; s.connectedLocked(l) {
 			out = append(out, l)
 		}
 	}
@@ -699,7 +727,7 @@ func (s *Session) sendControlVia(link *transportLink, subtype control.Subtype, p
 	n := s.cntCtrlSent.Add(1)
 	utils.Debugf("[SESSION] control #%d -> %q subtype=0x%02x payloadLen=%d size=%d",
 		n, link.name, subtype, len(payload), len(raw))
-	if utils.IsVerbose() {
+	if utils.IsVerbose() && utils.Sensitive() {
 		utils.Debugf("[SESSION] control hexdump:\n%s", hex.Dump(raw))
 	}
 	return link.batched.Send(raw)
@@ -737,7 +765,7 @@ func (s *Session) receive(link *transportLink, p []byte) {
 		s.cntDecodeErr.Add(1)
 		utils.Debugf("[SESSION] decode error #%d from %q (%d bytes): %v",
 			s.cntDecodeErr.Load(), link.name, len(p), err)
-		if utils.IsVerbose() {
+		if utils.IsVerbose() && utils.Sensitive() {
 			utils.Debugf("[SESSION] malformed packet hexdump:\n%s", hex.Dump(p))
 		}
 		return
@@ -761,7 +789,7 @@ func (s *Session) receive(link *transportLink, p []byte) {
 		s.cntUnknownKind.Add(1)
 		utils.Debugf("[SESSION] unknown kind 0x%02x #%d from %q, ignoring",
 			env.Kind, s.cntUnknownKind.Load(), link.name)
-		if utils.IsVerbose() {
+		if utils.IsVerbose() && utils.Sensitive() {
 			utils.Debugf("[SESSION] unknown-kind hexdump:\n%s", hex.Dump(p))
 		}
 	}
@@ -877,7 +905,7 @@ func (s *Session) offerReplacementLocked(link *transportLink, sender [32]byte, p
 			Capabilities:  params.Capabilities & s.params.Capabilities,
 			MaxPacketSize: minInt(params.MaxPacketSize, s.params.MaxPacketSize),
 		}
-		s.sequence, s.highest, s.window = 0, 0, 0
+		s.sequence, s.highest, s.window = 0, 0, replayWindow{}
 		s.peerKeepalive = false
 		s.candidate = nil
 		for _, l := range s.links {
@@ -1027,7 +1055,7 @@ func (s *Session) receiveControl(link *transportLink, p []byte, env *control.Env
 	n := s.cntCtrlRecv.Add(1)
 	utils.Debugf("[SESSION] control #%d from %q subtype=0x%02x payloadLen=%d",
 		n, link.name, sub, env.Control.PayloadLen)
-	if utils.IsVerbose() {
+	if utils.IsVerbose() && utils.Sensitive() {
 		utils.Debugf("[SESSION] control payload hexdump:\n%s", hex.Dump(p))
 	}
 	if cb == nil {
@@ -1038,26 +1066,57 @@ func (s *Session) receiveControl(link *transportLink, p []byte, env *control.Env
 	go cb(sub, payload)
 }
 
+// replayWindowSize is how far behind the newest sequence a data packet may
+// arrive and still be accepted once. Carriers of equal priority share
+// flows and can differ in latency by hundreds of milliseconds, thousands
+// of packets at speed, and cupsonline reorders whole batches across its
+// rooms; a 64-packet window dropped nearly all a slower carrier delivered.
+const replayWindowSize = 4096
+
+// replayWindow is a ring of bits, one per sequence number within
+// replayWindowSize of the newest one: set once that sequence was accepted.
+type replayWindow [replayWindowSize / 64]uint64
+
+func (w *replayWindow) has(seq uint64) bool {
+	i := seq % replayWindowSize
+	return w[i/64]&(1<<(i%64)) != 0
+}
+
+func (w *replayWindow) set(seq uint64) {
+	i := seq % replayWindowSize
+	w[i/64] |= 1 << (i % 64)
+}
+
+func (w *replayWindow) clear(seq uint64) {
+	i := seq % replayWindowSize
+	w[i/64] &^= 1 << (i % 64)
+}
+
+// acceptSequenceLocked accepts each sequence number at most once, and only
+// within replayWindowSize of the newest one seen. Caller holds s.mu.
 func (s *Session) acceptSequenceLocked(seq uint64) bool {
 	if seq == 0 {
 		return false
 	}
 	if seq > s.highest {
-		gap := seq - s.highest
-		if gap >= 64 {
-			s.window = 0
+		// The slots of the numbers skipped over still hold bits from a
+		// full turn of the ring ago.
+		if seq-s.highest >= replayWindowSize {
+			s.window = replayWindow{}
 		} else {
-			s.window <<= gap
+			for n := s.highest + 1; n < seq; n++ {
+				s.window.clear(n)
+			}
 		}
 		s.highest = seq
-		s.window |= 1
+		s.window.clear(seq)
+		s.window.set(seq)
 		return true
 	}
-	gap := s.highest - seq
-	if gap >= 64 || s.window&(uint64(1)<<gap) != 0 {
+	if s.highest-seq >= replayWindowSize || s.window.has(seq) {
 		return false
 	}
-	s.window |= uint64(1) << gap
+	s.window.set(seq)
 	return true
 }
 
@@ -1080,6 +1139,19 @@ func (s *Session) Stats() TransportStats {
 	}
 	out.Connected = s.IsConnected()
 	return out
+}
+
+// MarkStalled forgets that the peer was heard on a carrier, so routing
+// prefers the others until something arrives on it again. It is for a
+// carrier known to be stuck, e.g. one that reported a captcha: it may stay
+// connected while nothing gets through.
+func (s *Session) MarkStalled(name string) {
+	s.mu.Lock()
+	if l, ok := s.links[name]; ok && !l.lastHeard.IsZero() {
+		l.lastHeard = time.Time{}
+		utils.Debugf("[SESSION] %q stalled: routing around it until the peer is heard on it", name)
+	}
+	s.mu.Unlock()
 }
 
 func (s *Session) MarkDead(name string) {
