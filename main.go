@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -44,10 +46,18 @@ func expandShortFlags(args []string) []string {
 		"-u": "--url",
 		"-s": "--socks5",
 		"-l": "--local-ip",
-		"-d": "--debug",
 	}
 	out := make([]string, 0, len(args))
 	for _, a := range args {
+		// Counted debug flag: -d -> --debug=1, -dd -> --debug=2, -ddd -> 2.
+		if strings.HasPrefix(a, "-d") && !strings.HasPrefix(a, "--") {
+			n := len(a) - 1
+			if n > 2 {
+				n = 2
+			}
+			out = append(out, fmt.Sprintf("--debug=%d", n))
+			continue
+		}
 		replaced := false
 		for short, long := range aliases {
 			if a == short {
@@ -107,6 +117,54 @@ func cookieKey(transportType, docURL, maxUid string) string {
 	}
 }
 
+// pickSessionContext returns the KDF salt used to derive encryption keys.
+// The same value must be produced on both peers, regardless of how the
+// document URL was supplied (--url, --yandex-url, [Transport] URL, ...).
+//
+// Priority:
+//
+//	explicit          --session-context, if non-empty
+//	--url             globalURL, if non-empty and not the placeholder
+//	--<type>-url      first non-empty per-transport URL flag
+//	[Transport] URL   first non-empty URL from a .conf section
+//	fallback          transportType, or "openflux" if that is empty too
+//
+// The placeholder "http://#" (the default value of --url) is treated as
+// "not set" so it never becomes part of the KDF input.
+func pickSessionContext(
+	explicit, globalURL string,
+	yandexURL, vyandexURL, boardsURL, mailruURL, cupsonlineURL string,
+	confTransports []transportSpec,
+	transportType string,
+) string {
+	const placeholder = "http://#"
+	if explicit != "" {
+		return explicit
+	}
+	if globalURL != "" && globalURL != placeholder {
+		return globalURL
+	}
+	for _, u := range []string{yandexURL, vyandexURL, boardsURL, mailruURL, cupsonlineURL} {
+		if u != "" {
+			return u
+		}
+	}
+	for _, s := range confTransports {
+		if s.URL != "" {
+			return s.URL
+		}
+	}
+	if transportType != "" {
+		return transportType
+	}
+	return "openflux"
+}
+
+func sha256ShortHex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:8])
+}
+
 // managerRefreshLoop periodically asks the exit node for a fresh cookie jar.
 // Runs on the client side only, when --transports or --negotiate is set.
 func managerRefreshLoop(m *manager.Manager) {
@@ -141,6 +199,10 @@ func main() {
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+	sessionContextFlag := flag.String("session-context", "",
+		"Explicit KDF context for --encryption-key-file. Both peers must use the same value. "+
+			"Default: derived from the document URL (--url, any --<type>-url, or [Transport] URL "+
+			"from --config), falling back to --transport. Only set this to override that derivation.")
 
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
@@ -149,7 +211,7 @@ func main() {
 	directListen := flag.String("direct-listen", "", "DirectTransport: local address to listen on (exit). Requires --encryption-key-file")
 	transportsFlag := flag.String("transports", "",
 		"Comma-separated list of transports with priorities, e.g. "+
-			"\"direct:100,yandex:50,mailru:30\". If empty, --transport is used as a single transport.")
+			"\"direct:100,yandex:50\". If empty, --transport is used as a single transport.")
 	yandexURL := flag.String("yandex-url", "", "URL for the yandex transport (overrides --url in --transports mode)")
 	vyandexURL := flag.String("vyandex-url", "", "URL for the vyandex transport")
 	boardsURL := flag.String("boards-url", "", "URL for the boards transport")
@@ -172,7 +234,8 @@ func main() {
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
 
-	debug := flag.Bool("debug", false, "Enable verbose debug logging")
+	debug := flag.Int("debug", 0, "Debug level: 1 (default with -d), 2 (hexdump with -dd)")
+	sensitive := flag.Bool("sensitive", false, "Include sensitive data (session keys, secret bytes, plaintext, cookie jars) in logs")
 
 	// Deprecated aliases, kept for one release to ease migration.
 	depClient := flag.Bool("client", false, "DEPRECATED: use --role=client")
@@ -243,6 +306,9 @@ TRANSPORT MODIFIERS
                                AES-256-GCM wrapper. Required with
                                --transports or --negotiate. Both peers
                                must share the same key.
+      --session-context=<str>  Explicit KDF context for that key. Both peers
+                               must use the same value. Default: derived from
+                               the document URL, falling back to --transport.
       --negotiate              Require authenticated capability negotiation
                                on both peers. No legacy fallback.
       --max-packet-size=N      Max IPv4 packet in negotiated mode
@@ -278,6 +344,11 @@ DEPRECATED (removed in v2)
 
 	// Apply .conf file if requested. Only flags that were not explicitly set
 	// on the command line are overridden.
+	//
+	// confTransports is declared at function scope (not inside the if) so
+	// pickSessionContext can see it below: a .conf-only deployment has no
+	// --url/--yandex-url and its document URL lives in the [Transport]
+	// sections, which must still contribute to the KDF context.
 	var confTransports []transportSpec
 	if *configPath != "" {
 		conf, err := parseConf(*configPath)
@@ -294,11 +365,19 @@ DEPRECATED (removed in v2)
 		applyConfString(conf.Interface, "Codec", "codec", codec, setFlags)
 		applyConfString(conf.Interface, "Socks5", "socks5", socksAddr, setFlags)
 		applyConfString(conf.Interface, "EncryptionKeyFile", "encryption-key-file", encryptionKeyFile, setFlags)
+		applyConfString(conf.Interface, "SessionContext", "session-context", sessionContextFlag, setFlags)
 		applyConfString(conf.Interface, "CookieStore", "cookie-store", cookieStorePath, setFlags)
 		applyConfString(conf.Interface, "IPCSocket", "ipc-socket", ipcSocketPath, setFlags)
 		applyConfString(conf.Interface, "URL", "url", &globalDocUrl, setFlags)
 		if v, ok := confValue(conf.Interface, "Debug"); ok && !setFlags["debug"] {
-			*debug = confBool(v, *debug)
+			if b, err := strconv.Atoi(v); err == nil {
+				*debug = b
+			} else if confBool(v, false) {
+				*debug = 1
+			}
+		}
+		if v, ok := confValue(conf.Interface, "Sensitive"); ok && !setFlags["sensitive"] {
+			*sensitive = confBool(v, *sensitive)
 		}
 
 		for _, t := range conf.Transports {
@@ -421,9 +500,13 @@ DEPRECATED (removed in v2)
 		godebug.SetGCPercent(20)
 	}
 
-	if *debug {
-		utils.EnableDebug()
+	if *debug > 0 {
+		utils.SetLevel(*debug)
 	}
+	if *sensitive {
+		utils.SetSensitive(true)
+	}
+	utils.Debugf("[INIT] debug level=%d sensitive=%v", utils.Level(), utils.Sensitive())
 
 	log.Printf("=== Universal Bypass Tool ===")
 	log.Printf("Role: %s", *role)
@@ -480,7 +563,7 @@ DEPRECATED (removed in v2)
 			"mailru":     *mailruURL,
 			"cupsonline": *cupsonlineURL,
 		}
-		if globalDocUrl != "" && urls["yandex"] == "" {
+		if globalDocUrl != "" && globalDocUrl != "http://#" && urls["yandex"] == "" {
 			urls["yandex"] = globalDocUrl
 		}
 		extra := map[string]map[string]interface{}{
@@ -519,6 +602,22 @@ DEPRECATED (removed in v2)
 	}
 
 	// Encryption secret is mandatory when --negotiate is set.
+	//
+	// The session context is the KDF salt for the encryption keys and MUST
+	// be identical on both peers. It is derived from the document URL,
+	// because two peers that use different documents cannot talk to each
+	// other anyway. pickSessionContext reads whichever way the operator
+	// actually supplied that URL, in priority order:
+	//
+	//   1. --session-context   (explicit override, highest priority)
+	//   2. --url               (single-transport and --transports)
+	//   3. any --<type>-url    (yandex/vyandex/boards/mailru/cupsonline)
+	//   4. [Transport "x"] URL from a .conf file
+	//   5. --transport          (last resort, e.g. direct or oneme)
+	//
+	// Before this, only --url was consulted, so a run using --yandex-url
+	// (or a .conf section) silently fell back to the placeholder default
+	// "http://#" and produced a different key on each side.
 	var secret string
 	var sessionContext string
 	if *encryptionKeyFile != "" {
@@ -527,10 +626,27 @@ DEPRECATED (removed in v2)
 			log.Fatalf("Read encryption key file: %v", err)
 		}
 		secret = strings.TrimSpace(string(b))
+		if len(secret) < 16 {
+			log.Fatalf("Encryption key from %s is too short (%d chars, need at least 16)",
+				*encryptionKeyFile, len(secret))
+		}
+		if strings.ContainsAny(secret, "\r\n\t") {
+			utils.Debugf("[KEY] WARNING: secret still contains whitespace after TrimSpace; lengths may differ across platforms")
+		}
+		utils.Debugf("[KEY] loaded from %s: len=%d sha256=%s",
+			*encryptionKeyFile, len(secret), utils.Sha256Hex([]byte(secret)))
 	}
-	sessionContext = *transportType
-	if globalDocUrl != "" {
-		sessionContext = globalDocUrl
+
+	sessionContext = pickSessionContext(
+		*sessionContextFlag,
+		globalDocUrl,
+		*yandexURL, *vyandexURL, *boardsURL, *mailruURL, *cupsonlineURL,
+		confTransports,
+		*transportType,
+	)
+	if *encryptionKeyFile != "" {
+		utils.Debugf("[KEY] context=%q sha256=%s (MUST match on both peers)",
+			sessionContext, utils.Sha256Hex([]byte(sessionContext)))
 	}
 
 	// Decide whether we run the full Session path (encryption + negotiate)

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"openflux/network"
 	"openflux/utils"
 )
 
@@ -79,6 +80,7 @@ func (s *SOCKS5Server) Start() error {
 			utils.Debugf("[SOCKS5] Accept error: %v", err)
 			continue
 		}
+		utils.Debugf("[SOCKS5] <- accept %s", conn.RemoteAddr())
 		go s.handleConnection(conn)
 	}
 }
@@ -115,8 +117,6 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		s.mu.Unlock()
 	}()
 	_ = clientConn.SetDeadline(time.Now().Add(10 * time.Second))
-	// A malformed request must never crash the host process; contain any
-	// panic to this connection.
 	defer func() {
 		if r := recover(); r != nil {
 			utils.Debugf("[SOCKS5] Recovered from panic in handler: %v", r)
@@ -169,7 +169,6 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 }
 
 func (s *SOCKS5Server) handleConnect(clientConn net.Conn, targetAddr string) {
-
 	utils.Debugf("[SOCKS5] CONNECT %s", targetAddr)
 
 	targetConn, err := s.dialer.DialTCP(targetAddr)
@@ -190,13 +189,15 @@ func (s *SOCKS5Server) handleConnect(clientConn net.Conn, targetAddr string) {
 	go func() {
 		defer wg.Done()
 		defer targetConn.Close()
-		io.Copy(targetConn, clientConn)
+		n, _ := io.Copy(targetConn, clientConn)
+		utils.Debugf("[SOCKS5] -> remote %s sent %d bytes", targetAddr, n)
 	}()
 
 	go func() {
 		defer wg.Done()
 		defer clientConn.Close()
-		io.Copy(clientConn, targetConn)
+		n, _ := io.Copy(clientConn, targetConn)
+		utils.Debugf("[SOCKS5] <- remote %s received %d bytes", targetAddr, n)
 	}()
 
 	wg.Wait()
@@ -216,7 +217,6 @@ func (s *SOCKS5Server) handleUDPAssociate(control net.Conn, requestedAddr string
 	requestedIP := net.ParseIP(requestedHost)
 	var requestedPort int
 	_, _ = fmt.Sscanf(requestedService, "%d", &requestedPort)
-	// Do not resolve the association's source address using local DNS.
 	if requestedIP == nil {
 		_ = writeReply(control, 0x08, nil)
 		return
@@ -297,7 +297,6 @@ func (s *SOCKS5Server) handleUDPAssociate(control net.Conn, requestedAddr string
 					flowsMu.Unlock()
 					continue
 				}
-				// Dial outside the lock so shutdown can close existing flows.
 				flowsMu.Unlock()
 				conn, err := dialer.DialUDP(dest)
 				flowsMu.Lock()
@@ -356,6 +355,12 @@ func (s *SOCKS5Server) handleUDPAssociate(control net.Conn, requestedAddr string
 	})
 
 	_, _ = io.Copy(io.Discard, control)
+}
+
+// formatUDPBytes is a helper that renders an opaque UDP payload as a
+// "UDP <src> -> <dst> len=N" line without full IPv4 parsing.
+func formatUDPBytes(dir network.PacketDirection, src, dst string, n int) string {
+	return fmt.Sprintf("%s%d bytes - UDP %s -> %s", dir.Arrow(), n, src, dst)
 }
 
 func readAddress(r io.Reader, atyp byte) (string, error) {

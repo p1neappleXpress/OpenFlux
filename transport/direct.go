@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -106,6 +107,12 @@ type DirectTransport struct {
 	// Stats not tracked by BaseTransport directly.
 	reconnects atomic.Uint64
 	drops      atomic.Uint64
+
+	// Counters for verbose logging.
+	bytesIn   atomic.Uint64
+	bytesOut  atomic.Uint64
+	recordsIn atomic.Uint64
+	recordsOut atomic.Uint64
 }
 
 // NewDirectTransport builds a DirectTransport from a base config and a
@@ -119,12 +126,17 @@ func NewDirectTransport(base TransportConfig, cfg DirectConfig) *DirectTransport
 		done:          make(chan struct{}),
 		queue:         make(chan []byte, base.MaxQueueSize),
 	}
+	utils.Debugf("[DIRECT] created: isExit=%v listen=%q dial=%q handshakeTimeout=%v readTimeout=%v keepAlive=%v maxRecord=%d queueCap=%d",
+		cfg.IsExit, cfg.ListenAddr, cfg.DialAddr, cfg.HandshakeTimeout, cfg.ReadTimeout,
+		cfg.KeepAliveInterval, cfg.MaxRecordBytes, base.MaxQueueSize)
 	return t
 }
 
 // Start launches the accept (exit) or dial (client) loop.
 func (t *DirectTransport) Start() error {
+	utils.Debugf("[DIRECT] Start() called: isExit=%v", t.config.IsExit)
 	if err := t.BaseTransport.Start(); err != nil {
+		utils.Debugf("[DIRECT] Start: BaseTransport.Start failed: %v", err)
 		return err
 	}
 
@@ -133,35 +145,43 @@ func (t *DirectTransport) Start() error {
 		if addr == "" {
 			addr = "0.0.0.0:0"
 		}
+		utils.Debugf("[DIRECT] exit: binding listener on %s", addr)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
+			utils.Debugf("[DIRECT] exit: listen %s failed: %v", addr, err)
 			return fmt.Errorf("direct: listen %s: %w", addr, err)
 		}
 		t.listener = ln
-		utils.Debugf("[DIRECT] exit listening on %s", ln.Addr().String())
+		utils.Debugf("[DIRECT] exit listening on %s (waiting for a client)", ln.Addr().String())
 		go t.acceptLoop()
 	} else {
 		if t.config.DialAddr == "" {
+			utils.Debugf("[DIRECT] client: DialAddr is empty, refusing to start")
 			return fmt.Errorf("direct: DialAddr is empty")
 		}
+		utils.Debugf("[DIRECT] client: starting dial loop to %s", t.config.DialAddr)
 		go t.dialLoop()
 	}
 
 	go t.writerLoop()
+	utils.Debugf("[DIRECT] Start: loops launched")
 	return nil
 }
 
 // Stop closes the listener, the active connection and the outbound queue.
 func (t *DirectTransport) Stop() error {
+	utils.Debugf("[DIRECT] Stop() called")
 	t.once.Do(func() {
 		close(t.done)
 	})
 	t.mu.Lock()
 	if t.listener != nil {
+		utils.Debugf("[DIRECT] Stop: closing listener %s", t.listener.Addr().String())
 		_ = t.listener.Close()
 		t.listener = nil
 	}
 	if t.conn != nil {
+		utils.Debugf("[DIRECT] Stop: closing active conn %s", connDesc(t.conn))
 		_ = t.conn.Close()
 		t.conn = nil
 	}
@@ -177,18 +197,27 @@ func (t *DirectTransport) Stop() error {
 // A full queue drops the datagram; upper layers (TCP) retransmit, UDP loses.
 func (t *DirectTransport) Send(data []byte) error {
 	if !t.IsRunning() {
+		utils.Debugf("[DIRECT] Send: not running, dropping %d bytes", len(data))
 		return fmt.Errorf("direct: not running")
 	}
 	if len(data) == 0 || len(data) > t.config.MaxRecordBytes {
+		utils.Debugf("[DIRECT] Send: bad size %d (max %d)", len(data), t.config.MaxRecordBytes)
 		return fmt.Errorf("direct: record size %d outside 1..%d", len(data), t.config.MaxRecordBytes)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	select {
 	case t.queue <- cp:
+		utils.Debugf("[DIRECT] Send: enqueued %d bytes (queue %d/%d)",
+			len(cp), len(t.queue), cap(t.queue))
+		if utils.IsVerbose() {
+			utils.Debugf("[DIRECT] Send hexdump (%d bytes):\n%s", len(cp), hex.Dump(cp))
+		}
 		return nil
 	default:
 		t.drops.Add(1)
+		utils.Debugf("[DIRECT] Send: QUEUE FULL, dropped %d bytes (drops=%d)",
+			len(cp), t.drops.Load())
 		return fmt.Errorf("direct: queue full")
 	}
 }
@@ -196,6 +225,7 @@ func (t *DirectTransport) Send(data []byte) error {
 // Receive installs the user callback. DirectTransport forwards every framed
 // record it reads from the wire.
 func (t *DirectTransport) Receive(cb func([]byte)) {
+	utils.Debugf("[DIRECT] Receive: callback installed")
 	t.BaseTransport.Receive(cb)
 }
 
@@ -218,26 +248,30 @@ func (t *DirectTransport) Drops() uint64 { return t.drops.Load() }
 // ---- exit mode ----
 
 func (t *DirectTransport) acceptLoop() {
+	utils.Debugf("[DIRECT] acceptLoop: started on %s", t.listener.Addr().String())
 	for {
 		select {
 		case <-t.done:
+			utils.Debugf("[DIRECT] acceptLoop: done signal, exiting")
 			return
 		default:
 		}
 
+		utils.Debugf("[DIRECT] acceptLoop: blocking on Accept()")
 		conn, err := t.listener.Accept()
 		if err != nil {
 			select {
 			case <-t.done:
+				utils.Debugf("[DIRECT] acceptLoop: Accept failed after close: %v", err)
 				return
 			default:
 			}
-			utils.Debugf("[DIRECT] accept: %v", err)
+			utils.Debugf("[DIRECT] acceptLoop: Accept error: %v", err)
 			continue
 		}
-		utils.Debugf("[DIRECT] accepted %s", conn.RemoteAddr())
+		utils.Debugf("[DIRECT] acceptLoop: ACCEPTED %s", connDesc(conn))
 		t.serveConn(conn)
-		// After serveConn returns, loop and accept the next peer.
+		utils.Debugf("[DIRECT] acceptLoop: serveConn returned, looping back")
 	}
 }
 
@@ -248,25 +282,42 @@ func (t *DirectTransport) dialLoop() {
 	if delay <= 0 {
 		delay = 200 * time.Millisecond
 	}
+	utils.Debugf("[DIRECT] dialLoop: started, initial delay=%v", delay)
+	attempt := 0
 	for {
 		select {
 		case <-t.done:
+			utils.Debugf("[DIRECT] dialLoop: done signal, exiting")
 			return
 		default:
 		}
 
+		attempt++
+		utils.Debugf("[DIRECT] dialLoop: attempt #%d dialing %s (timeout=%v)",
+			attempt, t.config.DialAddr, t.config.HandshakeTimeout)
 		d := net.Dialer{Timeout: t.config.HandshakeTimeout}
+		start := time.Now()
 		conn, err := d.Dial("tcp", t.config.DialAddr)
+		elapsed := time.Since(start)
 		if err != nil {
-			utils.Debugf("[DIRECT] dial %s: %v", t.config.DialAddr, err)
+			utils.Debugf("[DIRECT] dialLoop: DIAL FAILED after %v: %v", elapsed, err)
 		} else {
-			utils.Debugf("[DIRECT] connected to %s", t.config.DialAddr)
+			utils.Debugf("[DIRECT] dialLoop: CONNECTED to %s in %v (local=%s remote=%s)",
+				t.config.DialAddr, elapsed, connDesc(conn),
+				conn.RemoteAddr().String())
 			t.serveConn(conn)
 			t.reconnects.Add(1)
+			utils.Debugf("[DIRECT] dialLoop: serveConn returned (reconnects=%d)", t.reconnects.Load())
+			delay = t.config.ReconnectMinDelay
+			if delay <= 0 {
+				delay = 200 * time.Millisecond
+			}
 		}
 
+		utils.Debugf("[DIRECT] dialLoop: waiting %v before next attempt", delay)
 		select {
 		case <-t.done:
+			utils.Debugf("[DIRECT] dialLoop: done signal during wait, exiting")
 			return
 		case <-time.After(delay):
 		}
@@ -280,11 +331,13 @@ func (t *DirectTransport) dialLoop() {
 // ---- shared conn lifecycle ----
 
 func (t *DirectTransport) serveConn(conn net.Conn) {
+	utils.Debugf("[DIRECT] serveConn: begin %s", connDesc(conn))
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 		if t.config.KeepAliveInterval > 0 {
 			_ = tc.SetKeepAlive(true)
 			_ = tc.SetKeepAlivePeriod(t.config.KeepAliveInterval)
+			utils.Debugf("[DIRECT] serveConn: TCP no-delay + keepalive=%v set", t.config.KeepAliveInterval)
 		}
 	}
 
@@ -292,8 +345,10 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 	t.conn = conn
 	t.mu.Unlock()
 	t.SetConnected(true)
+	utils.Debugf("[DIRECT] serveConn: connected=%v", t.IsConnected())
 
 	defer func() {
+		utils.Debugf("[DIRECT] serveConn: tearing down %s", connDesc(conn))
 		t.mu.Lock()
 		if t.conn == conn {
 			t.conn = nil
@@ -307,6 +362,7 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 	for {
 		select {
 		case <-t.done:
+			utils.Debugf("[DIRECT] serveConn: done signal, exiting read loop")
 			return
 		default:
 		}
@@ -314,25 +370,39 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 		if t.config.ReadTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(t.config.ReadTimeout))
 		}
+		utils.Debugf("[DIRECT] serveConn: waiting for 2-byte header")
 		if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-			if err != io.EOF {
-				utils.Debugf("[DIRECT] read header: %v", err)
+			if err == io.EOF {
+				utils.Debugf("[DIRECT] serveConn: peer closed (EOF) while reading header")
+			} else {
+				utils.Debugf("[DIRECT] serveConn: read header failed: %v", err)
 			}
 			return
 		}
 		n := int(buf[0])<<8 | int(buf[1])
+		utils.Debugf("[DIRECT] serveConn: header says record length=%d", n)
 		if n == 0 || n > t.config.MaxRecordBytes {
-			utils.Debugf("[DIRECT] invalid record length %d", n)
+			utils.Debugf("[DIRECT] serveConn: INVALID record length %d (max %d), closing",
+				n, t.config.MaxRecordBytes)
 			return
 		}
+		utils.Debugf("[DIRECT] serveConn: reading body (%d bytes)", n)
 		if _, err := io.ReadFull(conn, buf[:n]); err != nil {
-			utils.Debugf("[DIRECT] read body: %v", err)
+			utils.Debugf("[DIRECT] serveConn: read body failed after %d/%d bytes: %v",
+				len(buf[:n]), n, err)
 			return
+		}
+		utils.Debugf("[DIRECT] serveConn: received record #%d size=%d",
+			t.recordsIn.Load()+1, n)
+		if utils.IsVerbose() {
+			utils.Debugf("[DIRECT] serveConn: record hexdump:\n%s", hex.Dump(buf[:n]))
 		}
 
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 		t.RecordReceive(n)
+		t.bytesIn.Add(uint64(n))
+		t.recordsIn.Add(1)
 		t.CallReceive(pkt)
 	}
 }
@@ -340,14 +410,18 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 // ---- writer ----
 
 func (t *DirectTransport) writerLoop() {
+	utils.Debugf("[DIRECT] writerLoop: started")
 	var pending []byte
 	for {
 		if pending == nil {
 			select {
 			case <-t.done:
+				utils.Debugf("[DIRECT] writerLoop: done signal, exiting")
 				return
 			case pkt := <-t.queue:
 				pending = pkt
+				utils.Debugf("[DIRECT] writerLoop: dequeued %d bytes (queue %d/%d)",
+					len(pkt), len(t.queue), cap(t.queue))
 			}
 		}
 
@@ -355,9 +429,11 @@ func (t *DirectTransport) writerLoop() {
 		conn := t.conn
 		t.mu.RUnlock()
 		if conn == nil {
-			// Mid-reconnect: hold the packet and retry rather than drop it.
+			utils.Debugf("[DIRECT] writerLoop: no active conn, holding %d bytes; retrying in 20ms",
+				len(pending))
 			select {
 			case <-t.done:
+				utils.Debugf("[DIRECT] writerLoop: done during wait, exiting")
 				return
 			case <-time.After(20 * time.Millisecond):
 			}
@@ -365,11 +441,17 @@ func (t *DirectTransport) writerLoop() {
 		}
 
 		if len(pending) > t.config.MaxRecordBytes {
-			utils.Debugf("[DIRECT] dropping oversized record %d", len(pending))
+			utils.Debugf("[DIRECT] writerLoop: dropping oversized record %d (max %d)",
+				len(pending), t.config.MaxRecordBytes)
 			pending = nil
 			continue
 		}
 		hdr := [2]byte{byte(len(pending) >> 8), byte(len(pending))}
+		utils.Debugf("[DIRECT] writerLoop: writing record #%d size=%d (hdr=%02x%02x)",
+			t.recordsOut.Load()+1, len(pending), hdr[0], hdr[1])
+		if utils.IsVerbose() {
+			utils.Debugf("[DIRECT] writerLoop: record hexdump:\n%s", hex.Dump(pending))
+		}
 
 		t.writeMu.Lock()
 		_, err := conn.Write(hdr[:])
@@ -379,7 +461,8 @@ func (t *DirectTransport) writerLoop() {
 		t.writeMu.Unlock()
 
 		if err != nil {
-			utils.Debugf("[DIRECT] write: %v", err)
+			utils.Debugf("[DIRECT] writerLoop: WRITE FAILED for %s: %v (holding record, retry in 20ms)",
+				connDesc(conn), err)
 			select {
 			case <-t.done:
 				return
@@ -387,7 +470,26 @@ func (t *DirectTransport) writerLoop() {
 			}
 			continue // keep pending; reconnect will bring up a new conn
 		}
+		utils.Debugf("[DIRECT] writerLoop: wrote record size=%d OK", len(pending))
 		t.RecordSend(len(pending))
+		t.bytesOut.Add(uint64(len(pending)))
+		t.recordsOut.Add(1)
 		pending = nil
 	}
+}
+
+// connDesc returns a short descriptor for a net.Conn for logging.
+func connDesc(c net.Conn) string {
+	if c == nil {
+		return "<nil>"
+	}
+	local := "?"
+	remote := "?"
+	if a := c.LocalAddr(); a != nil {
+		local = a.String()
+	}
+	if a := c.RemoteAddr(); a != nil {
+		remote = a.String()
+	}
+	return fmt.Sprintf("%s->%s", local, remote)
 }
