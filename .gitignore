@@ -33,6 +33,8 @@ Thumbs.db
 
 .env
 .env.local
+yandex-cookies*.txt
+cookies.txt
 
 .gradle/
 *.hprof

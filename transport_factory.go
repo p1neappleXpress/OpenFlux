@@ -13,6 +13,20 @@ import (
 	"openflux/transport/yandex"
 )
 
+// yandexCookiesFile is --yandex-cookies-file: a Netscape cookies.txt with
+// a Yandex login that every vyandex transport starts with.
+var yandexCookiesFile string
+
+func newVolgaTransport(docURL string, cfg transport.TransportConfig) (transport.Transport, error) {
+	t := yandex.NewYandexVolgaTransport(docURL, cfg)
+	if yandexCookiesFile != "" {
+		if err := t.LoadCookieFile(yandexCookiesFile); err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
+}
+
 // transportFactory builds a raw transport from a control.TransportConfig.
 // It is the single place that knows every transport package. main.go passes
 // it into manager.New, and manager calls it whenever the peer asks the exit
@@ -26,7 +40,7 @@ func transportFactory(baseCfg transport.TransportConfig) manager.Factory {
 		case "yandex":
 			return yandex.NewYandexDocsTransport(cfg.URL, baseCfg), nil
 		case "vyandex":
-			return yandex.NewYandexVolgaTransport(cfg.URL, baseCfg), nil
+			return newVolgaTransport(cfg.URL, baseCfg)
 		case "boards":
 			return yandex.NewBoardsTransport(cfg.URL, baseCfg), nil
 		case "mailru":

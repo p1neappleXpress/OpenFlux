@@ -1,5 +1,9 @@
 # OpenFlux
 
+Этот репозиторий основан на [OpenFlux от p1neappleXpress](https://github.com/p1neappleXpress/OpenFlux).
+
+Практическая инструкция для VPS, Android и ПК: [docs/CONNECT.ru.md](docs/CONNECT.ru.md).
+
 [English](README.md) | **Русский**
 
 Исследовательский инструмент сетевого стека. IPv4 TCP/UDP-туннель с подключаемыми
@@ -489,6 +493,22 @@ URL = YOUR_YANDEX_DOC_URL
 Обе стороны должны использовать один и тот же файл-секрет. AES-256-GCM,
 направленные ключи. Без флага - без шифрования, поведение не меняется.
 
+### Авторизованная сессия Яндекса (экспериментально)
+
+Для `--transport=vyandex` можно передать экспорт cookies браузера в формате
+Netscape `cookies.txt`:
+
+```
+./openflux --role=exit --mode=l4 --transport=vyandex --url="..." \
+    --yandex-cookies-file=/path/to/yandex-cookies.txt
+```
+
+Укажите отдельный cookie-файл на клиенте и на выходной ноде. Загружаются только
+неистёкшие cookies домена `yandex.ru` и его поддоменов. Без флага транспорт
+работает анонимно, как раньше. Файл даёт доступ к аккаунту: храните его вне
+репозитория, ограничьте права доступа и не передавайте значения через чат или
+аргументы командной строки. Сессия может истечь, а CAPTCHA может сохраниться.
+
 ### Бенчмарки
 
 Измерьте чистый goodput через транспорт, не задевая сеть хоста:
@@ -539,6 +559,7 @@ URL = YOUR_YANDEX_DOC_URL
 | `--local-ip` | `-l` | (авто) | Egress IP для l3 SNAT / фильтра RST |
 | `--debug` | `-d` | `false` | Подробное per-packet логирование |
 | `--encryption-key-file` | | | Файл с общим секретом для AES-256-GCM |
+| `--yandex-cookies-file` | | | Экспорт Netscape `cookies.txt` для `vyandex` |
 | `--maxToken` | | | Токен авторизации MAX (`--transport=oneme`) |
 | `--maxUid` | | | ID пользователя MAX (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | Сколько MB залить (`--role=bench-send`) |

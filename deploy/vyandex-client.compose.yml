@@ -1,0 +1,21 @@
+services:
+  client:
+    image: openflux:local
+    restart: unless-stopped
+    entrypoint: /usr/local/bin/openflux
+    command:
+      - --role=client
+      - --inbound=socks5
+      - --transport=vyandex
+      - --url=${DOC_URL:?Set DOC_URL in .env}
+      - --socks5=:1081
+      - --encryption-key-file=/run/secrets/channel.key
+      - --yandex-cookies-file=/run/secrets/yandex-cookies.txt
+    ports:
+      - 127.0.0.1:${SOCKS_PORT:-1081}:1081
+    volumes:
+      - ./channel.key:/run/secrets/channel.key:ro
+      - ./yandex-cookies.txt:/run/secrets/yandex-cookies.txt:ro
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true

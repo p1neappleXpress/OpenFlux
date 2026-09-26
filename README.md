@@ -499,6 +499,22 @@ Wire details: [PROTOCOL_NEGOTIATION.md](PROTOCOL_NEGOTIATION.md).
 Both peers must use the same secret file. AES-256-GCM, directional keys.
 Unset means unencrypted, unchanged behavior.
 
+### Authenticated Yandex session (experimental)
+
+With `--transport=vyandex`, you can pass a Netscape-format `cookies.txt`
+export from a signed-in browser:
+
+```
+./openflux --role=exit --mode=l4 --transport=vyandex --url="..." \
+    --yandex-cookies-file=/path/to/yandex-cookies.txt
+```
+
+Use a separate cookie file on the client and exit node. Only unexpired
+`yandex.ru` cookies are loaded. Without the flag, anonymous behavior is
+unchanged. Treat the file as account access: keep it out of Git, restrict file
+permissions, and never put its contents in chat or command-line arguments.
+Cookies may expire, and authentication may not remove a CAPTCHA.
+
 ### Benchmarks
 
 Measure raw goodput through the transport, without touching the host network:
@@ -549,6 +565,7 @@ Measure raw goodput through the transport, without touching the host network:
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
 | `--debug` | `-d` | `false` | Verbose per-packet logging |
 | `--encryption-key-file` | | | AES-256-GCM shared secret file |
+| `--yandex-cookies-file` | | | Netscape `cookies.txt` export for `vyandex` |
 | `--maxToken` | | | MAX auth token (`--transport=oneme`) |
 | `--maxUid` | | | MAX user id (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | MB to push (`--role=bench-send`) |
