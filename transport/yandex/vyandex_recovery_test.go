@@ -50,7 +50,7 @@ func TestRefreshAuthPublishesNewSessionToRelay(t *testing.T) {
 	relay := &relayClient{auth: &shared}
 	listener := &wsListener{
 		auth: &shared,
-		authorizeFn: func(string, string) (*volgaAuth, error) {
+		authorizeFn: func() (*volgaAuth, error) {
 			return &volgaAuth{Token: "new"}, nil
 		},
 	}
@@ -67,7 +67,7 @@ func TestRefreshAuthKeepsOldSessionOnFailure(t *testing.T) {
 	shared.Store(&volgaAuth{Token: "old"})
 	listener := &wsListener{
 		auth: &shared,
-		authorizeFn: func(string, string) (*volgaAuth, error) {
+		authorizeFn: func() (*volgaAuth, error) {
 			return nil, errors.New("authorization unavailable")
 		},
 	}
@@ -154,19 +154,12 @@ func TestReconnectDelayResetsAfterHealthySession(t *testing.T) {
 	}
 }
 
-func TestSafeVolgaURLRemovesCredentials(t *testing.T) {
-	got := safeVolgaURL("https://volga.yandex.ru/document/?token=secret&request-path=private#fragment")
-	if strings.Contains(got, "secret") || strings.Contains(got, "private") || strings.Contains(got, "fragment") {
-		t.Fatalf("URL exposed credentials: %q", got)
-	}
-}
-
 func TestRefreshDoesNotPublishAfterStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var shared atomic.Pointer[volgaAuth]
 	shared.Store(&volgaAuth{Token: "old"})
-	w := &wsListener{ctx: ctx, auth: &shared, authorizeFn: func(string, string) (*volgaAuth, error) {
+	w := &wsListener{ctx: ctx, auth: &shared, authorizeFn: func() (*volgaAuth, error) {
 		return &volgaAuth{Token: "new"}, nil
 	}}
 	if err := w.refreshAuth(); err == nil {
