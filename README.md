@@ -256,6 +256,13 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -trimpath -o openflux-linux .
 ```
 
+## Multi-client exit-node deployment (Docker)
+
+Running exit nodes for several clients on one VPS? [`cli/openflux-ctl`](cli/README.md)
+is a Docker-based CLI that provisions one isolated exit-node container per
+client and tracks their transport/URL/status - see [`cli/README.md`](cli/README.md)
+for setup and usage.
+
 ## Usage
 
 ### Exit node - L3 (Linux, root)

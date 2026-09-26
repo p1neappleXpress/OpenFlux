@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+STATE_FILE="${OPENFLUX_STATE_FILE:-$SCRIPT_DIR/state/clients.tsv}"
+IMAGE_NAME="${OPENFLUX_IMAGE:-openflux-exit:local}"
+
+usage() {
+  cat <<'USAGE'
+Usage: openflux-ctl <command> [args]
+
+Commands:
+  install [--import <file>]                Check Docker, build the exit-node image, optionally bulk-import clients
+  add <name> --transport=<t> --url=<url>   Create a new client (starts an isolated exit-node container)
+  remove <name>                            Remove a client (stops its container, forgets its config)
+  list                                     List all clients: transport, status, url
+  logs <name>                              Follow logs for a client's container
+
+Transports: yandex, vyandex, cupsonline, mailru
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+ensure_state_file() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  if [ ! -f "$STATE_FILE" ]; then
+    : > "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+  fi
+}
+
+VALID_TRANSPORTS="yandex vyandex cupsonline mailru"
+
+validate_transport() {
+  local t="$1" vt
+  for vt in $VALID_TRANSPORTS; do
+    [ "$t" = "$vt" ] && return 0
+  done
+  return 1
+}
+
+validate_name() {
+  [ -n "$1" ] && [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+
+client_row() {
+  local name="$1"
+  awk -F'\t' -v n="$name" '!/^#/ && NF && $1==n {print; found=1} END{exit !found}' "$STATE_FILE"
+}
+
+client_exists() {
+  client_row "$1" >/dev/null 2>&1
+}
+
+record_client() {
+  local name="$1" transport="$2" url="$3" container="$4"
+  ensure_state_file
+  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$transport" "$url" "$container" "$(date -Iseconds)" >> "$STATE_FILE"
+}
+
+remove_client_record() {
+  local name="$1"
+  ensure_state_file
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'\t' -v n="$name" '/^#/ || $1!=n' "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+bulk_import() {
+  local file="$1"
+  [ -f "$file" ] || die "import file not found: $file"
+  local failures=0 lineno=0 line name transport url out
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    lineno=$((lineno + 1))
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac
+
+    IFS=',' read -r name transport url <<< "$line"
+    if [ -z "${name:-}" ] || [ -z "${transport:-}" ] || [ -z "${url:-}" ]; then
+      echo "import line $lineno: malformed (expected name,transport,url): $line" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+
+    if out="$(cmd_add "$name" --transport="$transport" --url="$url" 2>&1)"; then
+      echo "import line $lineno: $out"
+    else
+      echo "import line $lineno: $out" >&2
+      failures=$((failures + 1))
+    fi
+  done < "$file"
+
+  if [ "$failures" -gt 0 ]; then
+    echo "import finished with $failures failure(s)" >&2
+    return 1
+  fi
+  echo "import finished: all clients added"
+}
+
+install_docker() {
+  echo "docker not found on PATH -- installing via https://get.docker.com ..."
+  if [ "$(id -u)" = "0" ]; then
+    curl -fsSL https://get.docker.com | sh \
+      || die "automatic Docker install failed. Install it manually: https://docs.docker.com/engine/install/"
+  else
+    command -v sudo >/dev/null 2>&1 \
+      || die "docker is not installed and sudo is not available to install it. Install Docker manually: https://docs.docker.com/engine/install/"
+    curl -fsSL https://get.docker.com | sudo sh \
+      || die "automatic Docker install failed. Install it manually: https://docs.docker.com/engine/install/"
+  fi
+  command -v docker >/dev/null 2>&1 \
+    || die "Docker's install script finished but 'docker' is still not on PATH -- check the output above, or install manually: https://docs.docker.com/engine/install/"
+  echo "docker installed"
+}
+
+cmd_install() {
+  local import_file=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --import=*) import_file="${1#--import=}" ;;
+      --import) import_file="${2:-}"; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  if ! command -v docker >/dev/null 2>&1; then
+    install_docker
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    die "docker daemon is not reachable (you may need to log out and back in for the new 'docker' group membership to apply, or run as root/with sudo)"
+  fi
+
+  echo "building $IMAGE_NAME from $REPO_ROOT ..."
+  docker build -t "$IMAGE_NAME" "$REPO_ROOT"
+  echo "image built: $IMAGE_NAME"
+
+  if [ -n "$import_file" ]; then
+    bulk_import "$import_file"
+  fi
+}
+
+cmd_add() {
+  local name="" transport="" url="" args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --transport=*) transport="${1#--transport=}" ;;
+      --transport) transport="${2:-}"; shift ;;
+      --url=*) url="${1#--url=}" ;;
+      --url) url="${2:-}"; shift ;;
+      --*) die "unknown option: $1" ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  name="${args[0]:-}"
+
+  local usage_msg="usage: openflux-ctl add <name> --transport=<${VALID_TRANSPORTS// /|}> --url=<url>"
+  [ -n "$name" ] || die "$usage_msg"
+  validate_name "$name" || die "invalid client name '$name' (allowed: letters, digits, '-', '_')"
+  [ -n "$transport" ] || die "$usage_msg"
+  validate_transport "$transport" || die "unsupported transport '$transport' (allowed: $VALID_TRANSPORTS)"
+  [ -n "$url" ] || die "$usage_msg"
+
+  ensure_state_file
+  if client_exists "$name"; then
+    die "client '$name' already exists"
+  fi
+  local container="openflux-${name}"
+  if docker inspect "$container" >/dev/null 2>&1; then
+    die "a docker container named '$container' already exists (state file may be out of sync)"
+  fi
+
+  docker run -d --name "$container" --restart unless-stopped \
+    --cap-add NET_RAW --cap-add NET_ADMIN \
+    -e ROLE=exit-node -e TRANSPORT="$transport" -e URL="$url" \
+    "$IMAGE_NAME" >/dev/null || die "failed to start container '$container'"
+
+  record_client "$name" "$transport" "$url" "$container"
+  echo "added client '$name' -> $transport $url ($container)"
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: openflux-ctl remove <name>"
+  ensure_state_file
+  if ! client_exists "$name"; then
+    echo "warning: client '$name' not found, nothing to remove" >&2
+    return 0
+  fi
+  local container
+  container="$(client_row "$name" | cut -f4)"
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  remove_client_record "$name"
+  echo "removed client '$name'"
+}
+
+cmd_list() {
+  ensure_state_file
+  if [ -z "$(awk '!/^#/ && NF' "$STATE_FILE")" ]; then
+    echo "no clients"
+    return 0
+  fi
+  printf '%-12s %-10s %-10s %-45s %s\n' "NAME" "TRANSPORT" "STATUS" "URL" "CREATED"
+  while IFS=$'\t' read -r name transport url container created; do
+    local status
+    status="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo missing)"
+    printf '%-12s %-10s %-10s %-45s %s\n' "$name" "$transport" "$status" "$url" "$created"
+  done < <(awk '!/^#/ && NF' "$STATE_FILE")
+}
+
+cmd_logs() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: openflux-ctl logs <name>"
+  ensure_state_file
+  if ! client_exists "$name"; then
+    local known
+    known="$(awk -F'\t' '!/^#/ && NF {print $1}' "$STATE_FILE" | paste -sd', ' -)"
+    die "client '$name' not found. known clients: ${known:-none}"
+  fi
+  local container
+  container="$(client_row "$name" | cut -f4)"
+  exec docker logs -f "$container"
+}
+
+main() {
+  local cmd="${1:-}"
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$cmd" in
+    install) cmd_install "$@" ;;
+    add) cmd_add "$@" ;;
+    remove) cmd_remove "$@" ;;
+    list) cmd_list "$@" ;;
+    logs) cmd_logs "$@" ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    "")
+      usage >&2
+      exit 1
+      ;;
+    *)
+      usage >&2
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
