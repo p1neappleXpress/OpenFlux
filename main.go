@@ -126,6 +126,10 @@ func managerRefreshLoop(m *manager.Manager) {
 }
 
 func main() {
+	// The desktop wizard's JSON protocol owns stdout: no banner, no flags.
+	if len(os.Args) == 2 && os.Args[1] == "--node-wizard" {
+		os.Exit(runNodeWizard(os.Stdin, os.Stdout))
+	}
 	fmt.Print("written by p1neappleXpress\n")
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
