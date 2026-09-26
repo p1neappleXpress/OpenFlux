@@ -142,20 +142,15 @@ func isNumber(s string) bool {
 //
 // Priority:
 //
-//	explicit          --session-context, if non-empty
-//	--url             globalURL, if non-empty and not the placeholder
-//	--<type>-url      first non-empty per-transport URL flag
-//	[Transport] URL   first non-empty URL from a .conf section
-//	fallback          transportType, or "openflux" if that is empty too
+//	explicit      --session-context, if non-empty
+//	--url         globalURL, if set and not the placeholder
+//	transports    URL of the highest-priority transport that has one
+//	fallback      the placeholder "http://#"
 //
-// The placeholder "http://#" (the default value of --url) is treated as
-// "not set" so it never becomes part of the KDF input.
-func pickSessionContext(
-	explicit, globalURL string,
-	yandexURL, vyandexURL, boardsURL, mailruURL, cupsonlineURL string,
-	confTransports []transportSpec,
-	transportType string,
-) string {
+// This is what the OpenFlux-Android client derives for a Session profile,
+// and the fallback is what older builds used whenever --url was unset, so a
+// node without any document URL (direct, oneme) keeps its old key.
+func pickSessionContext(explicit, globalURL string, specs []transportSpec) string {
 	const placeholder = "http://#"
 	if explicit != "" {
 		return explicit
@@ -163,20 +158,16 @@ func pickSessionContext(
 	if globalURL != "" && globalURL != placeholder {
 		return globalURL
 	}
-	for _, u := range []string{yandexURL, vyandexURL, boardsURL, mailruURL, cupsonlineURL} {
-		if u != "" {
-			return u
+	best := -1
+	for i, s := range specs {
+		if s.URL != "" && s.URL != placeholder && (best < 0 || s.Priority > specs[best].Priority) {
+			best = i
 		}
 	}
-	for _, s := range confTransports {
-		if s.URL != "" {
-			return s.URL
-		}
+	if best >= 0 {
+		return specs[best].URL
 	}
-	if transportType != "" {
-		return transportType
-	}
-	return "openflux"
+	return placeholder
 }
 
 // managerRefreshLoop periodically asks the exit node for a fresh cookie jar.
@@ -322,8 +313,9 @@ TRANSPORT MODIFIERS
                                --transports or --negotiate. Both peers
                                must share the same key.
       --session-context=<str>  Explicit KDF context for that key. Both peers
-                               must use the same value. Default: derived from
-                               the document URL, falling back to --transport.
+                               must use the same value. Default: --url, else
+                               the URL of the highest-priority transport,
+                               else "http://#".
       --negotiate              Require authenticated capability negotiation
                                on both peers. No legacy fallback.
       --max-packet-size=N      Max IPv4 packet in negotiated mode
@@ -648,13 +640,7 @@ DEPRECATED (removed in v2)
 		}
 	}
 
-	sessionContext = pickSessionContext(
-		*sessionContextFlag,
-		globalDocUrl,
-		*yandexURL, *vyandexURL, *boardsURL, *mailruURL, *cupsonlineURL,
-		confTransports,
-		*transportType,
-	)
+	sessionContext = pickSessionContext(*sessionContextFlag, globalDocUrl, specs)
 	if *encryptionKeyFile != "" {
 		utils.Debugf("[KEY] context=%q sha256=%s (MUST match on both peers)",
 			sessionContext, utils.Sha256Hex([]byte(sessionContext)))

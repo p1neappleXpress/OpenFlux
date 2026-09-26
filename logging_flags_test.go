@@ -29,3 +29,27 @@ func TestExpandDebugFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestPickSessionContext(t *testing.T) {
+	specs := []transportSpec{
+		{Name: "direct", Type: "direct", Priority: 100},
+		{Name: "vyandex", Type: "vyandex", Priority: 30, URL: "https://volga/doc"},
+		{Name: "yandex", Type: "yandex", Priority: 50, URL: "https://docs/doc"},
+	}
+	cases := []struct {
+		name, explicit, url string
+		specs               []transportSpec
+		want                string
+	}{
+		{"explicit wins", "ctx", "https://u", specs, "ctx"},
+		{"--url wins over transports", "", "https://u", specs, "https://u"},
+		{"highest-priority transport URL", "", "http://#", specs, "https://docs/doc"},
+		{"no URL anywhere keeps the old default", "", "http://#", specs[:1], "http://#"},
+		{"legacy single transport", "", "http://#", []transportSpec{{Type: "yandex", Priority: 100, URL: "http://#"}}, "http://#"},
+	}
+	for _, c := range cases {
+		if got := pickSessionContext(c.explicit, c.url, c.specs); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}

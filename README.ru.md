@@ -540,6 +540,7 @@ URL = YOUR_YANDEX_DOC_URL
 | `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: строка на каждый пакет (`-> 52 bytes - UDP ...`); `2`: плюс рабочие логи; `3`: плюс hexdump |
 | `--sensitive` | | `false` | Ещё и ключи, а с `-ddd` — расшифрованные фреймы (куки, токены) |
 | `--encryption-key-file` | | | Файл с общим секретом для AES-256-GCM |
+| `--session-context` | | (вычисляется) | KDF-контекст ключа; по умолчанию `--url`, иначе URL транспорта с наивысшим приоритетом, иначе `http://#` |
 | `--maxToken` | | | Токен авторизации MAX (`--transport=oneme`) |
 | `--maxUid` | | | ID пользователя MAX (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | Сколько MB залить (`--role=bench-send`) |
