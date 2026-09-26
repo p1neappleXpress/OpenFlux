@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"openflux/network"
 	"openflux/transport"
 	"openflux/utils"
 )
@@ -31,7 +33,6 @@ type TUNClient struct {
 	bypassIPs   []string
 	routesAdded bool
 
-	// Saved default route, captured before we install any utun routes.
 	savedIface string
 	savedGw    string
 	defaultSet bool
@@ -56,7 +57,6 @@ func (c *TUNClient) Name() string { return c.name }
 
 // ConfigureInterface sets address + routes. Requires root. Called once at start.
 func (c *TUNClient) ConfigureInterface(bypassHosts []string) error {
-	// 1. Bring interface up.
 	setup := [][]string{
 		{"ifconfig", c.name, "10.10.10.2", "10.10.10.2", "up"},
 		{"ifconfig", c.name, "mtu", "1280"},
@@ -67,9 +67,6 @@ func (c *TUNClient) ConfigureInterface(bypassHosts []string) error {
 		}
 	}
 
-	// 2. Find the real default gateway. On macOS, netstat often reports the
-	// gateway as "link#N" (interface index) rather than an IP. In that case,
-	// derive the router IP from the interface's subnet (first usable host).
 	gw, iface, err := realGateway()
 	if err != nil {
 		return fmt.Errorf("find default gateway: %w", err)
@@ -77,8 +74,6 @@ func (c *TUNClient) ConfigureInterface(bypassHosts []string) error {
 	c.gateway = gw
 	utils.Debugf("[TUN] real gateway: %s (iface=%s)", gw, iface)
 
-	// 3. Add /32 bypass routes BEFORE the default route, so transport
-	// traffic never loops through the tunnel.
 	for _, host := range bypassHosts {
 		host = strings.TrimSpace(host)
 		if host == "" {
@@ -105,14 +100,12 @@ func (c *TUNClient) ConfigureInterface(bypassHosts []string) error {
 		}
 	}
 
-	// 4. Route all remaining traffic through utun.
 	defaults := [][]string{
 		{"route", "add", "-net", "0.0.0.0/1", "-interface", c.name},
 		{"route", "add", "-net", "128.0.0.0/1", "-interface", c.name},
 	}
 	for _, args := range defaults {
 		if out, err := exec.Command("sudo", args...).CombinedOutput(); err != nil {
-			// rollback bypass routes on failure
 			c.removeRoutes()
 			return fmt.Errorf("%v: %w (%s)", args, err, string(out))
 		}
@@ -121,16 +114,12 @@ func (c *TUNClient) ConfigureInterface(bypassHosts []string) error {
 	return nil
 }
 
-// removeRoutes undoes everything ConfigureInterface added. Safe to call
-// multiple times. Ignores errors (best-effort cleanup).
 func (c *TUNClient) removeRoutes() {
 	if !c.routesAdded && len(c.bypassIPs) == 0 {
 		return
 	}
-	// default routes first
 	exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1").Run()
 	exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1").Run()
-	// bypass /32 routes
 	for _, ip := range c.bypassIPs {
 		exec.Command("sudo", "route", "delete", "-host", ip).Run()
 	}
@@ -138,12 +127,10 @@ func (c *TUNClient) removeRoutes() {
 	c.routesAdded = false
 }
 
-// Start kicks off the two forwarding loops.
 func (c *TUNClient) Start() {
 	go c.readFromTun()
 	go c.writeToTun()
 
-	// Transport -> utun
 	c.trans.Receive(func(pkt []byte) {
 		cp := make([]byte, len(pkt))
 		copy(cp, pkt)
@@ -160,7 +147,6 @@ func (c *TUNClient) readFromTun() {
 	buf := make([]byte, 2048)
 	for {
 		n, err := c.fd.Read(buf)
-		utils.Debugf("[TUN] readFromTun: n=%d err=%v", n, err)
 		if err != nil {
 			utils.Debugf("[TUN] read: %v", err)
 			return
@@ -175,10 +161,15 @@ func (c *TUNClient) readFromTun() {
 			continue
 		}
 		c.packetsOut.Add(1)
-		utils.Debugf("[TUN] -> %d bytes proto=%d %d.%d.%d.%d -> %d.%d.%d.%d",
-			len(pkt), pkt[9],
-			pkt[12], pkt[13], pkt[14], pkt[15],
-			pkt[16], pkt[17], pkt[18], pkt[19])
+
+		// -> : packet leaves the device towards the tunnel / exit.
+		if utils.Level() >= 1 {
+			utils.Debugf("[TUN] %s", network.FormatPacket(network.DirOutbound, pkt))
+		}
+		if utils.IsVerbose() && utils.Sensitive() {
+			utils.Debugf("[TUN] ->net payload hexdump:\n%s", hex.Dump(pkt))
+		}
+
 		if err := c.trans.Send(pkt); err != nil {
 			utils.Debugf("[TUN] trans.Send FAIL: %v", err)
 		}
@@ -187,6 +178,16 @@ func (c *TUNClient) readFromTun() {
 
 func (c *TUNClient) writeToTun() {
 	for pkt := range c.inbound {
+		c.packetsIn.Add(1)
+
+		// <- : packet arrives from the tunnel / exit towards the device.
+		if utils.Level() >= 1 {
+			utils.Debugf("[TUN] %s", network.FormatPacket(network.DirInbound, pkt))
+		}
+		if utils.IsVerbose() && utils.Sensitive() {
+			utils.Debugf("[TUN] <-net payload hexdump:\n%s", hex.Dump(pkt))
+		}
+
 		out := make([]byte, 4+len(pkt))
 		out[3] = 2 // AF_INET
 		copy(out[4:], pkt)
@@ -194,7 +195,6 @@ func (c *TUNClient) writeToTun() {
 			utils.Debugf("[TUN] write: %v", err)
 			return
 		}
-		c.packetsIn.Add(1)
 	}
 }
 
@@ -204,14 +204,12 @@ func (c *TUNClient) Close() error {
 	return c.fd.Close()
 }
 
-// openUtun creates a new utun interface via the PF_SYSTEM control socket.
 func openUtun() (*os.File, string, error) {
-	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, 2 /* SYSPROTO_CONTROL */)
+	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, 2)
 	if err != nil {
 		return nil, "", fmt.Errorf("socket AF_SYSTEM: %w", err)
 	}
 
-	// Resolve the control id for com.apple.net.utun_control via CTLIOCGINFO.
 	var info unix.CtlInfo
 	copy(info.Name[:], "com.apple.net.utun_control")
 	if err := unix.IoctlCtlInfo(fd, &info); err != nil {
@@ -219,7 +217,6 @@ func openUtun() (*os.File, string, error) {
 		return nil, "", fmt.Errorf("IoctlCtlInfo: %w", err)
 	}
 
-	// sc_unit = 0 lets the kernel pick the next free unit.
 	sa := &unix.SockaddrCtl{
 		ID:   info.Id,
 		Unit: 0,
@@ -229,8 +226,7 @@ func openUtun() (*os.File, string, error) {
 		return nil, "", fmt.Errorf("connect PF_SYSTEM: %w", err)
 	}
 
-	// Ask the kernel for the actual interface name (utunN).
-	name, err := unix.GetsockoptString(fd, 2 /* SYSPROTO_CONTROL */, 2 /* UTUN_OPT_IFNAME */)
+	name, err := unix.GetsockoptString(fd, 2, 2)
 	if err != nil {
 		unix.Close(fd)
 		return nil, "", fmt.Errorf("getsockopt UTUN_OPT_IFNAME: %w", err)
@@ -239,20 +235,10 @@ func openUtun() (*os.File, string, error) {
 	return os.NewFile(uintptr(fd), name), name, nil
 }
 
-// Silence unused import when building only on darwin.
 var _ = net.IPv4len
 
-// realGateway returns the default router IP and the interface it is on.
-// It handles macOS's habit of reporting "link#N" instead of an IP address:
-// in that case, the gateway is the first usable host in the interface's
-// subnet (e.g. 192.168.1.1 for 192.168.1.x/24).
 func realGateway() (string, string, error) {
-	// Find a PHYSICAL interface (en0, en1, ...) with IPv4. We deliberately
-	// don't use "route get default" because on macOS with another VPN/tun
-	// active, that returns the *other* tunnel's interface, not the physical
-	// uplink.
-	out, err := exec.Command("sh", "-c",
-		"ifconfig -l").Output()
+	out, err := exec.Command("sh", "-c", "ifconfig -l").Output()
 	if err != nil {
 		return "", "", fmt.Errorf("ifconfig -l: %w", err)
 	}
@@ -278,8 +264,6 @@ func realGateway() (string, string, error) {
 	return "", "", fmt.Errorf("no physical interface with IPv4 found")
 }
 
-// parseIfconfigIPv4 extracts the first inet + netmask from ifconfig output.
-// Handles macOS's hex netmask form (0xffffff00).
 func parseIfconfigIPv4(s string) (net.IP, net.IPMask) {
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
@@ -308,7 +292,6 @@ func parseIfconfigIPv4(s string) (net.IP, net.IPMask) {
 	return nil, nil
 }
 
-// parseMask accepts both dotted-quad (255.255.255.0) and hex (0xffffff00).
 func parseMask(s string) net.IPMask {
 	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
 		var m uint32
@@ -323,7 +306,6 @@ func parseMask(s string) net.IPMask {
 	return nil
 }
 
-// firstUsableHost returns network+1 as a dotted-quad string.
 func firstUsableHost(ip net.IP, mask net.IPMask) string {
 	ip4 := ip.To4()
 	if ip4 == nil {
@@ -340,19 +322,8 @@ func firstUsableHost(ip net.IP, mask net.IPMask) string {
 	return network.String()
 }
 
-// Gateway returns the physical gateway IP resolved at SetupInterface time.
 func (c *TUNClient) Gateway() string { return c.gateway }
 
-// SetupInterface brings utun up with an address and MTU, and resolves the
-// physical gateway. It does NOT touch the default route.
-
-// ConfigureDefault installs 0.0.0.0/1 and 128.0.0.0/1 through utun.
-
-// SaveDefault records the current default route (interface + gateway) so we
-// can restore it on exit. Must be called BEFORE any tunnel routes are
-// installed. On macOS with another VPN active, the default might already be
-// a utun; we save exactly that and restore it later, so we never leave the
-// user with a broken default.
 func (c *TUNClient) SaveDefault() error {
 	out, err := exec.Command("route", "-n", "get", "default").Output()
 	if err != nil {
@@ -377,11 +348,7 @@ func (c *TUNClient) SaveDefault() error {
 	return nil
 }
 
-// SetupInterface brings utun up, purges leftover tunnel routes from a
-// previous crashed run, and resolves the physical gateway used for bypass
-// routes. It does NOT install the default route.
 func (c *TUNClient) SetupInterface() error {
-	// Purge leftover default-override routes from a previous run.
 	exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1").Run()
 	exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1").Run()
 
@@ -394,9 +361,6 @@ func (c *TUNClient) SetupInterface() error {
 		}
 	}
 
-	// Prefer the saved default's gateway for bypass routes, so they use
-	// exactly the same path that worked before we started. Fall back to
-	// scanning physical interfaces if it was not an IP.
 	if c.savedGw != "" && net.ParseIP(c.savedGw) != nil {
 		c.gateway = c.savedGw
 		utils.Debugf("[TUN] bypass gateway = saved default gw %s", c.gateway)
@@ -411,16 +375,10 @@ func (c *TUNClient) SetupInterface() error {
 	return nil
 }
 
-// ConfigureDefault installs 0.0.0.0/1 and 128.0.0.0/1 through utun, saving
-// the current default in c.saved* for later restore.
-
-// RestoreDefault puts the default route back the way it was before we
-// started (interface and gateway captured by SaveDefault).
 func (c *TUNClient) RestoreDefault() {
 	if !c.defaultSet && c.savedIface == "" {
 		return
 	}
-	// Remove our overrides first.
 	exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1").Run()
 	exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1").Run()
 	c.routesAdded = false
@@ -428,7 +386,6 @@ func (c *TUNClient) RestoreDefault() {
 	if c.savedIface == "" {
 		return
 	}
-	// Re-add the default we saved.
 	if c.savedGw != "" && net.ParseIP(c.savedGw) != nil {
 		exec.Command("sudo", "route", "add", "default", c.savedGw).Run()
 	} else {

@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
+	"openflux/network"
 	"openflux/transport"
 	"openflux/tunnel/l3"
 	"openflux/utils"
@@ -27,8 +28,8 @@ import (
 type ExitMode int
 
 const (
-	ExitModeL3 ExitMode = iota // L3: SNAT/DNAT без gVisor (Linux)
-	ExitModeL4                 // L4: gVisor TCP-терминация + net.Dial (работает везде)
+	ExitModeL3 ExitMode = iota
+	ExitModeL4
 )
 
 func (m ExitMode) String() string {
@@ -40,11 +41,9 @@ func (m ExitMode) String() string {
 	}
 }
 
-// ParseExitMode разбирает строку из флага --mode.
 func ParseExitMode(s string) (ExitMode, error) {
 	switch s {
 	case "", "l4", "proxy":
-		// "proxy" is a deprecated alias kept for one release.
 		return ExitModeL4, nil
 	case "l3":
 		return ExitModeL3, nil
@@ -66,14 +65,12 @@ type TCPTunnel struct {
 	udpFlows    atomic.Int32
 }
 
-// TCP buffer size range for gvisor stacks.
 var (
 	TCPBufMin     = 4 * 1024 * 1024
 	TCPBufDefault = 16 * 1024 * 1024
 	TCPBufMax     = 64 * 1024 * 1024
 )
 
-// SetTCPBuffers applies the configured TCP send/receive buffer ranges to s.
 func SetTCPBuffers(s *stack.Stack) {
 	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
@@ -113,6 +110,10 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 		}
 	}
 	tunnelEP.onOutgoingPacket = func(data []byte) {
+		// `->` : emitted by the local stack, going to the peer / internet.
+		if utils.Level() >= 1 {
+			utils.Debugf("[TUNNEL] %s", network.FormatPacket(network.DirOutbound, data))
+		}
 		if err := trans.Send(data); err != nil {
 			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
 		}
@@ -131,14 +132,16 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	}
 
 	trans.Receive(func(data []byte) {
+		// `<-` : received from the peer / internet, going into the local stack.
+		if utils.Level() >= 1 {
+			utils.Debugf("[TUNNEL] %s", network.FormatPacket(network.DirInbound, data))
+		}
 		tunnelEP.InjectInbound(data)
 	})
 
 	utils.SafeGo("tunnel.printStats", t.printStats)
 	return t
 }
-
-// ---- exit node: proxy ----
 
 func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 	utils.Debugf("[TUNNEL] EXIT NODE - proxy mode (no raw sockets)")
@@ -259,8 +262,6 @@ func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	})
 }
 
-// ---- client ----
-
 func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	clientAddr := tcpip.AddrFrom4([4]byte{10, 10, 10, 2})
 	t.gvisorStack.AddProtocolAddress(tunnelNIC, tcpip.ProtocolAddress{
@@ -277,8 +278,6 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	})
 }
 
-// dialTimeout bounds DialTCP. Over a transport that is down the handshake
-// never completes, and gonet.DialTCP would wait for it indefinitely.
 var dialTimeout = 10 * time.Second
 
 func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
@@ -306,8 +305,6 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 		Port: uint16(tcpAddr.Port),
 	}, ipv4.ProtocolNumber)
 	if err != nil {
-		// Not "return conn, err": a nil *gonet.TCPConn in a net.Conn is a
-		// non-nil interface, and callers checking conn != nil would crash.
 		return nil, err
 	}
 	return conn, nil
@@ -366,5 +363,4 @@ func (t *TCPTunnel) printStats() {
 	}
 }
 
-// SetLocalIP overrides auto-detection for the L3 exit backend.
 func SetLocalIP(ip string) error { return l3.SetLocalIP(ip) }
