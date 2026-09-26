@@ -27,7 +27,7 @@ type Session struct {
 	stopped          bool
 	sequence         uint64
 	highest          uint64
-	window           uint64
+	window           replayWindow
 	handshakeTimeout time.Duration
 
 	helloInterval time.Duration
@@ -432,7 +432,7 @@ func (s *Session) resetLocked() {
 	s.ready = false
 	s.peer = [32]byte{}
 	s.remote = PeerParameters{}
-	s.sequence, s.highest, s.window = 0, 0, 0
+	s.sequence, s.highest, s.window = 0, 0, replayWindow{}
 	s.peerKeepalive = false
 	s.candidate = nil
 	if _, err := rand.Read(s.local[:]); err != nil {
@@ -905,7 +905,7 @@ func (s *Session) offerReplacementLocked(link *transportLink, sender [32]byte, p
 			Capabilities:  params.Capabilities & s.params.Capabilities,
 			MaxPacketSize: minInt(params.MaxPacketSize, s.params.MaxPacketSize),
 		}
-		s.sequence, s.highest, s.window = 0, 0, 0
+		s.sequence, s.highest, s.window = 0, 0, replayWindow{}
 		s.peerKeepalive = false
 		s.candidate = nil
 		for _, l := range s.links {
@@ -1066,26 +1066,57 @@ func (s *Session) receiveControl(link *transportLink, p []byte, env *control.Env
 	go cb(sub, payload)
 }
 
+// replayWindowSize is how far behind the newest sequence a data packet may
+// arrive and still be accepted once. Carriers of equal priority share
+// flows and can differ in latency by hundreds of milliseconds, thousands
+// of packets at speed, and cupsonline reorders whole batches across its
+// rooms; a 64-packet window dropped nearly all a slower carrier delivered.
+const replayWindowSize = 4096
+
+// replayWindow is a ring of bits, one per sequence number within
+// replayWindowSize of the newest one: set once that sequence was accepted.
+type replayWindow [replayWindowSize / 64]uint64
+
+func (w *replayWindow) has(seq uint64) bool {
+	i := seq % replayWindowSize
+	return w[i/64]&(1<<(i%64)) != 0
+}
+
+func (w *replayWindow) set(seq uint64) {
+	i := seq % replayWindowSize
+	w[i/64] |= 1 << (i % 64)
+}
+
+func (w *replayWindow) clear(seq uint64) {
+	i := seq % replayWindowSize
+	w[i/64] &^= 1 << (i % 64)
+}
+
+// acceptSequenceLocked accepts each sequence number at most once, and only
+// within replayWindowSize of the newest one seen. Caller holds s.mu.
 func (s *Session) acceptSequenceLocked(seq uint64) bool {
 	if seq == 0 {
 		return false
 	}
 	if seq > s.highest {
-		gap := seq - s.highest
-		if gap >= 64 {
-			s.window = 0
+		// The slots of the numbers skipped over still hold bits from a
+		// full turn of the ring ago.
+		if seq-s.highest >= replayWindowSize {
+			s.window = replayWindow{}
 		} else {
-			s.window <<= gap
+			for n := s.highest + 1; n < seq; n++ {
+				s.window.clear(n)
+			}
 		}
 		s.highest = seq
-		s.window |= 1
+		s.window.clear(seq)
+		s.window.set(seq)
 		return true
 	}
-	gap := s.highest - seq
-	if gap >= 64 || s.window&(uint64(1)<<gap) != 0 {
+	if s.highest-seq >= replayWindowSize || s.window.has(seq) {
 		return false
 	}
-	s.window |= uint64(1) << gap
+	s.window.set(seq)
 	return true
 }
 
