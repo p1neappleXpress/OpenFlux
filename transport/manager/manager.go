@@ -393,6 +393,9 @@ func (m *Manager) DispatchControl(sub control.Subtype, payload []byte) {
 			utils.Debugf("[MANAGER] bad AuthRequired payload: %v", err)
 			return
 		}
+		// The exit's side of that transport is stuck: stop routing through
+		// it here as well, the cookies that unstick it included.
+		m.session.MarkStalled(req.Transport)
 		m.mu.RLock()
 		cb := m.remoteAuth
 		m.mu.RUnlock()
@@ -522,6 +525,9 @@ func (m *Manager) SetCaptchaNotifier(n CaptchaNotifier) {
 // has to be passed from the exit's address anyway, so the report also goes
 // to the client over whichever carrier still reaches it.
 func (m *Manager) NotifyCaptcha(name, url, reason string) {
+	// A transport waiting on a check carries nothing; route around it,
+	// and in particular do not send its own AuthRequired through it.
+	m.session.MarkStalled(name)
 	m.mu.RLock()
 	n := m.captchaNotifier
 	m.mu.RUnlock()

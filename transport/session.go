@@ -294,6 +294,7 @@ func (s *Session) startLink(link *transportLink) error {
 
 	s.mu.Lock()
 	stopped := s.stopped
+	ready := s.ready
 	if !stopped {
 		link.started = true
 	}
@@ -302,6 +303,12 @@ func (s *Session) startLink(link *transportLink) error {
 		_ = link.batched.Stop()
 		_ = link.raw.Stop()
 		return errors.New("session stopped")
+	}
+	// A carrier that comes up in an established session (e.g. once a check
+	// was passed) is probed at once: the pong marks it heard, instead of it
+	// waiting for the next keepalive tick.
+	if ready {
+		go func() { _ = s.sendControlVia(link, control.SubtypeLinkPing, nil) }()
 	}
 	return nil
 }
@@ -497,11 +504,17 @@ func (s *Session) anyLive() bool {
 	return len(s.liveLinksLocked()) > 0
 }
 
-func (s *Session) liveLocked(l *transportLink) bool {
-	if l == nil || l.dead || !l.started || !l.raw.IsConnected() {
-		return false
-	}
-	return !s.peerKeepalive || time.Since(l.lastHeard) < s.linkTimeout
+// connectedLocked reports whether a carrier is up on this side.
+// Caller holds s.mu.
+func (s *Session) connectedLocked(l *transportLink) bool {
+	return l != nil && !l.dead && l.started && l.raw.IsConnected()
+}
+
+// heardLocked reports whether the peer was heard on a carrier within
+// linkTimeout: the carrier is known to work both ways, not just to be
+// attached to its document on this side. Caller holds s.mu.
+func (s *Session) heardLocked(l *transportLink) bool {
+	return s.connectedLocked(l) && time.Since(l.lastHeard) < s.linkTimeout
 }
 
 func (s *Session) ActiveTransport() string {
@@ -641,10 +654,28 @@ func (s *Session) Send(p []byte) error {
 	return chosen.batched.Send(raw)
 }
 
+// liveLinksLocked returns the carriers to route through, in priority order.
+//
+// Carriers the peer has been heard on come first; a carrier that is merely
+// connected on this side may be stuck on the other (a document attached
+// while the peer's side waits on a captcha), and ranking it by priority
+// alone sends everything into it until keepalives catch up. Only when no
+// carrier has been heard lately (a peer that predates keepalive and is
+// idle, or the heard ones just went away) do connected carriers stand in,
+// so sending is still tried rather than refused.
+// Caller holds s.mu.
 func (s *Session) liveLinksLocked() []*transportLink {
 	out := make([]*transportLink, 0, len(s.links))
 	for _, name := range s.order {
-		if l := s.links[name]; s.liveLocked(l) {
+		if l := s.links[name]; s.heardLocked(l) {
+			out = append(out, l)
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	for _, name := range s.order {
+		if l := s.links[name]; s.connectedLocked(l) {
 			out = append(out, l)
 		}
 	}
@@ -1077,6 +1108,19 @@ func (s *Session) Stats() TransportStats {
 	}
 	out.Connected = s.IsConnected()
 	return out
+}
+
+// MarkStalled forgets that the peer was heard on a carrier, so routing
+// prefers the others until something arrives on it again. It is for a
+// carrier known to be stuck, e.g. one that reported a captcha: it may stay
+// connected while nothing gets through.
+func (s *Session) MarkStalled(name string) {
+	s.mu.Lock()
+	if l, ok := s.links[name]; ok && !l.lastHeard.IsZero() {
+		l.lastHeard = time.Time{}
+		utils.Debugf("[SESSION] %q stalled: routing around it until the peer is heard on it", name)
+	}
+	s.mu.Unlock()
 }
 
 func (s *Session) MarkDead(name string) {
