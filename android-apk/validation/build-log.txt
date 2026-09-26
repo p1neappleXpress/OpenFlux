@@ -1,0 +1,26 @@
+Android (12027248, +pgo, +bolt, +lto, +mlgo, based on r522817) clang version 18.0.1 (https://android.googlesource.com/toolchain/llvm-project d8003a456d14a3deb8054cdaa529ffbf02d9b262)
+Target: aarch64-unknown-linux-android26
+Thread model: posix
+InstalledDir: /tmp/openflux-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin
+go version go1.26.4 linux/amd64
+Сборка Go-клиента для Android ARM64…
+universal-bypass-tool/tunnel
+universal-bypass-tool
+Сборка TUN → SOCKS5 / DNS TCP (JNI)…
+openflux-android-tun/bridge
+openflux-android-tun/cmd/jnibridge
+Компиляция ресурсов и Android-оболочки…
+Note: /workspace/scratch/bf139d2e0c04/OpenFlux-APK/src/local/openflux/client/MainActivity.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+Подпись APK…
+Verifies
+Verified using v1 scheme (JAR signing): false
+Verified using v2 scheme (APK Signature Scheme v2): true
+Verified using v3 scheme (APK Signature Scheme v3): true
+Verified using v3.1 scheme (APK Signature Scheme v3.1): false
+Verified using v4 scheme (APK Signature Scheme v4): false
+Verified for SourceStamp: false
+Number of signers: 1
+
+Готово: /workspace/scratch/bf139d2e0c04/OpenFlux-APK/dist/OpenFlux-local-arm64.apk
+-rw-r--r-- 1 root root 6.4M Sep 10 11:43 /workspace/scratch/bf139d2e0c04/OpenFlux-APK/dist/OpenFlux-local-arm64.apk
