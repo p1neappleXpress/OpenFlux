@@ -2,6 +2,7 @@ package yandex
 
 import (
 	"net/http"
+	"sync/atomic"
 	"testing"
 )
 
@@ -10,7 +11,9 @@ import (
 // queues.
 func TestRelayStopTwiceAndSendAfterStop(t *testing.T) {
 	cfg := DefaultVolgaConfig()
-	r := newRelayClient(&volgaAuth{Session: &http.Client{}}, cfg, &VolgaStats{})
+	var auth atomic.Pointer[volgaAuth]
+	auth.Store(&volgaAuth{Session: &http.Client{}})
+	r := newRelayClient(&auth, cfg, &VolgaStats{})
 	r.Start()
 	r.Stop()
 	r.Stop()
