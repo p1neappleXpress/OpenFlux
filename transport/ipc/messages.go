@@ -58,6 +58,9 @@ type StatusPayload struct {
 	BytesIn   uint64 `json:"bytes_in"`
 	BytesOut  uint64 `json:"bytes_out"`
 	UptimeMs  int64  `json:"uptime_ms"`
+	// Active names the carrier data currently goes through ("" when none
+	// reaches the peer). Sessions only.
+	Active string `json:"active,omitempty"`
 }
 
 type CommandPayload struct {
