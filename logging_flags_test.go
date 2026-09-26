@@ -46,6 +46,11 @@ func TestPickSessionContext(t *testing.T) {
 		{"highest-priority transport URL", "", "http://#", specs, "https://docs/doc"},
 		{"no URL anywhere keeps the old default", "", "http://#", specs[:1], "http://#"},
 		{"legacy single transport", "", "http://#", []transportSpec{{Type: "yandex", Priority: 100, URL: "http://#"}}, "http://#"},
+		{"cupsonline rooms are not a context", "", "http://#", []transportSpec{
+			{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"},
+			{Type: "yandex", Priority: 50, URL: "https://docs/doc"},
+		}, "https://docs/doc"},
+		{"cupsonline alone", "", "http://#", []transportSpec{{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"}}, "http://#"},
 	}
 	for _, c := range cases {
 		if got := pickSessionContext(c.explicit, c.url, c.specs); got != c.want {

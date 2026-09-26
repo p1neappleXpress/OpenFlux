@@ -144,8 +144,13 @@ func isNumber(s string) bool {
 //
 //	explicit      --session-context, if non-empty
 //	--url         globalURL, if set and not the placeholder
-//	transports    URL of the highest-priority transport that has one
+//	transports    URL of the highest-priority transport that has one,
+//	              cupsonline aside
 //	fallback      the placeholder "http://#"
+//
+// A cupsonline "URL" is the room list the exit creates when it starts and
+// prints for clients, so the exit cannot know it beforehand; letting it
+// into the context gave the two sides different keys.
 //
 // This is what the OpenFlux-Android client derives for a Session profile,
 // and the fallback is what older builds used whenever --url was unset, so a
@@ -160,7 +165,10 @@ func pickSessionContext(explicit, globalURL string, specs []transportSpec) strin
 	}
 	best := -1
 	for i, s := range specs {
-		if s.URL != "" && s.URL != placeholder && (best < 0 || s.Priority > specs[best].Priority) {
+		if s.Type == "cupsonline" || s.URL == "" || s.URL == placeholder {
+			continue
+		}
+		if best < 0 || s.Priority > specs[best].Priority {
 			best = i
 		}
 	}
