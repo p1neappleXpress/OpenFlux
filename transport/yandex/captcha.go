@@ -22,6 +22,16 @@ import (
 //
 // Возвращает retpath (пустая строка = капча не требовалась).
 // Cookies в jar обновляются на месте.
+// safeVolgaURL keeps only scheme and host for logs: document ids and
+// captcha keys in paths and queries are secrets.
+func safeVolgaURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<invalid URL>"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, error) {
 	if jar == nil {
 		return "", fmt.Errorf("captcha: nil cookiejar")

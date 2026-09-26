@@ -1341,6 +1341,12 @@ func maxU64(a, b uint64) uint64 {
 }
 
 // jar returns the transport's shared cookie jar (never nil).
+// LoadCookieFile imports a Netscape cookies.txt (yandex.ru cookies only)
+// into the transport's cookie jar, so it opens the document signed in.
+func (t *YandexVolgaTransport) LoadCookieFile(path string) error {
+	return loadYandexCookies(path, t.jar())
+}
+
 func (t *YandexVolgaTransport) jar() *cookiejar.Jar {
 	t.jarMu.RLock()
 	jar := t.cookieJar

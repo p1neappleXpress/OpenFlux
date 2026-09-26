@@ -152,6 +152,7 @@ func main() {
 			"\"direct:100,yandex:50,mailru:30\". If empty, --transport is used as a single transport.")
 	yandexURL := flag.String("yandex-url", "", "URL for the yandex transport (overrides --url in --transports mode)")
 	vyandexURL := flag.String("vyandex-url", "", "URL for the vyandex transport")
+	flag.StringVar(&yandexCookiesFile, "yandex-cookies-file", "", "Netscape cookies.txt with a Yandex login for vyandex transports")
 	boardsURL := flag.String("boards-url", "", "URL for the boards transport")
 	mailruURL := flag.String("mailru-url", "", "URL (weblink) for the mailru transport")
 	cupsonlineURL := flag.String("cupsonline-url", "", "URL for the cupsonline transport")
@@ -218,6 +219,9 @@ TRANSPORTS  (multi-transport session; requires --encryption-key-file)
                                Session; IPv4 flows are hashed across them.
       --yandex-url=<URL>       URL for the yandex transport.
       --vyandex-url=<URL>      URL for the vyandex transport.
+      --yandex-cookies-file=<path>
+                               Netscape cookies.txt with a Yandex login for
+                               vyandex transports.
       --boards-url=<URL>       URL for the boards transport.
       --mailru-url=<WEBLINK>   Weblink for the mailru transport.
       --cupsonline-url=<URL>   URL for the cupsonline transport.
@@ -635,7 +639,11 @@ DEPRECATED (removed in v2)
 		case "boards":
 			inner = yandex.NewBoardsTransport(globalDocUrl, config)
 		case "vyandex":
-			inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
+			t, err := newVolgaTransport(globalDocUrl, config)
+			if err != nil {
+				log.Fatalf("vyandex: %v", err)
+			}
+			inner = t
 		case "yandex":
 			inner = yandex.NewYandexDocsTransport(globalDocUrl, config)
 		case "oneme":

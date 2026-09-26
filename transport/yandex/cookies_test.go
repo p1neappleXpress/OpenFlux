@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"openflux/transport"
 )
 
 func writeCookieFile(t *testing.T, contents string) string {
@@ -81,9 +83,21 @@ func TestLoadYandexCookiesAcceptsEmptyValue(t *testing.T) {
 	}
 }
 
-func TestAuthorizeInvalidCookieFileFailsBeforeRequest(t *testing.T) {
-	_, err := authorize("https://docs.yandex.ru/edit/d/test", writeCookieFile(t, "invalid"))
-	if err == nil || !strings.Contains(err.Error(), "cookie") {
+func TestVolgaLoadCookieFileFillsTheSharedJar(t *testing.T) {
+	tr := NewYandexVolgaTransport("https://docs.yandex.ru/edit/d/test", transport.DefaultConfig())
+	if err := tr.LoadCookieFile(writeCookieFile(t, "invalid")); err == nil || !strings.Contains(err.Error(), "cookie") {
 		t.Fatalf("expected cookie file error, got %v", err)
+	}
+	path := writeCookieFile(t, ".yandex.ru\tTRUE\t/\tTRUE\t0\tSession_id\tsecret\n")
+	if err := tr.LoadCookieFile(path); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse("https://docs.yandex.ru/edit/d/test")
+	found := false
+	for _, c := range tr.jar().Cookies(u) {
+		found = found || (c.Name == "Session_id" && c.Value == "secret")
+	}
+	if !found {
+		t.Fatal("the login cookie did not reach the transport's jar")
 	}
 }
