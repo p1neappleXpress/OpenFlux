@@ -147,15 +147,17 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 	b.userCb = callback
 	b.mu.Unlock()
 
+	// Frames here are plaintext and can carry control messages with cookie
+	// jars, so their hexdumps need --sensitive as well as -ddd.
 	b.Transport.Receive(func(data []byte) {
 		utils.Debugf("[BATCH] Recv: %d wire bytes", len(data))
-		if utils.IsVerbose() {
+		if utils.IsVerbose() && utils.Sensitive() {
 			utils.Debugf("[BATCH] Recv wire hexdump:\n%s", hex.Dump(data))
 		}
 		pkts, err := decodeBatch(data)
 		if err != nil {
 			utils.Debugf("[BATCH] decode error (%d bytes): %v", len(data), err)
-			if utils.IsVerbose() {
+			if utils.IsVerbose() && utils.Sensitive() {
 				utils.Debugf("[BATCH] bad frame hexdump:\n%s", hex.Dump(data))
 			}
 			return
@@ -170,7 +172,7 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 		}
 		for i, p := range pkts {
 			utils.Debugf("[BATCH] Recv: delivering packet %d/%d size=%d", i+1, len(pkts), len(p))
-			if utils.IsVerbose() {
+			if utils.IsVerbose() && utils.Sensitive() {
 				utils.Debugf("[BATCH] packet %d hexdump:\n%s", i+1, hex.Dump(p))
 			}
 			cb(p)
@@ -242,7 +244,7 @@ func (b *BatchedTransport) flushLoop() {
 		encoded := encodeBatch(batch)
 		utils.Debugf("[BATCH] flushLoop: sending batch of %d packets (%d raw -> %d wire bytes)",
 			len(batch), size, len(encoded))
-		if utils.IsVerbose() {
+		if utils.IsVerbose() && utils.Sensitive() {
 			utils.Debugf("[BATCH] flushLoop: batch hexdump:\n%s", hex.Dump(encoded))
 		}
 		if err := b.Transport.Send(encoded); err != nil {

@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
+	"openflux/network"
 	"openflux/utils"
 )
 
@@ -213,6 +214,7 @@ func (pt *PacketTunnel) dnsOverTCP(dest string, query []byte) ([]byte, error) {
 
 // WriteInbound injects one IPv4 packet coming from the device into the stack.
 func (pt *PacketTunnel) WriteInbound(ipPacket []byte) {
+	network.LogPacket("PKT", network.DirOutbound, ipPacket)
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(append([]byte{}, ipPacket...)),
 	})
@@ -231,6 +233,7 @@ func (pt *PacketTunnel) ReadOutbound(ctx context.Context) []byte {
 	data := append([]byte(nil), view.ToSlice()...)
 	view.Release()
 	p.DecRef()
+	network.LogPacket("PKT", network.DirInbound, data)
 	return data
 }
 

@@ -110,11 +110,15 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 			tunnelEP.SetMTU(uint32(min(1500, p.MaxPacketSize)))
 		}
 	}
+	// "->" points towards the internet and "<-" back towards the device on
+	// both sides, as in the L3 and utun logs, so one flow reads the same in
+	// the client's and the exit's log.
+	toPeer, fromPeer := network.DirOutbound, network.DirInbound
+	if isExitNode {
+		toPeer, fromPeer = network.DirInbound, network.DirOutbound
+	}
 	tunnelEP.onOutgoingPacket = func(data []byte) {
-		// `->` : emitted by the local stack, going to the peer / internet.
-		if utils.Level() >= 1 {
-			utils.Debugf("[TUNNEL] %s", network.FormatPacket(network.DirOutbound, data))
-		}
+		network.LogPacket("TUNNEL", toPeer, data)
 		if err := trans.Send(data); err != nil {
 			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
 		}
@@ -133,10 +137,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	}
 
 	trans.Receive(func(data []byte) {
-		// `<-` : received from the peer / internet, going into the local stack.
-		if utils.Level() >= 1 {
-			utils.Debugf("[TUNNEL] %s", network.FormatPacket(network.DirInbound, data))
-		}
+		network.LogPacket("TUNNEL", fromPeer, data)
 		tunnelEP.InjectInbound(data)
 	})
 

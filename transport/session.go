@@ -53,17 +53,17 @@ type Session struct {
 	wg   sync.WaitGroup
 
 	// Counters for diagnostics.
-	cntHelloSent    atomic.Uint64
-	cntHelloRecv    atomic.Uint64
-	cntHelloAccept  atomic.Uint64
-	cntHelloReject  atomic.Uint64
-	cntDataSent     atomic.Uint64
-	cntDataRecv     atomic.Uint64
-	cntDataDrop     atomic.Uint64
-	cntCtrlSent     atomic.Uint64
-	cntCtrlRecv     atomic.Uint64
-	cntDecodeErr    atomic.Uint64
-	cntUnknownKind  atomic.Uint64
+	cntHelloSent   atomic.Uint64
+	cntHelloRecv   atomic.Uint64
+	cntHelloAccept atomic.Uint64
+	cntHelloReject atomic.Uint64
+	cntDataSent    atomic.Uint64
+	cntDataRecv    atomic.Uint64
+	cntDataDrop    atomic.Uint64
+	cntCtrlSent    atomic.Uint64
+	cntCtrlRecv    atomic.Uint64
+	cntDecodeErr   atomic.Uint64
+	cntUnknownKind atomic.Uint64
 }
 
 type candidatePeer struct {
@@ -638,9 +638,6 @@ func (s *Session) Send(p []byte) error {
 	if n == 1 || n%100 == 0 {
 		utils.Debugf("[SESSION] send IPv4 #%d seq=%d via %q size=%d proto=%d", n, seq, chosen.name, len(p), p[9])
 	}
-	if utils.IsVerbose() && utils.Sensitive() {
-		utils.Debugf("[SESSION] send IPv4 hexdump:\n%s", hex.Dump(p))
-	}
 	return chosen.batched.Send(raw)
 }
 
@@ -699,7 +696,7 @@ func (s *Session) sendControlVia(link *transportLink, subtype control.Subtype, p
 	n := s.cntCtrlSent.Add(1)
 	utils.Debugf("[SESSION] control #%d -> %q subtype=0x%02x payloadLen=%d size=%d",
 		n, link.name, subtype, len(payload), len(raw))
-	if utils.IsVerbose() {
+	if utils.IsVerbose() && utils.Sensitive() {
 		utils.Debugf("[SESSION] control hexdump:\n%s", hex.Dump(raw))
 	}
 	return link.batched.Send(raw)
@@ -737,7 +734,7 @@ func (s *Session) receive(link *transportLink, p []byte) {
 		s.cntDecodeErr.Add(1)
 		utils.Debugf("[SESSION] decode error #%d from %q (%d bytes): %v",
 			s.cntDecodeErr.Load(), link.name, len(p), err)
-		if utils.IsVerbose() {
+		if utils.IsVerbose() && utils.Sensitive() {
 			utils.Debugf("[SESSION] malformed packet hexdump:\n%s", hex.Dump(p))
 		}
 		return
@@ -761,7 +758,7 @@ func (s *Session) receive(link *transportLink, p []byte) {
 		s.cntUnknownKind.Add(1)
 		utils.Debugf("[SESSION] unknown kind 0x%02x #%d from %q, ignoring",
 			env.Kind, s.cntUnknownKind.Load(), link.name)
-		if utils.IsVerbose() {
+		if utils.IsVerbose() && utils.Sensitive() {
 			utils.Debugf("[SESSION] unknown-kind hexdump:\n%s", hex.Dump(p))
 		}
 	}
@@ -1027,7 +1024,7 @@ func (s *Session) receiveControl(link *transportLink, p []byte, env *control.Env
 	n := s.cntCtrlRecv.Add(1)
 	utils.Debugf("[SESSION] control #%d from %q subtype=0x%02x payloadLen=%d",
 		n, link.name, sub, env.Control.PayloadLen)
-	if utils.IsVerbose() {
+	if utils.IsVerbose() && utils.Sensitive() {
 		utils.Debugf("[SESSION] control payload hexdump:\n%s", hex.Dump(p))
 	}
 	if cb == nil {

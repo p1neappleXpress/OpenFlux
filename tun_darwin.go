@@ -3,14 +3,14 @@
 package main
 
 import (
-	"encoding/hex"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
+
+	"golang.org/x/sys/unix"
 
 	"openflux/network"
 	"openflux/transport"
@@ -163,12 +163,7 @@ func (c *TUNClient) readFromTun() {
 		c.packetsOut.Add(1)
 
 		// -> : packet leaves the device towards the tunnel / exit.
-		if utils.Level() >= 1 {
-			utils.Debugf("[TUN] %s", network.FormatPacket(network.DirOutbound, pkt))
-		}
-		if utils.IsVerbose() && utils.Sensitive() {
-			utils.Debugf("[TUN] ->net payload hexdump:\n%s", hex.Dump(pkt))
-		}
+		network.LogPacket("TUN", network.DirOutbound, pkt)
 
 		if err := c.trans.Send(pkt); err != nil {
 			utils.Debugf("[TUN] trans.Send FAIL: %v", err)
@@ -181,12 +176,7 @@ func (c *TUNClient) writeToTun() {
 		c.packetsIn.Add(1)
 
 		// <- : packet arrives from the tunnel / exit towards the device.
-		if utils.Level() >= 1 {
-			utils.Debugf("[TUN] %s", network.FormatPacket(network.DirInbound, pkt))
-		}
-		if utils.IsVerbose() && utils.Sensitive() {
-			utils.Debugf("[TUN] <-net payload hexdump:\n%s", hex.Dump(pkt))
-		}
+		network.LogPacket("TUN", network.DirInbound, pkt)
 
 		out := make([]byte, 4+len(pkt))
 		out[3] = 2 // AF_INET

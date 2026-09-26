@@ -7,107 +7,134 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 )
 
-// Debug levels:
+// Debug levels. Each level prints everything the ones below it do.
 //
-//	0 — off (only Infof and log.* go out)
-//	1 — -d  : operational logs (connection events, state changes, errors)
-//	2 — -dd : everything from 1 plus hexdumps of every packet
+//	0  (default)   off: only Infof and log.* status lines
+//	1  -d          packet movement: one line per IPv4 packet crossing the
+//	               tunnel, "-> 52 bytes - UDP 10.10.10.2:53000 -> 8.8.8.8:53 ..."
+//	2  -dd         operational logs: sessions, carriers, handshakes, crypto,
+//	               control messages, errors
+//	3  -ddd        hexdumps of packets and frames
 //
-// --sensitive is a separate boolean: when on, functions that would
-// otherwise redact secrets (raw session keys, secret file bytes, decrypted
-// payloads, cookie jars) print them in full. It is independent of level:
-// you can have -dd --sensitive or -d --sensitive.
-var (
-	debugLog  *log.Logger
-	level     atomic.Int32
-	sensitive atomic.Bool
-	output    io.Writer = os.Stderr
+// --sensitive is separate from the level: it adds key material and cookie
+// jars to whatever the level prints.
+const (
+	LevelOff     = 0
+	LevelPackets = 1
+	LevelDebug   = 2
+	LevelHexdump = 3
 )
 
-// SetOutput redirects all debug and standard log output to w.
-// Used by the mobile bridge to pipe logs into the app UI.
-func SetOutput(w io.Writer) {
-	output = w
-	log.SetOutput(w)
-	if debugLog != nil {
-		debugLog.SetOutput(w)
-	}
+// The logger is created once and never replaced: the mobile bridges change
+// the level and the output on every connect while goroutines of the
+// previous connection may still be logging.
+var (
+	level     atomic.Int32
+	sensitive atomic.Bool
+	output    = &swapWriter{}
+	debugLog  = log.New(output, "", log.LstdFlags|log.Lmicroseconds)
+	logSinkMu sync.RWMutex
+	logSink   func(string)
+)
+
+func init() {
+	output.Set(os.Stderr)
 }
 
-// SetLevel sets the debug level (0/1/2). Level >=1 enables Debugf;
-// level >=2 additionally enables verbose hexdumps (IsVerbose).
+// swapWriter lets SetOutput redirect a logger that is already in use.
+type swapWriter struct {
+	w atomic.Pointer[io.Writer]
+}
+
+func (s *swapWriter) Set(w io.Writer) { s.w.Store(&w) }
+
+func (s *swapWriter) Write(p []byte) (int, error) { return (*s.w.Load()).Write(p) }
+
+// SetOutput redirects debug and standard log output to w.
+// Used by the iOS bridge to keep logs in its ring buffer.
+func SetOutput(w io.Writer) {
+	output.Set(w)
+	log.SetOutput(w)
+}
+
+// SetLogSink mirrors every debug message (packet lines included) to an
+// embedding application, e.g. the Android log screen. nil stops it.
+func SetLogSink(sink func(string)) {
+	logSinkMu.Lock()
+	logSink = sink
+	logSinkMu.Unlock()
+}
+
+// SetLevel sets the debug level, clamped to LevelOff..LevelHexdump.
 func SetLevel(n int) {
-	if n < 0 {
-		n = 0
-	}
-	if n > 2 {
-		n = 2
-	}
+	n = min(max(n, LevelOff), LevelHexdump)
 	level.Store(int32(n))
-	if n >= 1 {
-		debugLog = log.New(output, "", log.LstdFlags|log.Lmicroseconds)
-		log.SetOutput(output)
+	if n > LevelOff {
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	}
 }
 
-// Level returns the current debug level (0/1/2).
+// Level returns the current debug level.
 func Level() int {
 	return int(level.Load())
 }
 
-// SetSensitive toggles sensitive-data output (secrets, keys, plaintext).
+// EnableDebug turns on operational logs (LevelDebug), what debug meant
+// before there were levels.
+func EnableDebug() {
+	SetLevel(LevelDebug)
+}
+
+// SetDebug turns operational logs on (LevelDebug) or all debug output off.
+func SetDebug(on bool) {
+	if on {
+		SetLevel(LevelDebug)
+		return
+	}
+	SetLevel(LevelOff)
+}
+
+// IsVerbose reports whether hexdumps are enabled (LevelHexdump).
+func IsVerbose() bool {
+	return Level() >= LevelHexdump
+}
+
+// SetSensitive toggles logging of key material and cookie jars.
 func SetSensitive(on bool) {
 	sensitive.Store(on)
 }
 
-// Sensitive reports whether sensitive data may be logged.
+// Sensitive reports whether key material and cookie jars may be logged.
 func Sensitive() bool {
 	return sensitive.Load()
 }
 
-// EnableDebug is a compatibility shim for older call sites; it is
-// equivalent to SetLevel(2).
-func EnableDebug() {
-	SetLevel(2)
-}
-
-// SetDebug is a compatibility shim: on=true -> level 2, off -> level 0.
-func SetDebug(on bool) {
-	if on {
-		SetLevel(2)
-		return
+// Packetf logs a packet-movement line (LevelPackets and up).
+func Packetf(format string, args ...interface{}) {
+	if Level() >= LevelPackets {
+		emit(fmt.Sprintf(format, args...))
 	}
-	SetLevel(0)
 }
 
-// IsVerbose reports whether hexdump-level output is enabled.
-// Kept for compatibility with code that already calls it.
-func IsVerbose() bool {
-	return Level() >= 2
-}
-
+// Debugf logs an operational message (LevelDebug and up).
 func Debugf(format string, args ...interface{}) {
-	if Level() >= 1 {
-		debugLog.Output(2, fmt.Sprintf(format, args...))
+	if Level() >= LevelDebug {
+		emit(fmt.Sprintf(format, args...))
 	}
 }
 
-// Verbosef only logs at level >= 2. Prefer wrapping hexdumps with
-// "if utils.IsVerbose()" for clarity, but this is available.
-func Verbosef(format string, args ...interface{}) {
-	if Level() >= 2 {
-		debugLog.Output(2, fmt.Sprintf(format, args...))
-	}
-}
+func emit(message string) {
+	debugLog.Output(3, message)
 
-// Sensitivef logs only when --sensitive is on AND level >= 1.
-func Sensitivef(format string, args ...interface{}) {
-	if Level() >= 1 && sensitive.Load() {
-		debugLog.Output(2, fmt.Sprintf(format, args...))
+	logSinkMu.RLock()
+	sink := logSink
+	logSinkMu.RUnlock()
+	if sink != nil {
+		sink(message)
 	}
 }
 
@@ -141,18 +168,4 @@ func Sha256Hex(b []byte) string {
 func Sha256Short(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:8])
-}
-
-// Redact returns "" at level <1, a short hash at level 1, and the raw bytes
-// at level 2 with --sensitive. Used for secrets that should not be logged
-// in full unless explicitly requested.
-func Redact(label string, b []byte) string {
-	switch {
-	case level.Load() < 1:
-		return ""
-	case sensitive.Load():
-		return fmt.Sprintf("%s[len=%d hex=%s]", label, len(b), hex.EncodeToString(b))
-	default:
-		return fmt.Sprintf("%s[len=%d sha256=%s]", label, len(b), Sha256Short(b))
-	}
 }
