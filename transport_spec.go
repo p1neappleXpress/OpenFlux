@@ -50,7 +50,9 @@ func parseTransportList(s string) ([]transportSpec, error) {
 // per-type URL flags (--yandex-url, --mailru-url, ...) and global settings.
 func buildTransportSpecs(specs []transportSpec, urls map[string]string, extra map[string]map[string]interface{}) []transportSpec {
 	for i := range specs {
-		if u, ok := urls[specs[i].Type]; ok {
+		// Only a flag that was set overrides: the unset ones are "" and
+		// would wipe the URL of a .conf [Transport] section.
+		if u, ok := urls[specs[i].Type]; ok && u != "" {
 			specs[i].URL = u
 		}
 		if p, ok := extra[specs[i].Type]; ok {
