@@ -406,6 +406,11 @@ DEPRECATED (removed in v2)
 		flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 		applyConfString(conf.Interface, "Role", "role", role, setFlags)
+		// Role may have just changed: isExit above was computed from the
+		// pre-.conf value, so a config-only "Role = exit" (no --role on the
+		// command line, as every node-wizard deployment runs) left isExit
+		// stuck at false. Recompute before it's used below.
+		isExit = *role == roleExit || *role == roleBenchSink
 		applyConfString(conf.Interface, "Inbound", "inbound", inbound, setFlags)
 		applyConfString(conf.Interface, "Transport", "transport", transportType, setFlags)
 		applyConfString(conf.Interface, "Mode", "mode", mode, setFlags)
