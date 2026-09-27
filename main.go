@@ -616,6 +616,9 @@ DEPRECATED (removed in v2)
 	//   --transports=direct:100,yandex:50  -> multi-transport session
 	//   --transport=<type>                 -> legacy single-transport mode
 	var specs []transportSpec
+	// Running transports whose client address (cupsonline rooms) exists only
+	// once they start, by spec name, for --share.
+	rooms := make(map[string]roomLister)
 	if len(confTransports) > 0 {
 		specs = confTransports
 		// Per-type URL flags still override config values.
@@ -745,7 +748,7 @@ DEPRECATED (removed in v2)
 		factory := transportFactory(config)
 		managerInst = manager.New(sess, factory, secret, sessionContext)
 
-		if err := registerBootstrapTransports(managerInst, specs, config, secret, sessionContext); err != nil {
+		if err := registerBootstrapTransports(managerInst, specs, config, secret, sessionContext, rooms); err != nil {
 			log.Fatalf("bootstrap transports: %v", err)
 		}
 
@@ -824,7 +827,9 @@ DEPRECATED (removed in v2)
 			uidint, _ := strconv.ParseInt(maxUid, 10, 64)
 			inner = oneme.NewOneMeTransport(isExit, maxToken, uidint, config)
 		case "cupsonline":
-			inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, !isExit)
+			c := cupsonline.NewCupsonlineTransport(globalDocUrl, config, !isExit)
+			rooms[specs[0].Name] = c
+			inner = c
 		case "mailru":
 			inner = mailru.NewMailruDocsTransport(globalDocUrl, config)
 		default:
@@ -917,7 +922,15 @@ DEPRECATED (removed in v2)
 			if host == "" {
 				host = publicIPv4()
 			}
-			printShare(shareConfig(specs, session, *codec, secret, sessionContext, host))
+			printLink := func() {
+				printShare(shareConfig(specs, session, *codec, secret, sessionContext, host, rooms))
+			}
+			// Rooms created later (a start that failed and was retried)
+			// or anew change the link: print it again for the clients.
+			for _, r := range rooms {
+				r.OnRoomList(func(string) { printLink() })
+			}
+			printLink()
 		}
 		runExit(trans, exitMode)
 	case roleClient:

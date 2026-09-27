@@ -77,12 +77,16 @@ func makeRawTransport(spec transportSpec, baseCfg transport.TransportConfig) (tr
 
 // registerBootstrapTransports wires every spec into the manager, and also
 // calls Session.AddTransport with the shared secret/context so the handshake
-// can use any of them.
-func registerBootstrapTransports(m *manager.Manager, specs []transportSpec, baseCfg transport.TransportConfig, secret, ctx string) error {
+// can use any of them. Transports that learn their client address only when
+// running go into rooms by spec name, for --share.
+func registerBootstrapTransports(m *manager.Manager, specs []transportSpec, baseCfg transport.TransportConfig, secret, ctx string, rooms map[string]roomLister) error {
 	for _, spec := range specs {
 		raw, err := makeRawTransport(spec, baseCfg)
 		if err != nil {
 			return fmt.Errorf("%s: %w", spec.Name, err)
+		}
+		if r, ok := raw.(roomLister); ok {
+			rooms[spec.Name] = r
 		}
 		var provider manager.CookieProvider
 		if p, ok := raw.(manager.CookieProvider); ok {

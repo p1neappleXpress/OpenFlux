@@ -157,6 +157,9 @@ func classicTransport(transportType, documentURL, encryptionSecret, codec, maxTo
 	}
 	attachCaptcha(transportType, documentURL, inner)
 	setClassicRoute(transportType)
+	if exit {
+		addExitRoom(transportType, inner)
+	}
 
 	// App-layer codec, same as the CLI's --codec flag. Both peers must use
 	// the same one. Applied before encryption so it compresses plaintext

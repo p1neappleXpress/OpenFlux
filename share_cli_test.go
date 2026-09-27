@@ -15,7 +15,7 @@ func TestShareConfigFromExitSpecs(t *testing.T) {
 		{Name: "yandex", Type: "yandex", Priority: 50, URL: "https://disk.yandex.ru/i/abc"},
 		{Name: "oneme", Type: "oneme", Priority: 10},
 	}
-	c, skipped := shareConfig(specs, true, codecBatched, "a shared secret of 32 characters", "https://disk.yandex.ru/i/abc", "203.0.113.7")
+	c, skipped := shareConfig(specs, true, codecBatched, "a shared secret of 32 characters", "https://disk.yandex.ru/i/abc", "203.0.113.7", nil)
 	if len(skipped) != 1 || !strings.HasPrefix(skipped[0], "oneme") {
 		t.Fatalf("skipped = %v, want the MAX transport only", skipped)
 	}
@@ -32,8 +32,31 @@ func TestShareConfigFromExitSpecs(t *testing.T) {
 		t.Fatalf("decoded %+v", got)
 	}
 
-	_, skipped = shareConfig(specs[:1], true, codecBatched, "a shared secret of 32 characters", "", "")
+	_, skipped = shareConfig(specs[:1], true, codecBatched, "a shared secret of 32 characters", "", "", nil)
 	if len(skipped) != 1 {
 		t.Fatal("direct without a host to share must be left out")
+	}
+}
+
+type fakeRooms struct{ list string }
+
+func (f *fakeRooms) RoomList() string        { return f.list }
+func (f *fakeRooms) OnRoomList(func(string)) {}
+
+// A cupsonline exit started without --url creates its rooms at start; the
+// link must carry them, or the client has nothing to join.
+func TestShareConfigCarriesCreatedCupsRooms(t *testing.T) {
+	specs := []transportSpec{{Name: "cupsonline", Type: "cupsonline", Priority: 50}}
+	rooms := map[string]roomLister{"cupsonline": &fakeRooms{}}
+
+	_, skipped := shareConfig(specs, true, codecBatched, "a shared secret of 32 characters", "http://#", "", rooms)
+	if len(skipped) != 1 || !strings.HasPrefix(skipped[0], "cupsonline") {
+		t.Fatalf("skipped = %v, want cupsonline left out before its rooms exist", skipped)
+	}
+
+	rooms["cupsonline"].(*fakeRooms).list = "WyJyb29tLTEiXQ"
+	c, skipped := shareConfig(specs, true, codecBatched, "a shared secret of 32 characters", "http://#", "", rooms)
+	if len(skipped) != 0 || len(c.Transports) != 1 || c.Transports[0].URL != "WyJyb29tLTEiXQ" {
+		t.Fatalf("transports %+v, skipped %v", c.Transports, skipped)
 	}
 }

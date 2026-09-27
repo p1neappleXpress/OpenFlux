@@ -72,3 +72,36 @@ func TestParseShareLinkRejectsGarbage(t *testing.T) {
 		t.Fatal("accepted a non-openflux link")
 	}
 }
+
+type fakeRooms string
+
+func (f fakeRooms) RoomList() string { return string(f) }
+
+// A cupsonline exit started without a room list creates its rooms at start;
+// the link must carry them, or the client has nothing to join.
+func TestExitShareLinkCarriesCreatedCupsRooms(t *testing.T) {
+	tmpl := exitShareSession(`[{"name":"cupsonline","type":"cupsonline","priority":50}]`, "a shared secret of 32 characters")
+	if tmpl == nil || len(tmpl.Transports) != 1 || tmpl.Transports[0].URL != "" {
+		t.Fatalf("template %+v", tmpl)
+	}
+	exitNode.mu.Lock()
+	exitNode.share, exitNode.rooms = tmpl, map[string]roomLister{"cupsonline": fakeRooms("WyJyb29tLTEiXQ")}
+	exitNode.mu.Unlock()
+	t.Cleanup(func() {
+		exitNode.mu.Lock()
+		exitNode.share, exitNode.rooms = nil, nil
+		exitNode.mu.Unlock()
+	})
+
+	link, err := ExitShareLink("", "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := share.Decode(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Transports) != 1 || c.Transports[0].URL != "WyJyb29tLTEiXQ" {
+		t.Fatalf("transports %+v", c.Transports)
+	}
+}

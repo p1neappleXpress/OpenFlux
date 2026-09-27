@@ -21,7 +21,27 @@ var exitNode = struct {
 	node      tunnel.ExitNode
 	// share is what ExitShareLink hands to clients; nil when not running.
 	share *share.Config
+	// rooms are the transports whose client address exists only once they
+	// run (cupsonline's rooms), by name, filled in by ExitShareLink.
+	rooms map[string]roomLister
 }{}
+
+type roomLister interface{ RoomList() string }
+
+// addExitRoom remembers raw for ExitShareLink when its rooms are known only
+// once it runs. Called while the exit's transports are built.
+func addExitRoom(name string, raw transport.Transport) {
+	r, ok := raw.(roomLister)
+	if !ok {
+		return
+	}
+	exitNode.mu.Lock()
+	if exitNode.rooms == nil {
+		exitNode.rooms = make(map[string]roomLister)
+	}
+	exitNode.rooms[name] = r
+	exitNode.mu.Unlock()
+}
 
 // StartExit starts the exit node in classic single-transport mode; the
 // arguments are those of Start. Returns "" or a user-readable error.
@@ -48,6 +68,7 @@ func startExitWith(build func() (transport.Transport, error), shareCfg *share.Co
 		exitNode.mu.Unlock()
 		return ""
 	}
+	exitNode.rooms = nil
 	exitNode.mu.Unlock()
 
 	utils.SetLevel(int(debugLevel.Load()))
@@ -87,6 +108,7 @@ func StopExit() {
 	exitNode.mu.Lock()
 	trans, node := exitNode.transport, exitNode.node
 	exitNode.running, exitNode.transport, exitNode.node, exitNode.share = false, nil, nil, nil
+	exitNode.rooms = nil
 	exitNode.mu.Unlock()
 	detachCaptcha()
 	CancelCaptcha()

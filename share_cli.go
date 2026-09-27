@@ -9,10 +9,18 @@ import (
 	"openflux/share"
 )
 
+// roomLister is a transport whose address for clients exists only once it
+// runs: cupsonline, whose exit creates its rooms at start when given no --url.
+type roomLister interface {
+	RoomList() string
+	OnRoomList(func(packed string))
+}
+
 // shareConfig describes this exit to its clients for --share: the same
-// transports, secret and encryption context, with direct pointing at host.
-// It also returns the transports left out and why.
-func shareConfig(specs []transportSpec, session bool, codec, secret, context, host string) (share.Config, []string) {
+// transports, secret and encryption context, with direct pointing at host
+// and cupsonline carrying the rooms its running transport (in rooms, by
+// spec name) entered. It also returns the transports left out and why.
+func shareConfig(specs []transportSpec, session bool, codec, secret, context, host string, rooms map[string]roomLister) (share.Config, []string) {
 	name := "OpenFlux"
 	if h, err := os.Hostname(); err == nil && h != "" {
 		name += " " + h
@@ -40,8 +48,13 @@ func shareConfig(specs []transportSpec, session bool, codec, secret, context, ho
 			skipped = append(skipped, s.Name+": a MAX token belongs to one account; clients need their own")
 			continue
 		case "cupsonline":
-			if s.URL == "" {
-				skipped = append(skipped, s.Name+": rooms are created at startup; share the room list it prints")
+			if r := rooms[s.Name]; r != nil {
+				if list := r.RoomList(); list != "" {
+					t.URL = list
+				}
+			}
+			if t.URL == "" {
+				skipped = append(skipped, s.Name+": no rooms yet; the link is printed again once they exist")
 				continue
 			}
 		}

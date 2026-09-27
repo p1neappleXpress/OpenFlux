@@ -88,6 +88,9 @@ func buildSessionWith(specsJSON, secret string, exit bool) (transport.Transport,
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: %w", spec.Name, err)
 		}
+		if exit {
+			addExitRoom(spec.Name, raw)
+		}
 		if err := sess.AddTransport(spec.Name, raw, secret, context, spec.Priority); err != nil {
 			return nil, nil, err
 		}

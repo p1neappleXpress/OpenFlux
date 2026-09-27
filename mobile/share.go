@@ -32,22 +32,40 @@ func ParseShareLink(link string) (string, error) {
 // name. It fails while the exit is not running.
 func ExitShareLink(host, name string) (string, error) {
 	exitNode.mu.Lock()
-	tmpl := exitNode.share
+	tmpl, rooms := exitNode.share, exitNode.rooms
 	exitNode.mu.Unlock()
 	if tmpl == nil {
 		return "", errors.New("выходная нода не запущена")
 	}
 	c := *tmpl
 	c.Name = name
-	c.Transports = append([]share.Transport(nil), tmpl.Transports...)
-	for i := range c.Transports {
-		if c.Transports[i].Type == "direct" {
-			_, port, err := net.SplitHostPort(c.Transports[i].Dial)
+	c.Transports = nil
+	for _, t := range tmpl.Transports {
+		switch t.Type {
+		case "direct":
+			_, port, err := net.SplitHostPort(t.Dial)
 			if err != nil || host == "" {
 				return "", errors.New("direct: нет адреса, по которому клиенты смогут подключиться")
 			}
-			c.Transports[i].Dial = net.JoinHostPort(host, port)
+			t.Dial = net.JoinHostPort(host, port)
+		case "cupsonline":
+			// Started without a room list, the exit creates its rooms at
+			// start; clients need that list to join them.
+			if t.URL == "" {
+				key := t.Name
+				if key == "" {
+					key = t.Type
+				}
+				if r := rooms[key]; r != nil {
+					t.URL = r.RoomList()
+				}
+			}
+			if t.URL == "" {
+				appendLog("[ANDROID] Cups: комнаты ещё не созданы, в ссылку не попали")
+				continue
+			}
 		}
+		c.Transports = append(c.Transports, t)
 	}
 	return share.Encode(c)
 }

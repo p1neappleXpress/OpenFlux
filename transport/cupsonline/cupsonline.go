@@ -1076,6 +1076,12 @@ type CupsonlineTransport struct {
 	isClient  bool
 	clientErr error
 
+	// roomList is the packed list of the rooms this transport keeps
+	// channels to, as clients need it in --url; "" until Start got them.
+	roomsMu    sync.Mutex
+	roomList   string
+	onRoomList func(packed string)
+
 	// ctx ends with Stop and takes every room's goroutines down with it.
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1191,6 +1197,7 @@ func (t *CupsonlineTransport) enterRooms() ([]roomSlot, error) {
 		// retried. Dropping them left the peer's traffic in those rooms with
 		// nobody listening.
 		if joined > 0 {
+			t.setRoomList(t.roomIDs)
 			return slots, nil
 		}
 		switch {
@@ -1223,7 +1230,37 @@ func (t *CupsonlineTransport) enterRooms() ([]roomSlot, error) {
 	fmt.Printf("%s\n", packRooms(ids))
 	fmt.Printf("===========================\n")
 	fmt.Printf("Save it and pass it back as --url to reuse these rooms after a restart.\n\n")
+	t.setRoomList(ids)
 	return slots, nil
+}
+
+// RoomList is the packed list of the rooms this transport keeps channels
+// to, the --url a client needs: the rooms an exit created, or re-joined from
+// its own --url. "" until Start has entered or created them.
+func (t *CupsonlineTransport) RoomList() string {
+	t.roomsMu.Lock()
+	defer t.roomsMu.Unlock()
+	return t.roomList
+}
+
+// OnRoomList calls f with the new list whenever RoomList changes, e.g. when
+// a start that failed is retried and creates the rooms after all.
+func (t *CupsonlineTransport) OnRoomList(f func(packed string)) {
+	t.roomsMu.Lock()
+	t.onRoomList = f
+	t.roomsMu.Unlock()
+}
+
+func (t *CupsonlineTransport) setRoomList(ids []string) {
+	packed := packRooms(ids)
+	t.roomsMu.Lock()
+	changed := packed != t.roomList
+	t.roomList = packed
+	f := t.onRoomList
+	t.roomsMu.Unlock()
+	if changed && f != nil {
+		f(packed)
+	}
 }
 
 // joinListed enters all the listed rooms at once rather than one by one: on
