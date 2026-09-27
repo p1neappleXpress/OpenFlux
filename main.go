@@ -571,7 +571,22 @@ DEPRECATED (removed in v2)
 
 	log.Printf("=== OpenFlux ===")
 	log.Printf("Role: %s", *role)
-	log.Printf("Transport: %s", *transportType)
+	// A .conf's [Transport ...] sections or --transports run a Session of
+	// several carriers; *transportType stays at its flag default ("yandex")
+	// in both cases, so printing it unconditionally here always claimed
+	// "yandex" regardless of what was actually configured.
+	switch {
+	case len(confTransports) > 0:
+		names := make([]string, len(confTransports))
+		for i, t := range confTransports {
+			names[i] = t.Type
+		}
+		log.Printf("Transport: %s (session)", strings.Join(names, ", "))
+	case *transportsFlag != "":
+		log.Printf("Transport: %s (session)", *transportsFlag)
+	default:
+		log.Printf("Transport: %s", *transportType)
+	}
 	if *role == roleClient {
 		log.Printf("Inbound: %s", *inbound)
 	}
