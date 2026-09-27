@@ -51,7 +51,7 @@ func TestNewBoardsAPIRequestUsesJSONEnvelope(t *testing.T) {
 }
 
 func TestGetWhiteboardInfoUsesJSONRequest(t *testing.T) {
-	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	client := &http.Client{Transport: boardsRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if got := req.Header.Get("Content-Type"); got != "application/json" {
 			t.Fatalf("Content-Type = %q", got)
 		}
@@ -82,8 +82,8 @@ func TestGetWhiteboardInfoUsesJSONRequest(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+type boardsRoundTripFunc func(*http.Request) (*http.Response, error)
 
-func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+func (fn boardsRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
