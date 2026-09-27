@@ -50,7 +50,7 @@ func startExitWith(build func() (transport.Transport, error), shareCfg *share.Co
 	}
 	exitNode.mu.Unlock()
 
-	utils.EnableDebug()
+	utils.SetLevel(int(debugLevel.Load()))
 	utils.SetLogSink(appendLog)
 	appendLog("[ANDROID] Запуск выходной ноды (l4)")
 

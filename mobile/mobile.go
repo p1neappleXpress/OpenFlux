@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"openflux/transport"
 	"openflux/transport/cupsonline"
@@ -18,6 +19,24 @@ import (
 )
 
 var client = packetClient{}
+
+// debugLevel is what Start/StartSession/StartExit/StartProxy set the core's
+// logger to on their next connect. Defaults to utils.LevelDebug, the fixed
+// level every embedding app got before SetDebugLevel existed.
+var debugLevel atomic.Int32
+
+func init() {
+	debugLevel.Store(int32(utils.LevelDebug))
+}
+
+// SetDebugLevel sets the level Start/StartSession/StartExit/StartProxy put
+// the core's logger at on their next connect: 0 off, 1 packet movement
+// (-d), 2 operational logs including session/crypto/KDF context (-dd), 3
+// packet and frame hexdumps (-ddd). Matches the CLI's --debug=N; call
+// before connecting, it only takes effect on the next Start*.
+func SetDebugLevel(n int) {
+	debugLevel.Store(int32(n))
+}
 
 type packetClient struct {
 	mu        sync.Mutex
@@ -72,7 +91,7 @@ func startPacket(build func() (transport.Transport, error)) string {
 	client.logs = nil
 	client.mu.Unlock()
 
-	utils.EnableDebug()
+	utils.SetLevel(int(debugLevel.Load()))
 	utils.SetLogSink(appendLog)
 
 	fail := func(err error) string {

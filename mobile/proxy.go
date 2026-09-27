@@ -62,7 +62,7 @@ func startProxyWith(build func() (transport.Transport, error), listenAddr, usern
 	}
 	proxy.mu.Unlock()
 
-	utils.EnableDebug()
+	utils.SetLevel(int(debugLevel.Load()))
 	utils.SetLogSink(appendLog)
 	appendLog("[ANDROID] Запуск прокси-транспорта")
 
