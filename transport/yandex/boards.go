@@ -20,7 +20,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/netbind"
 	"openflux/transport"
 	"openflux/utils"
 )
@@ -325,27 +324,12 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
 	return nil
 }
 
-// apiRequest builds a POST /api call: the action and its content (JSON,
-// base64-encoded) in a JSON body. The API used to take a form and now
-// answers 415 "Request body must use a JSON Content-Type" to one.
-func apiRequest(hash, action string, content interface{}) *http.Request {
-	raw, _ := json.Marshal(content)
-	body, _ := json.Marshal(map[string]string{
-		"action":  action,
-		"content": base64.StdEncoding.EncodeToString(raw),
-	})
-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(body))
-	req.Header.Set("User-Agent", boardsUA)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
-	req.Header.Set("Origin", "https://"+boardsBase)
-	return req
-}
-
 func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
-	resp, err := client.Do(apiRequest(hash, action, content))
+	req, err := newBoardsAPIRequest(hash, action, content)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -361,8 +345,39 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
 	return nil
 }
 
+// newBoardsAPIRequest uses the current Boards API envelope.  The endpoint
+// stopped accepting a form-encoded body and now rejects it with HTTP 415.
+func newBoardsAPIRequest(hash, action string, content interface{}) (*http.Request, error) {
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(map[string]string{
+		"action":  action,
+		"content": base64.StdEncoding.EncodeToString(raw),
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", boardsUA)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
+	req.Header.Set("Origin", "https://"+boardsBase)
+	return req, nil
+}
+
 func (t *BoardsTransport) getWhiteboardInfo(client *http.Client, hash string) (map[string]string, error) {
-	resp, err := client.Do(apiRequest(hash, "get-whiteboard-info", map[string]string{"hash": hash}))
+	req, err := newBoardsAPIRequest(hash, "get-whiteboard-info", map[string]string{"hash": hash})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +524,7 @@ func (t *BoardsTransport) connectAndServe(info boardsInfo) error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
-		NetDialContext: netbind.Wrap(&net.Dialer{
+		NetDialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
