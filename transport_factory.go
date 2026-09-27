@@ -46,7 +46,13 @@ func transportFactory(baseCfg transport.TransportConfig) manager.Factory {
 		case "mailru":
 			return mailru.NewMailruDocsTransport(cfg.URL, baseCfg), nil
 		case "cupsonline":
-			return cupsonline.NewCupsonlineTransport(cfg.URL, baseCfg, false), nil
+			// Our own transports carry our role in "exit"; one the peer asks
+			// for at runtime is started on the exit, which creates the rooms.
+			exit := true
+			if v, ok := cfg.Params["exit"].(bool); ok {
+				exit = v
+			}
+			return cupsonline.NewCupsonlineTransport(cfg.URL, baseCfg, !exit), nil
 		case "oneme":
 			token, _ := cfg.Params["token"].(string)
 			uidStr, _ := cfg.Params["uid"].(string)

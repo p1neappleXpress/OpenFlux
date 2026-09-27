@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"errors"
 	"io"
 
 	"github.com/pierrec/lz4/v4"
@@ -10,7 +11,15 @@ import (
 const (
 	MinCompressSize   = 200
 	CompressionMarker = 0x1F
+
+	// maxDecompressed bounds what one legacy frame may inflate to, the same
+	// cap the batched zstd codec uses. A frame carries one packet, so honest
+	// peers stay far below it; without a cap a few bytes of crafted LZ4 from
+	// anyone on the document could inflate into gigabytes.
+	maxDecompressed = 8 << 20
 )
+
+var errDecompressedTooLarge = errors.New("lz4: decompressed frame exceeds limit")
 
 type CompressedTransport struct {
 	Transport
@@ -28,7 +37,11 @@ func (c *CompressedTransport) Send(data []byte) error {
 func (c *CompressedTransport) Receive(callback func([]byte)) {
 	c.Transport.Receive(func(data []byte) {
 		decompressed, err := decompress(data)
+		if errors.Is(err, errDecompressedTooLarge) {
+			return
+		}
 		if err != nil {
+			hintCodecMismatch(data, true)
 			callback(data) // fallback
 			return
 		}
@@ -71,5 +84,12 @@ func decompress(data []byte) ([]byte, error) {
 	}
 
 	r := lz4.NewReader(bytes.NewReader(data[1:]))
-	return io.ReadAll(r)
+	out, err := io.ReadAll(io.LimitReader(r, maxDecompressed+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxDecompressed {
+		return nil, errDecompressedTooLarge
+	}
+	return out, nil
 }

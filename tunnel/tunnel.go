@@ -64,7 +64,11 @@ type TCPTunnel struct {
 	stopOnce    sync.Once
 	stopCh      chan struct{}
 	udpFlows    atomic.Int32
+	err         error
 }
+
+// Err reports why the tunnel could not be set up, or nil.
+func (t *TCPTunnel) Err() error { return t.err }
 
 var (
 	TCPBufMin     = 4 * 1024 * 1024
@@ -104,6 +108,16 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	SetTCPBuffers(t.gvisorStack)
 
+	// Detect loss only by duplicate ACKs and the RTO, without RACK-TLP. The
+	// document relay delivers every message in order but sometimes holds them
+	// for hundreds of milliseconds; RACK-TLP takes each hold for a loss and
+	// halves the window, and gVisor never undoes that, which kept uploads
+	// through the tunnel at ~100 KB/s.
+	recovery := tcpip.TCPRecovery(0)
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		utils.Debugf("[TUNNEL] disable RACK-TLP: %v", err)
+	}
+
 	tunnelEP := NewTunnelLinkEndpoint()
 	if n, ok := trans.(transport.PeerParameterProvider); ok {
 		if p, ready := n.PeerParameters(); ready {
@@ -127,7 +141,11 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	tunnelNIC := tcpip.NICID(1)
 	if err := t.gvisorStack.CreateNIC(tunnelNIC, tunnelEP); err != nil {
-		utils.Debugf("[TUNNEL] CreateNIC tunnel error: %v", err)
+		// Without the NIC nothing is forwarded; Err reports it so an exit
+		// does not stay up looking healthy.
+		t.err = fmt.Errorf("tunnel: create NIC: %v", err)
+		utils.Infof("[TUNNEL] %v", t.err)
+		return t
 	}
 
 	if isExitNode {
@@ -179,6 +197,7 @@ func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 	local := gonet.NewUDPConn(&wq, ep)
+	noteUDPBypassesUpstream()
 	remote, err := net.DialTimeout("udp", dest, 10*time.Second)
 	if err != nil {
 		utils.Debugf("[EXIT] UDP dial %s failed: %v", dest, err)
@@ -238,7 +257,7 @@ func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	local := gonet.NewTCPConn(&wq, ep)
 
 	utils.SafeGo("exit.flow", func() {
-		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+		remote, err := dialExitTCP(dest)
 		if err != nil {
 			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
 			local.Close()

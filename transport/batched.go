@@ -157,6 +157,7 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 		pkts, err := decodeBatch(data)
 		if err != nil {
 			utils.Debugf("[BATCH] decode error (%d bytes): %v", len(data), err)
+			hintCodecMismatch(data, false)
 			if utils.IsVerbose() && utils.Sensitive() {
 				utils.Debugf("[BATCH] bad frame hexdump:\n%s", hex.Dump(data))
 			}

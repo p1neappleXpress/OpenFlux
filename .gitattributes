@@ -1,1 +1,4 @@
 deploy/node-install.sh text eol=lf
+# Shell scripts run inside Linux images and on Linux hosts: a Windows
+# checkout must not turn their line endings into CRLF.
+*.sh text eol=lf

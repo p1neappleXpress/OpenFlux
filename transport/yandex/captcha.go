@@ -80,6 +80,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 			return "", fmt.Errorf("captcha: redirect without Location")
 		}
 
+		loc = resolveLocation(currentURL, loc)
 		if strings.Contains(loc, "showcaptchafast") {
 			captchaURL = loc
 			break
@@ -106,7 +107,10 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	}
 	utils.Debugf("[CAPTCHA] showcaptcha: %d bytes", len(body))
 
-	ssr, formAction, err := parseCaptchaHTML(string(body))
+	// The challenge is answered on the host that issued it: docs.yandex.kz
+	// and the other regional domains reject a POST sent to docs.yandex.ru.
+	origin := volgaOrigin(captchaURL)
+	ssr, formAction, err := parseCaptchaHTML(string(body), origin)
 	if err != nil {
 		return "", err
 	}
@@ -131,7 +135,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 	req2, _ := http.NewRequest("POST", formAction, strings.NewReader(form.Encode()))
 	setBrowserHeaders(req2, userAgent)
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req2.Header.Set("Origin", "https://docs.yandex.ru")
+	req2.Header.Set("Origin", origin)
 	req2.Header.Set("Referer", captchaURL)
 
 	resp2, err := client.Do(req2)
@@ -174,7 +178,32 @@ var (
 	reFormAction = regexp.MustCompile(`<form[^>]*id="tmgrdfrend-form"[^>]*action="([^"]+)"`)
 )
 
-func parseCaptchaHTML(html string) (*captchaSSRData, string, error) {
+// volgaOrigin returns scheme://host of raw, or Yandex Docs' origin when raw
+// has none.
+func volgaOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "https://docs.yandex.ru"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// resolveLocation turns a redirect target into an absolute URL.
+func resolveLocation(base, loc string) string {
+	b, err := url.Parse(base)
+	if err != nil {
+		return loc
+	}
+	l, err := url.Parse(loc)
+	if err != nil {
+		return loc
+	}
+	return b.ResolveReference(l).String()
+}
+
+// parseCaptchaHTML reads the challenge and the form's action from a
+// showcaptchafast page; a relative action is resolved against origin.
+func parseCaptchaHTML(html, origin string) (*captchaSSRData, string, error) {
 	m := reSSRData.FindStringSubmatch(html)
 	if len(m) < 2 {
 		return nil, "", fmt.Errorf("captcha: __SSR_DATA__ not found")
@@ -194,7 +223,7 @@ func parseCaptchaHTML(html string) (*captchaSSRData, string, error) {
 	}
 	formAction := strings.ReplaceAll(m2[1], "&amp;", "&")
 	if strings.HasPrefix(formAction, "/") {
-		formAction = "https://docs.yandex.ru" + formAction
+		formAction = origin + formAction
 	}
 
 	return &ssr, formAction, nil

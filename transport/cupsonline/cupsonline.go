@@ -1087,6 +1087,10 @@ type CupsonlineTransport struct {
 	statsStart time.Time
 }
 
+// IsClient reports whether the transport joins an exit's rooms rather than
+// creating its own.
+func (t *CupsonlineTransport) IsClient() bool { return t.isClient }
+
 func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClient bool) *CupsonlineTransport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &CupsonlineTransport{

@@ -124,15 +124,25 @@ func (c *MaxClient) getUserMap(resp *MaxPacket) map[int64]UserInfo {
 	}
 	if contacts, ok := payload["contacts"].([]interface{}); ok {
 		for _, contact := range contacts {
-			cm := contact.(map[string]interface{})
-			id := int64(cm["id"].(float64))
+			cm, ok := contact.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fid, ok := cm["id"].(float64)
+			if !ok {
+				continue
+			}
+			id := int64(fid)
 			u := UserInfo{ID: id}
 			if phone, ok := cm["phone"].(float64); ok {
 				u.Phone = int64(phone)
 			}
 			if names, ok := cm["names"].([]interface{}); ok {
 				for _, name := range names {
-					n := name.(map[string]interface{})
+					n, ok := name.(map[string]interface{})
+					if !ok {
+						continue
+					}
 					if n["type"] == "ONEME" {
 						if v, ok := n["firstName"].(string); ok {
 							u.FirstName = v

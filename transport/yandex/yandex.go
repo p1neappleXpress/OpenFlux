@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -152,6 +153,15 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	}
 }
 
+// fetchDocInfo is replaced in tests.
+var fetchDocInfo = (*YandexDocsTransport).fetchDocInfo
+
+// nextUserID returns a document participant id not used by this transport
+// before.
+func (t *YandexDocsTransport) nextUserID() string {
+	return t.baseUserID + fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
+}
+
 func (t *YandexDocsTransport) connectToDoc(attempt int) {
 	if !t.IsRunning() {
 		return
@@ -169,15 +179,14 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		existingSession := t.session
 		t.Mu.Unlock()
 
-		var userID string
-		if existingSession != nil {
-			userID = existingSession.UserID
-		} else {
-			suffix := fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
-			userID = t.baseUserID + suffix
-		}
+		// A fresh participant id on every attempt: after a drop (4007) the
+		// old participant lingers on Yandex's side for seconds, and joining
+		// again under its id is refused right after CONNECT with close 1005,
+		// which turned one routine drop into 30-120 s of reconnects. The
+		// write queue is still carried over below.
+		userID := t.nextUserID()
 
-		info, err := t.fetchDocInfo(t.url, userID)
+		info, err := fetchDocInfo(t, t.url, userID)
 		if err != nil {
 			if errors.Is(err, ErrCaptchaRequired) || errors.Is(err, ErrLoginRequired) {
 				utils.Debugf("[YDOCS] fetchDocInfo needs external help: %v", err)
@@ -206,14 +215,26 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		}
+		// Join the engine.io session by long polling first; strict balancers
+		// refuse a bare websocket (#31). Lenient ones still get a direct dial
+		// if polling fails.
+		wsURL, cookies := info.WsURL, info.CookieStr
+		sid, pollCookies, perr := engineIOPoll(info)
+		if perr == nil {
+			wsURL += "&sid=" + sid
+			cookies = pollCookies
+		} else {
+			utils.Debugf("[YDOCS] engine.io polling failed, dialing the websocket directly: %v", perr)
+		}
+
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
 		headers.Set("Origin", info.Origin)
-		headers.Set("Cookie", info.CookieStr)
+		headers.Set("Cookie", cookies)
 		headers.Set("Host", info.Host)
 
-		utils.Debugf("[YDOCS] WebSocket dial %s", info.WsURL)
-		conn, resp, err := dialer.Dial(info.WsURL, headers)
+		utils.Debugf("[YDOCS] WebSocket dial %s", shortStr(wsURL, 120))
+		conn, resp, err := dialer.Dial(wsURL, headers)
 		if err != nil {
 			status := 0
 			if resp != nil {
@@ -224,6 +245,18 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
+
+		if perr == nil {
+			err = engineIOProbe(conn, 10*time.Second)
+		} else {
+			err = engineIOAwaitOpen(conn, 10*time.Second)
+		}
+		if err != nil {
+			utils.Debugf("[YDOCS] engine.io handshake failed: %v", err)
+			conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
@@ -335,19 +368,42 @@ func (t *YandexDocsTransport) writerLoop() {
 	}
 }
 
-func (t *YandexDocsTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
-	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+// Keepalives of one size at one interval are a signature that survives
+// TLS. They now come at 0.5-1.5x the configured interval and carry random
+// padding after the marker; peers find the marker with strings.Contains, so
+// older nodes still recognize them (#81).
+const keepAliveMarker = "---KA---"
 
+const keepAlivePadAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+func keepAliveMessage() string {
+	pad := make([]byte, 4+mrand.IntN(48))
+	for i := range pad {
+		pad[i] = keepAlivePadAlphabet[mrand.IntN(len(keepAlivePadAlphabet))]
+	}
+	return `42["message",{"type":"cursor","cursor":"18;` + keepAliveMarker + string(pad) + `"}]`
+}
+
+func keepAliveDelay(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return interval
+	}
+	return interval/2 + time.Duration(mrand.Int64N(int64(interval)))
+}
+
+func (t *YandexDocsTransport) keepAliveLoop() {
 	for t.IsRunning() {
-		<-ticker.C
+		select {
+		case <-time.After(keepAliveDelay(t.GetConfig().KeepAliveInterval)):
+		case <-t.Done():
+			return
+		}
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
 
 		if session != nil && session.Conn != nil {
-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
+			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMessage())); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
 				t.SetConnected(false)
 			}
@@ -358,7 +414,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
-	if strings.Contains(text, "---KA---") {
+	if strings.Contains(text, keepAliveMarker) {
 		return
 	}
 

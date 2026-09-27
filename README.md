@@ -519,6 +519,16 @@ context, with `direct` pointing at the exit:
 - In practice a real browser coming from the exit's address is usually let
   straight through to the document (the captcha targets the transport's HTTP
   client), so loading the page and sending its cookies is typically enough.
+- **A headless exit with no client yet** has nobody to ask. Pass the check
+  once from a desktop browser that goes out through the exit's address, for
+  example over an SSH tunnel: `ssh -D 1080 user@exit`, point the browser at
+  SOCKS5 `127.0.0.1:1080` and open the document. Then hand the cookies to
+  the exit: for `vyandex` export them as a Netscape `cookies.txt` and start
+  the exit with `--yandex-cookies-file`; for the other transports put them
+  into the `--cookie-store` file, a JSON object of
+  `{"<document URL>": {"<name>": "<value>", ...}}`. The node wizards of the
+  desktop and Android apps write a Yandex sign-in into that file the same
+  way.
 - Cookies are persisted in `--cookie-store` (default
   `./cookies-<transport>.json`) and reused after restarts. Under systemd with
   `ProtectSystem=strict`, point it at a writable directory.
@@ -580,9 +590,11 @@ Measure raw goodput through the transport, without touching the host network:
 | `--mode` | `-m` | `l3` | Exit-node mode: `l3` \| `l4` |
 | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
 | `--url` | `-u` | `http://#` | Document URL |
+| `--url-file` | | | Read `--url` from a file (first non-comment line), keeping the document URL out of the process list and shell history |
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
 | `--http-proxy` | | | Also serve an HTTP proxy (CONNECT + plain requests) on this address |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
+| `--upstream-proxy` | | | l4 exit: open TCP connections through this SOCKS5 proxy (`127.0.0.1:10808`, `socks5://user:pass@host:port`), e.g. an xray inbound with its own routing. Implies `--mode=l4`; UDP still leaves the exit directly |
 | `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: one line per packet (`-> 52 bytes - UDP ...`); `2`: plus operational logs; `3`: plus hexdumps |
 | `--sensitive` | | `false` | Also log key material and, with `-ddd`, plaintext frames (cookie jars, tokens) |
 | `--encryption-key-file` | | | AES-256-GCM shared secret file |
