@@ -47,3 +47,27 @@ Guards: a shared token, only ports 80/443, and no private/loopback targets.
 v0 carries frames in the clear, so the host and anything on-path see the
 destinations and traffic (the app's own TLS/MTProto still protects content).
 Wrap the carrier with the core's encryption before any real use.
+
+## cupsexit.php — the cups path (for the censored client)
+
+When the client can only reach cups.online (not the PHP host directly), use
+`cupsexit.php` instead of `phpbox.php`. It joins the **same cups room** as the
+client and relays the stream mux there:
+
+```
+client (--mode=stream, --transport=cupsonline, --url <room>)
+      ->  cups.online room  ->  cupsexit.php  ->  dst
+```
+
+`cupsexit.php` is a cups participant (same auth + Centrifuge WS + cursor
+encoding as `transport/cupsonline`) plus the mux demux and `fsockopen(dst)`.
+It carries no IP packets and runs no gVisor.
+
+Run (open in a browser so the host's bot check passes; keep re-opening or
+point a pinger at it — one request serves ~140 s):
+
+```
+https://<host>/cupsexit.php?k=PHPBOX_TOKEN&url=<full cups room URL>
+```
+
+Offline framing self-test (no network): `php cupsexit.php selftest`.
