@@ -21,6 +21,7 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/transport/mailru"
 	"github.com/p1neappleXpress/OpenFlux/transport/manager"
 	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
+	"github.com/p1neappleXpress/OpenFlux/transport/phpbox"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 	"github.com/p1neappleXpress/OpenFlux/tunnel"
 	"github.com/p1neappleXpress/OpenFlux/utils"
@@ -530,6 +531,16 @@ DEPRECATED (removed in v2)
 	// slower than l3 (SNAT/DNAT: Linux as root, Windows with WinDivert).
 	if *role == roleExit && *mode == "l4" {
 		log.Printf("warning: exit on l4 (gVisor). l3 is faster: Linux as root, Windows as Administrator.")
+	}
+
+	// --mode=stream: the client speaks the phpbox stream mux (OPEN/DATA/CLOSE
+	// frames) over the transport instead of IP packets through gVisor, and a
+	// local SOCKS5 hands each app connection to a mux stream. The exit is a
+	// phpbox exit (deploy/phpbox over cups). This is a circuit-level TCP
+	// tunnel, not L7 - the exit never parses the application protocol.
+	if *role == roleClient && *mode == "stream" {
+		runStreamClient(*transportType, globalDocUrl, *socksAddr)
+		return
 	}
 
 	exitMode, err := tunnel.ParseExitMode(*mode)
@@ -1049,6 +1060,40 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 	}
 
 	select {}
+}
+
+// runStreamClient runs the --mode=stream client: a raw transport carries the
+// phpbox stream mux, and a local SOCKS5 server dials each app connection out
+// as a mux stream to the phpbox exit. No gVisor, no IP packets.
+func runStreamClient(transportType, url, socksAddr string) {
+	cfg := transport.DefaultConfig()
+	var carrier phpbox.Carrier
+	switch transportType {
+	case "cupsonline":
+		carrier = cupsonline.NewCupsonlineTransport(url, cfg, true)
+	case "yandex", "":
+		carrier = yandex.NewYandexDocsTransport(url, cfg)
+	case "vyandex":
+		t, err := newVolgaTransport(url, cfg)
+		if err != nil {
+			log.Fatalf("--mode=stream vyandex: %v", err)
+		}
+		carrier = t
+	case "mailru":
+		carrier = mailru.NewMailruDocsTransport(url, cfg)
+	default:
+		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
+	}
+
+	m := phpbox.NewMux(carrier)
+	if err := m.Start(); err != nil {
+		log.Fatalf("--mode=stream: start carrier: %v", err)
+	}
+	defer m.Close()
+
+	log.Printf("Running as CLIENT (stream mux over %s, SOCKS5 on %s)", transportType, socksAddr)
+	srv := socks5.NewSOCKS5Server(socksAddr, phpbox.NewSocksDialer(m))
+	log.Fatal(srv.Start())
 }
 
 func runClient(trans transport.Transport, inbound, socksAddr, httpProxyAddr string, exitMode tunnel.ExitMode) {
