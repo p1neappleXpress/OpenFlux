@@ -47,7 +47,10 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'selftest') { CupsExit::selfTest(
 header('Content-Type: text/plain; charset=utf-8');
 if (!hash_equals($TOKEN, (string)($_GET['k'] ?? ''))) { http_response_code(404); exit("no\n"); }
 $roomURL = $_GET['url'] ?? '';
-if ($roomURL === '') { http_response_code(400); exit("need ?url=<cups room URL>\n"); }
+if ($roomURL === '' && !empty($_GET['room'])) {
+    $roomURL = 'https://interview.cups.online/live-coding/?room=' . preg_replace('/[^0-9a-f-]/', '', $_GET['room']);
+}
+if ($roomURL === '') { http_response_code(400); exit("need ?url=<cups room URL> or ?room=<uuid>\n"); }
 @set_time_limit(0);
 while (ob_get_level() > 0) { ob_end_flush(); }
 
