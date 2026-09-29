@@ -71,3 +71,28 @@ https://<host>/cupsexit.php?k=PHPBOX_TOKEN&url=<full cups room URL>
 ```
 
 Offline framing self-test (no network): `php cupsexit.php selftest`.
+
+## mailruexit.php — the Mail.ru path
+
+`mailruexit.php` is the sibling of `cupsexit.php` for Mail.ru's cloud document
+editor (docs.datacloudmail.ru), matching `transport/mailru`: one WebSocket
+message carries exactly one packet (one mux frame), base64 in the "cursor"
+field, no extra length framing. Same guards and shape as cups.
+
+```
+client (--mode=stream, --transport=mailru, --url <public doc link>)
+      ->  Mail.ru doc  ->  mailruexit.php  ->  dst
+```
+
+Run: `https://<host>/mailruexit.php?k=PHPBOX_TOKEN&url=<public doc link>`
+Offline self-test: `php mailruexit.php selftest`.
+
+## Shared code (`lib/`)
+
+Both exits share `lib/`: `mux.php` (the carrier-agnostic stream mux — the
+`Carrier` interface, OPEN/DATA/CLOSE demux, dst dialing with the port/private
+guards, the select loop), `ws.php` (a minimal WebSocket client), and
+`util.php` (HTTP with a cookie jar, HTML scraping, the private-target guard).
+Each exit implements one `Carrier`: `CupsCarrier` (Centrifuge + cursor
+integers + 2-byte chunk/packet framing) and `MailruCarrier` (Socket.IO +
+base64 in the cursor field). Adding another editor = one more `Carrier`.
