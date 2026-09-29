@@ -4,7 +4,6 @@
 package mobile
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -182,13 +181,18 @@ func classicTransport(transportType, documentURL, encryptionSecret, codec, maxTo
 	appendLog(fmt.Sprintf("[ANDROID] Запуск транспорта %s", transportType))
 	params := classicParams(transportType, documentURL, maxToken, maxUid)
 	if encryptionSecret != "" {
-		specs, err := json.Marshal([]sessionSpec{{
-			Name: transportType, Type: transportType, URL: documentURL, Priority: 100, Params: params,
-		}})
-		if err != nil {
-			return nil, err
-		}
-		t, _, err := buildSessionWith(string(specs), encryptionSecret, exit, sessionOptions{classic: true, codec: codec})
+		specs := ClassicSessionSpecs(
+			transportType,
+			documentURL,
+			maxToken,
+			maxUid,
+		)
+		t, _, err := buildSessionWith(
+			specs,
+			encryptionSecret,
+			exit,
+			sessionOptions{classic: true, codec: codec},
+		)
 		return t, err
 	}
 

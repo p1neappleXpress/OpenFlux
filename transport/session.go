@@ -71,7 +71,8 @@ type Session struct {
 	classicLink  *transportLink // exit: the carrier a classic client was last heard on
 	classicSeen  bool           // client: the exit answered in classic mode
 	classicSince time.Time      // client: when data started going out classic
-	alternates   []string       // KDF contexts the peer may derive instead, see KDFContexts
+	prepared     *PreparedEncryption
+	alternates   []string // KDF contexts the peer may derive instead, see KDFContexts
 
 	cntClassicSent atomic.Uint64
 	cntClassicRecv atomic.Uint64
@@ -180,7 +181,16 @@ func (s *Session) SetAlternateContexts(contexts []string) {
 // encrypted(codec(classic side)) sharing its keys.
 func (s *Session) newLink(name string, raw Transport, secret, context string, priority int) (*transportLink, error) {
 	d := newFrameDemux(raw, name)
-	enc, err := NewEncryptedTransport(d.side(true), secret, context, s.exit)
+	s.mu.Lock()
+	prepared := s.prepared
+	s.mu.Unlock()
+	enc, err := newEncryptedTransport(
+		d.side(true),
+		secret,
+		context,
+		s.exit,
+		prepared,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("session: wrap %q: %w", name, err)
 	}

@@ -11,7 +11,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"io"
 	"log"
 	"net"
@@ -51,7 +50,7 @@ var tunnelUDP atomic.Bool
 //export OpenFluxSetTunnelUDP
 func OpenFluxSetTunnelUDP(on C.int) { tunnelUDP.Store(on != 0) }
 
-// extensionLimits keeps the Network Extension under its 50 MB cap: a Go
+// extensionLimits budgets memory for the Network Extension: a soft Go
 // heap limit with headroom for what lives outside it (TLS, WebSocket
 // buffers, the runtime), and the phone resource profile of the carriers.
 func extensionLimits() {
@@ -74,13 +73,32 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		log.Printf("[PKT] direct needs an encryption key")
 		return startBadEncryption
 	}
+	settings.mu.Lock()
+	prepared, preparedSet := settings.prepared, settings.preparedSet
+	settings.mu.Unlock()
+	specs, classic := packetSessionSpecs(
+		typ,
+		value,
+		C.GoString(maxToken),
+		C.GoString(maxUid),
+	)
 	return startPacketTunnel(func() string {
-		if specs := classicSpecs(typ, value); len(specs) > 1 {
+		if secret != "" && preparedSet {
+			if !classic {
+				codec = ""
+			}
+			return mobile.StartPreparedSession(
+				specs,
+				secret,
+				prepared,
+				codec,
+			)
+		}
+		if !classic {
 			if secret == "" {
 				return "для нескольких документов нужен ключ шифрования"
 			}
-			b, _ := json.Marshal(specs)
-			return mobile.StartSession(string(b), secret)
+			return mobile.StartSession(specs, secret)
 		}
 		return mobile.Start(typ, value, secret, codec, C.GoString(maxToken), C.GoString(maxUid))
 	})
@@ -94,7 +112,20 @@ func OpenFluxStartSessionPacketTunnel(specsJSON, secret *C.char) (rc C.int) {
 	defer recoverStart(&rc, "OpenFluxStartSessionPacketTunnel")
 	specs := C.GoString(specsJSON)
 	key := strings.TrimSpace(C.GoString(secret))
-	return startPacketTunnel(func() string { return mobile.StartSession(specs, key) })
+	settings.mu.Lock()
+	prepared, preparedSet := settings.prepared, settings.preparedSet
+	settings.mu.Unlock()
+	return startPacketTunnel(func() string {
+		if preparedSet {
+			return mobile.StartPreparedSession(
+				specs,
+				key,
+				prepared,
+				"",
+			)
+		}
+		return mobile.StartSession(specs, key)
+	})
 }
 
 func startPacketTunnel(start func() string) C.int {

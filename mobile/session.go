@@ -31,7 +31,8 @@ type sessionOptions struct {
 	codec   string
 	// strict turns the classic fallback a single-carrier Session client
 	// gets by default off.
-	strict bool
+	strict   bool
+	prepared *transport.PreparedEncryption
 }
 
 // parseSessionSpecs reads what the app sends: a JSON array of sessionSpec,
@@ -111,6 +112,11 @@ func buildSessionWith(specsJSON, secret string, exit bool, opt sessionOptions) (
 	}, exit)
 	if err != nil {
 		return nil, nil, err
+	}
+	if opt.prepared != nil {
+		if err := sess.SetPreparedEncryption(opt.prepared); err != nil {
+			return nil, nil, err
+		}
 	}
 	// A single-carrier client falls back to the classic layering while the
 	// exit does not answer the handshake (an exit that predates Session or

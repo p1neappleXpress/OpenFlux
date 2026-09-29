@@ -87,11 +87,12 @@ type contextKeys struct {
 // derived once and shared by the EncryptedTransports on it (a Session's
 // and its classic fallback's).
 type keyStore struct {
-	secret  string
-	exit    bool
-	side    string
-	sendDir byte
-	recvDir byte
+	secret   string
+	prepared *PreparedEncryption
+	exit     bool
+	side     string
+	sendDir  byte
+	recvDir  byte
 
 	mu       sync.Mutex
 	keys     []*contextKeys // [0] is the primary context
@@ -122,13 +123,32 @@ type keyRing struct {
 // exactly one of them must set exitNode=true so the two sides pick opposite
 // send/receive key pairs.
 func NewEncryptedTransport(inner Transport, secret, context string, exitNode bool) (*EncryptedTransport, error) {
+	return newEncryptedTransport(
+		inner,
+		secret,
+		context,
+		exitNode,
+		nil,
+	)
+}
+
+func newEncryptedTransport(
+	inner Transport,
+	secret string,
+	context string,
+	exitNode bool,
+	prepared *PreparedEncryption,
+) (*EncryptedTransport, error) {
 	if inner == nil {
 		return nil, errors.New("inner transport is nil")
 	}
 	if utils.SecretChars(secret) < utils.MinSecretChars {
 		return nil, fmt.Errorf("encryption secret must contain at least %d characters", utils.MinSecretChars)
 	}
-	st := &keyStore{secret: secret, exit: exitNode, side: "CLIENT", sendDir: 0, recvDir: 1}
+	if prepared != nil && !hmac.Equal([]byte(prepared.secret), []byte(secret)) {
+		return nil, errors.New("prepared encryption does not match the carrier key")
+	}
+	st := &keyStore{secret: secret, prepared: prepared, exit: exitNode, side: "CLIENT", sendDir: 0, recvDir: 1}
 	if exitNode {
 		st.side, st.sendDir, st.recvDir = "EXIT", 1, 0
 	}
@@ -204,11 +224,35 @@ func (st *keyStore) key(i int) *contextKeys {
 	return st.keys[i]
 }
 
-func (st *keyStore) derive(context string) (*contextKeys, error) {
+func deriveMasterKey(secret, context string) ([]byte, error) {
 	salt := sha256.Sum256([]byte("OpenFlux encrypted transport v1\x00" + context))
-	master, err := scrypt.Key([]byte(st.secret), salt[:], 32768, 8, 1, 32)
+	master, err := scrypt.Key(
+		[]byte(secret),
+		salt[:],
+		32768,
+		8,
+		1,
+		32,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("derive encryption key: %w", err)
+	}
+	return master, nil
+}
+
+func (st *keyStore) derive(context string) (*contextKeys, error) {
+	var master []byte
+	if st.prepared != nil {
+		master = st.prepared.masters[context]
+		if len(master) != 32 {
+			return nil, errors.New("encryption context was not prepared; reconnect from the app")
+		}
+	} else {
+		var err error
+		master, err = deriveMasterKey(st.secret, context)
+		if err != nil {
+			return nil, err
+		}
 	}
 	clientToExit := deriveDirectionalKey(master, "client-to-exit")
 	exitToClient := deriveDirectionalKey(master, "exit-to-client")
@@ -237,7 +281,8 @@ func (st *keyStore) derive(context string) (*contextKeys, error) {
 		utils.Sha256Short(clientToExit),
 		utils.Sha256Short(exitToClient),
 	)
-	if utils.Sensitive() {
+	if utils.Sensitive() && st.prepared == nil {
+		salt := sha256.Sum256([]byte("OpenFlux encrypted transport v1\x00" + context))
 		utils.Debugf("[KEYDUMP] ============================================================")
 		utils.Debugf("[KEYDUMP] side=%s", st.side)
 		utils.Debugf("[KEYDUMP] secretLen=%d", len(st.secret))

@@ -47,6 +47,34 @@ State and checks:
 - `OpenFluxReadLog()`, `OpenFluxSetDebug(on)`, `OpenFluxSetDebugLevel(0..3)`,
   `OpenFluxSetDoTResolver(spec)`; free returned strings with `OpenFluxFreeString`.
 
+## Preparing encryption keys outside the VPN extension
+
+For memory-constrained Network Extensions, opt in to prepared encryption:
+
+1. In the containing app, call `OpenFluxPreparePacketTunnelKeys(type, url, secret)`
+   for a classic profile, or `OpenFluxPrepareSessionPacketTunnelKeys(session, secret)`.
+   Run it off the UI thread: it performs the existing scrypt KDF for the primary
+   and all alternate contexts. The response is `{"keys":"..."}` or `{"error":"..."}`;
+   free it with `OpenFluxFreeString`.
+2. Store the **private** `keys` string in the shared Keychain, separated by profile
+   and by document/direct key slot. Use after-first-unlock, this-device-only access
+   for reconnects; never put this data in logs, UserDefaults, or providerConfiguration.
+3. In the extension, read the current secret and bundle, call
+   `OpenFluxSetEncryption(secret)`, then `OpenFluxSetPreparedEncryption(keys)`,
+   then the existing `OpenFluxStartPacketTunnel` / `OpenFluxStartSessionPacketTunnel`.
+   Order matters: setting the secret clears the prepared setting.
+4. Recompute in the app after a key/profile change. Missing, corrupt or stale
+   prepared material fails closed and asks for preparation from the app; it never
+   falls back to scrypt. Old app versions that do not call the new setter retain
+   their existing behavior. Apply the app and core changes together to gain the fix.
+
+The private versioned bundle contains scrypt master keys and a MAC binding it to
+its secret. Its context list must exactly match the core's current profile rules.
+It is equivalent to decryption credentials and is not a public password verifier.
+AES-256-GCM, scrypt parameters, wire frames, Session/classic interoperability and
+context fallback remain unchanged. New contexts not present in the bundle are
+rejected; reconnect from the app to prepare the updated profile.
+
 ## Build + archive + export (one command)
 From the repo root:
 ```bash
@@ -71,9 +99,10 @@ Produces `ios-app/build/export/OpenFlux.ipa`, distribution-signed for the App St
 3. The build appears in TestFlight after Apple processing (a few minutes).
 
 ## Notes / follow-ups
-- The app runs a **local** SOCKS5 proxy. The in-app **Test** button proves the
-  tunnel carries traffic (fetches the exit IP through the proxy). Routing the
-  whole device requires a Network Extension (`NEPacketTunnelProvider`) target
-  with the Network Extensions capability — not included in this first build.
+- The local SOCKS5 mode supports in-app checks. Whole-device routing uses the
+  included `OpenFluxTunnel` (`NEPacketTunnelProvider`) target and requires a
+  provisioning profile authorizing Network Extensions. For encrypted packet
+  startup with a smaller memory footprint, integrate the prepared-key flow above
+  in the containing app and extension together.
 - Deployment target: iOS 15.0 (SwiftUI App lifecycle). The Go lib is built with
   `-miphoneos-version-min=13.0`, so it is compatible.

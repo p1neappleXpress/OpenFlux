@@ -245,9 +245,11 @@ const (
 )
 
 var settings struct {
-	mu     sync.Mutex
-	secret string
-	codec  string
+	mu          sync.Mutex
+	secret      string
+	prepared    string
+	preparedSet bool
+	codec       string
 }
 
 // OpenFluxSetEncryption sets (or clears, with "") the shared secret for the
@@ -263,6 +265,8 @@ func OpenFluxSetEncryption(secret *C.char) {
 	}
 	settings.mu.Lock()
 	settings.secret = s
+	settings.prepared = ""
+	settings.preparedSet = false
 	settings.mu.Unlock()
 	if s == "" {
 		log.Printf("[BRIDGE] encryption: off")
