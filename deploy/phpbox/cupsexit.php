@@ -11,6 +11,8 @@
  *
  * Run (open in a browser so the host's bot check passes; ~140s per request):
  *   https://<host>/cupsexit.php?k=PHPBOX_TOKEN&room=<uuid>   (or &url=<room URL>)
+ * A browser gets the status page (starts the node unless one already runs);
+ * a pinger/curl runs the node directly, as before. See lib/node.php.
  * Offline framing self-test: php cupsexit.php selftest
  */
 
@@ -18,6 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 require_once __DIR__ . '/lib/util.php';
 require_once __DIR__ . '/lib/ws.php';
 require_once __DIR__ . '/lib/mux.php';
+require_once __DIR__ . '/lib/node.php';
 
 const RUN_CAP       = 140;
 const SEND_INTERVAL = 0.018;   // s between cursor messages (cups throttles)
@@ -231,21 +234,10 @@ final class CupsCarrier implements Carrier
 // ---- entry point (after the class so it is declared before use) -----------
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'selftest') { CupsCarrier::selfTest(); exit; }
 
-$TOKEN = getenv('PHPBOX_TOKEN') ?: 'CHANGE-ME';
-header('Content-Type: text/plain; charset=utf-8');
-if (!hash_equals($TOKEN, (string)($_GET['k'] ?? ''))) { http_response_code(404); exit("no\n"); }
-
-$roomURL = $_GET['url'] ?? '';
-if ($roomURL === '' && !empty($_GET['room'])) {
-    $roomURL = 'https://interview.cups.online/live-coding/?room=' . preg_replace('/[^0-9a-f-]/', '', $_GET['room']);
-}
-if ($roomURL === '') { http_response_code(400); exit("need ?url=<cups room URL> or ?room=<uuid>\n"); }
-
-@set_time_limit(0);
-while (ob_get_level() > 0) { ob_end_flush(); }
-
-$carrier = new CupsCarrier($roomURL);
-if (!$carrier->connect()) { echo "connect failed\n"; exit; }
-echo "cups exit ready; serving up to " . RUN_CAP . "s\n";
-(new Mux($carrier))->run(RUN_CAP);
-echo "exit done\n";
+(new PhpboxNode('cupsonline', 'cups.online', function (array $g): string {
+    $u = (string)($g['url'] ?? '');
+    if ($u === '' && !empty($g['room'])) {
+        $u = 'https://interview.cups.online/live-coding/?room=' . preg_replace('/[^0-9a-f-]/', '', (string)$g['room']);
+    }
+    return $u;
+}, fn(string $room) => new CupsCarrier($room), RUN_CAP))->handle();

@@ -7,6 +7,30 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ### Added
 
+- phpbox page (`deploy/phpbox`): opening an exit's URL in a browser shows a
+  status page (OpenFlux look, light and dark) instead of silently running:
+  live state, a debug log, Start/Stop, and a check that a node is already
+  running on that target (a heartbeat plus a lock), so a second open or a
+  pinger attaches to the first instead of starting another. Anything that is
+  not a browser (a pinger, curl) runs the node exactly as before, and the
+  old `?url=` / `?room=` addresses are unchanged. The page reads
+  `openflux://` links and draws their QR in the browser with the core's own
+  `share` package compiled to WebAssembly (`cmd/sharewasm`,
+  `deploy/phpbox/build-wasm.sh`), so there is one link parser for every
+  client; the secret in a link never leaves the browser.
+- `deploy/phpbox/build-bundle.sh` builds the upload set from the sources
+  (token in `config.php`, which also works where `putenv` is disabled).
+- Link compatibility tests (`share/compat_test.go`): links written by
+  earlier builds are frozen as literals and must keep reading, including how
+  a link is mangled by chats and terminals, unknown JSON fields, and the
+  stability of the error codes.
+
+### Changed
+
+- phpbox mux: destinations are dialed asynchronously (a slow one no longer
+  stalls the others), writes to a full destination are queued instead of
+  dropped, and the frame buffer is consumed by offset.
+
 - The node wizard (`--node-wizard`, `mobile.Node*`) lets a new channel use
   any mix of a Yandex document, a Mail.ru public document and cups.online
   rooms besides direct (`provision.ChannelTransport`); the rooms are created

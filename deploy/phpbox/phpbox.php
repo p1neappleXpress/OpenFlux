@@ -27,7 +27,7 @@
  *   1 OPEN "host:port"  2 DATA  3 CLOSE  4 OPEN_OK  5 OPEN_ERR reason
  */
 
-$TOKEN   = getenv('PHPBOX_TOKEN') ?: 'CHANGE-ME';
+$TOKEN = getenv('PHPBOX_TOKEN') ?: (defined('PHPBOX_TOKEN') ? PHPBOX_TOKEN : 'CHANGE-ME'); // putenv is disabled on some free hosts: config.php also define()s it
 $BUS_DIR = getenv('PHPBOX_BUS') ?: (sys_get_temp_dir() . '/phpbox-bus');
 const RUN_CAP = 140;   // seconds a down-poll holds before returning (client reconnects)
 const DIAL_TO = 6;

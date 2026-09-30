@@ -96,3 +96,43 @@ guards, the select loop), `ws.php` (a minimal WebSocket client), and
 Each exit implements one `Carrier`: `CupsCarrier` (Centrifuge + cursor
 integers + 2-byte chunk/packet framing) and `MailruCarrier` (Socket.IO +
 base64 in the cursor field). Adding another editor = one more `Carrier`.
+
+## The page (v0.3)
+
+Open an exit's URL in a browser and you get a status page, not a wall of
+text: the node's state (running / run number / time left / streams / bytes),
+a live log with `info` and `debug` lines, Start and Stop, and a link box.
+
+- **Already running?** The running node writes a heartbeat every second (and
+  holds a lock). Opening the page again, or a pinger hitting the URL, attaches
+  to it and says so; it never starts a second node on the same target.
+- **Who gets what.** A browser navigation gets the page, which starts the node
+  unless one already runs (`&auto=0` to only look). Anything else (a pinger,
+  `curl`) runs the node directly, exactly as before; `&a=run` forces it,
+  `&headless=1` forces it from a browser. Other actions: `a=status`, `a=log`,
+  `a=stop` (JSON).
+- **Links.** Paste an `openflux://` link into the box: it is parsed in the
+  browser by the core's own parser (`share`, compiled to WebAssembly), shown
+  field by field with the reason codes worded by the page, and drawn as a QR.
+  The secret stays in the browser. The page picks the transport that fits
+  this exit (`cupsonline` or `mailru`) and starts the node on it. Raw room and
+  document addresses still work, and so does the old `?url=` / `?room=`.
+- **Debug log.** Kept on the host in a ring file (trimmed when full).
+  Destination hosts are hidden (`*:443`) like the core's `--sensitive`; tick
+  the box on the page, or add `&sensitive=1`, to log them.
+
+Build and upload:
+
+```bash
+deploy/phpbox/build-bundle.sh      # -> phpbox_bundle/ (token in config.php; needs Go for the parser)
+./upload_bundle.sh                 # asks for the FTP password; nothing is stored
+```
+
+`NO_WASM=1` skips the parser build: addresses work, `openflux://` links then
+show a note instead of a parse. Tests: `php test/mux_test.php`,
+`test/node_test.sh`, `php cupsexit.php selftest`, `php mailruexit.php selftest`.
+
+Free-host facts this code relies on (measured on InfinityFree): `sleep`,
+`set_time_limit`, `putenv`, `proc_open` and `socket_*` are disabled, so the
+code uses `usleep`, `stream_select` and `define()`; the 60 s limit counts CPU
+time, not wall time.

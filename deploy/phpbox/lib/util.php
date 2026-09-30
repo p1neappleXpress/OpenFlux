@@ -62,14 +62,42 @@ final class PhpboxUtil
         return ($p['scheme'] ?? 'https') . '://' . ($p['host'] ?? '');
     }
 
+    /** Host -> IP, looked up once per run ('' when it does not resolve). */
+    public static function resolve(string $host): string
+    {
+        static $cache = [];
+        if (!isset($cache[$host])) {
+            $ip = filter_var($host, FILTER_VALIDATE_IP) ? $host : gethostbyname($host);
+            $cache[$host] = filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
+        }
+        return $cache[$host];
+    }
+
+    /** Local testing only: lifts the private-address and port guards. Never set on a real host. */
+    public static function testMode(): bool
+    {
+        return getenv('PHPBOX_ALLOW_PRIVATE') === '1' || (defined('PHPBOX_ALLOW_PRIVATE') && PHPBOX_ALLOW_PRIVATE === '1');
+    }
+
     /** Refuse loopback / private / reserved targets (no SSRF into the host LAN). */
     public static function isPrivate(string $host): bool
     {
-        if (getenv('PHPBOX_ALLOW_PRIVATE') === '1') {
-            return false; // local testing only
+        if (self::testMode()) {
+            return false;
         }
-        $ip = filter_var($host, FILTER_VALIDATE_IP) ? $host : gethostbyname($host);
-        return !filter_var($ip, FILTER_VALIDATE_IP,
+        $ip = self::resolve($host);
+        return $ip === '' || !filter_var($ip, FILTER_VALIDATE_IP,
             FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+
+    /** Where run state and logs live: a writable dir that is not web-served when the host has one. */
+    public static function stateDir(): string
+    {
+        $base = (is_dir('/home/tmp') && is_writable('/home/tmp')) ? '/home/tmp' : sys_get_temp_dir();
+        $dir = $base . '/phpbox-state';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0700, true);
+        }
+        return $dir;
     }
 }

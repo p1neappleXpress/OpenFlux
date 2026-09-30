@@ -21,6 +21,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 require_once __DIR__ . '/lib/util.php';
 require_once __DIR__ . '/lib/ws.php';
 require_once __DIR__ . '/lib/mux.php';
+require_once __DIR__ . '/lib/node.php';
 
 const RUN_CAP = 140;
 
@@ -156,18 +157,5 @@ final class MailruCarrier implements Carrier
 // ---- entry point (after the class so it is declared before use) -----------
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'selftest') { MailruCarrier::selfTest(); exit; }
 
-$TOKEN = getenv('PHPBOX_TOKEN') ?: 'CHANGE-ME';
-header('Content-Type: text/plain; charset=utf-8');
-if (!hash_equals($TOKEN, (string)($_GET['k'] ?? ''))) { http_response_code(404); exit("no\n"); }
-
-$link = $_GET['url'] ?? '';
-if ($link === '') { http_response_code(400); exit("need ?url=<Mail.ru public doc link>\n"); }
-
-@set_time_limit(0);
-while (ob_get_level() > 0) { ob_end_flush(); }
-
-$carrier = new MailruCarrier($link);
-if (!$carrier->connect()) { echo "connect failed\n"; exit; }
-echo "mailru exit ready; serving up to " . RUN_CAP . "s\n";
-(new Mux($carrier))->run(RUN_CAP);
-echo "exit done\n";
+(new PhpboxNode('mailru', 'Mail.ru', fn(array $g): string => (string)($g['url'] ?? ''),
+    fn(string $link) => new MailruCarrier($link), RUN_CAP))->handle();

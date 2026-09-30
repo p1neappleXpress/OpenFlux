@@ -61,3 +61,5 @@ watch_stats.sh
 openflux
 *.bak
 core.bin
+deploy/phpbox/assets/
+phpbox_bundle/
