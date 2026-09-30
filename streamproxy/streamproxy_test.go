@@ -152,6 +152,11 @@ func TestProxyServesSocks5AndHTTP(t *testing.T) {
 	if string(b) != "hello via stream" {
 		t.Fatalf("through the HTTP proxy got %q", b)
 	}
+	// The relay counts a direction when its copy ends, which can be a moment after the client has its answer.
+	deadline := time.Now().Add(3 * time.Second)
+	for (p.BytesReceived() == 0 || p.BytesSent() == 0) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if p.BytesReceived() == 0 || p.BytesSent() == 0 {
 		t.Errorf("counters did not move: sent %d received %d", p.BytesSent(), p.BytesReceived())
 	}
