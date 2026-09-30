@@ -49,7 +49,20 @@ const (
 	CodeUnknownTransport   = "unknown_transport"
 	CodeDirectNoDial       = "direct_no_dial"
 	CodeDirectNeedsSession = "direct_needs_session"
+	CodeUnknownMode        = "unknown_mode"     // Param: the mode
+	CodeStreamTransport    = "stream_transport" // Param: the transport type
+	CodeStreamOneTransport = "stream_one_transport"
+	CodeStreamPlainOnly    = "stream_plain_only" // a session or a secret does not go with stream mode
 )
+
+// ModeStream is the phpbox stream mode: the client speaks the stream mux to an
+// exit on plain PHP hosting (deploy/phpbox) over one carrier, instead of IP
+// packets to a VDS. A link without a mode is the classic tunnel, as it always was.
+const ModeStream = "stream"
+
+// streamTypes are the carriers a stream-mode exit speaks (deploy/phpbox has a
+// carrier for cups.online and for Mail.ru documents; the clients also ride Yandex).
+var streamTypes = map[string]bool{"cupsonline": true, "mailru": true, "yandex": true, "vyandex": true}
 
 // Error is a link that cannot be used: Code says which problem it is (for
 // the apps), Param the value it is about, Error() the English detail the
@@ -96,7 +109,11 @@ type Config struct {
 	Secret string `json:"secret,omitempty"`
 	// Context is the encryption context, the exit's --url; both peers must
 	// use the same one.
-	Context    string      `json:"context,omitempty"`
+	Context string `json:"context,omitempty"`
+	// Mode is "" (the classic tunnel) or ModeStream. Readers that predate it ignore the
+	// field and would run the classic tunnel against a PHP exit, which cannot work, so
+	// only links made for stream mode carry it.
+	Mode       string      `json:"mode,omitempty"`
 	Transports []Transport `json:"transports"`
 }
 
@@ -112,6 +129,11 @@ var knownTypes = map[string]bool{
 func (c *Config) Validate() error {
 	if len(c.Transports) == 0 {
 		return linkError(CodeNoTransports, "", "share: no transports", nil)
+	}
+	if c.Mode != "" {
+		if err := c.validateStream(); err != nil {
+			return err
+		}
 	}
 	if len(c.Transports) > 1 && !c.Negotiate {
 		return linkError(CodeNeedsSession, "", "share: several transports need a negotiated session", nil)
@@ -144,6 +166,23 @@ func (c *Config) Validate() error {
 				return linkError(CodeDirectNeedsSession, "", "share: direct only works in a negotiated session", nil)
 			}
 		}
+	}
+	return nil
+}
+
+// validateStream checks what stream mode needs: one carrier it can ride, no session.
+func (c *Config) validateStream() error {
+	if c.Mode != ModeStream {
+		return linkError(CodeUnknownMode, c.Mode, fmt.Sprintf("share: unknown mode %q", c.Mode), nil)
+	}
+	if len(c.Transports) != 1 {
+		return linkError(CodeStreamOneTransport, "", "share: stream mode rides exactly one transport", nil)
+	}
+	if t := c.Transports[0].Type; !streamTypes[t] {
+		return linkError(CodeStreamTransport, t, fmt.Sprintf("share: stream mode cannot ride %q (cups.online, mail.ru, yandex, vyandex)", t), nil)
+	}
+	if c.Negotiate || c.Secret != "" {
+		return linkError(CodeStreamPlainOnly, "", "share: stream mode has no session or encryption secret", nil)
 	}
 	return nil
 }

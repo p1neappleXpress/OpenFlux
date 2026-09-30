@@ -1,8 +1,10 @@
 package phpbox
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/p1neappleXpress/OpenFlux/network"
 	"github.com/p1neappleXpress/OpenFlux/utils"
@@ -35,6 +37,8 @@ func frameName(t byte) string {
 		return "OPEN_OK"
 	case FrameOpenErr:
 		return "OPEN_ERR"
+	case FrameAck:
+		return "ACK"
 	}
 	return fmt.Sprintf("type%d", t)
 }
@@ -47,7 +51,11 @@ func logFrame(dir network.PacketDirection, f Frame) {
 	extra := ""
 	switch f.Type {
 	case FrameOpen, FrameOpenErr:
-		extra = " " + string(f.Payload)
+		extra = " " + strings.ReplaceAll(string(f.Payload), "\x00", " +")
+	case FrameAck:
+		if len(f.Payload) == 4 {
+			extra = fmt.Sprintf(" consumed=%d", binary.BigEndian.Uint32(f.Payload))
+		}
 	}
 	utils.Packetf("[%s] %s%d bytes - stream %d %s%s", logTag, dir.Arrow(), headerLen+len(f.Payload), f.StreamID, frameName(f.Type), extra)
 	if f.Type == FrameData && utils.IsVerbose() {

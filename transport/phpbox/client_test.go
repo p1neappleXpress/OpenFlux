@@ -111,14 +111,14 @@ func (s *fakeSession) ingest(ctx context.Context) {
 func (s *fakeSession) apply(f Frame) {
 	switch f.Type {
 	case FrameOpen:
-		host, port, err := net.SplitHostPort(string(f.Payload))
+		host, port, err := net.SplitHostPort(strings.SplitN(string(f.Payload), "\x00", 2)[0])
 		_ = host
 		_ = port
 		if err != nil {
 			s.downCh <- Frame{Type: FrameOpenErr, StreamID: f.StreamID, Payload: []byte("bad addr")}
 			return
 		}
-		c, err := net.DialTimeout("tcp", string(f.Payload), 3*time.Second)
+		c, err := net.DialTimeout("tcp", strings.SplitN(string(f.Payload), "\x00", 2)[0], 3*time.Second)
 		if err != nil {
 			s.downCh <- Frame{Type: FrameOpenErr, StreamID: f.StreamID, Payload: []byte(err.Error())}
 			return

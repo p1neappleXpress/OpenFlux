@@ -36,6 +36,20 @@ All notable changes to the OpenFlux core. Format loosely follows
   Until now the level was set after the stream branch had returned, so none
   of it showed.
 
+- Stream mode is now a library (`streamproxy`: carrier -> mux -> SOCKS5 and an
+  optional HTTP proxy, with counters) used by `--mode=stream` and, next, the
+  mobile bridges; `--mode=stream` also takes `--http-proxy` and `--ipc-socket`.
+- `openflux://` links and QR codes can name the stream mode (`share.Config.Mode`,
+  `"stream"`): one carrier (cups.online, Mail.ru, Yandex), no session, no secret.
+  Links without a mode are the classic tunnel as before; codes `unknown_mode`,
+  `stream_transport`, `stream_one_transport`, `stream_plain_only`.
+- phpbox flow control: windows per stream (256 KB) and over all streams (512 KB)
+  with ACK frames, agreed in OPEN (`host:port\0fc` / OPEN_OK `fc`), so old clients
+  and exits are unaffected. Without it a saturated carrier queue buried small
+  frames: over Mail.ru, four parallel downloads starved new TLS handshakes and
+  uploads for minutes. With it (same test): 60 of 60 handshakes complete while four
+  8 MB downloads run, and a 4 MB upload takes 33 s instead of timing out.
+
 ### Fixed
 
 - Mail.ru transport dropped data under load: the server batches several

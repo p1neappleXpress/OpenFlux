@@ -172,5 +172,18 @@ destinations are hidden (`*:443`) unless `&sensitive=1`.
 
 `&cap=` seconds one generation lives (30-900), `&chunk=` bytes read from a
 destination per frame (2048-262144, default 65536; bigger frames cost fewer carrier messages),
-`&idle=` seconds before an idle stream is closed (0 = never), `&sensitive=1`,
+`&win=` flow-control window per stream in bytes (default 262144, 2x that over all streams; 0 = never honour a client's request for windows), `&idle=` seconds before an idle stream is closed (0 = never), `&sensitive=1`,
 `&chain=1`.
+
+## Flow control
+
+A saturated carrier (a document server that takes a few hundred KB/s) queues
+whatever it is given, without limit, and every frame waits behind it: four
+parallel downloads made new TLS handshakes starve for minutes. So a client that
+understands acks says so in OPEN (`host:port` + `\0fc`), the exit answers
+OPEN_OK `fc`, and from then on each side keeps at most a window (256 KB per
+stream, 512 KB over all) of DATA unacknowledged; the other side acks what it
+consumed (ACK frame 6, payload = running total, uint32). Measured on a
+simulated shared queue with four bulk downloads running: a handshake-sized
+round trip takes 0.5 s with windows and never completes within 6 s without.
+Old clients and old exits never say `fc`, and then nothing changes.

@@ -23,11 +23,15 @@ import "encoding/binary"
 
 // Frame types on the wire.
 const (
-	FrameOpen    byte = 1 // payload = "host:port"
+	FrameOpen    byte = 1 // payload = "host:port", optionally "\x00fc": the client understands FrameAck
 	FrameData    byte = 2 // payload = stream bytes
 	FrameClose   byte = 3 // payload = empty
-	FrameOpenOK  byte = 4 // payload = empty
+	FrameOpenOK  byte = 4 // payload = empty, or "fc": the exit will honour acks on this stream
 	FrameOpenErr byte = 5 // payload = reason
+	// FrameAck tells the sender how much of its DATA the receiver has consumed, so it never
+	// has more than a window in flight. Payload = the receiver's running total, uint32
+	// big-endian (cumulative, so a lost ack is repaired by the next one).
+	FrameAck byte = 6
 )
 
 // headerLen is the fixed frame header: type(1) + streamID(4) + length(4).

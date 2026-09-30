@@ -14,9 +14,16 @@ final class MemCarrier implements Carrier
     public function connect(): bool { return true; }
     public function sockets(): array { return []; }
     public function onReadable($sock): void {}
+    public array $dataBytes = [];                // sid => DATA bytes seen (payloads are kept only up to a cap)
+    private int $stored = 0;
     public function sendPacket(string $f): void
     {
         $h = unpack('Ctype/Nsid/Nlen', substr($f, 0, 9));
+        if ($h['type'] === Mux::DATA) {
+            $this->dataBytes[$h['sid']] = ($this->dataBytes[$h['sid']] ?? 0) + $h['len'];
+            if ($this->stored > 8 * 1024 * 1024) { return; }       // a flood in a test must not eat the memory
+            $this->stored += $h['len'];
+        }
         $this->out[] = [$h['type'], $h['sid'], substr($f, 9, $h['len'])];
     }
     public function feed(int $type, int $sid, string $payload): void
@@ -117,6 +124,50 @@ $cb = new MemCarrier(); $mb = new Mux($cb); $mb->claim = $claimFn;
 foreach ([1, 2, 3, 4, 5] as $sid) { $open($ma, $ca, $sid); $open($mb, $cb, $sid); }
 $check('two generations never both serve a stream', $ma->activeStreams() + $mb->activeStreams() === 5);
 foreach (glob("$dirClaim/*") as $f) { @rmdir($f); } @rmdir($dirClaim);
+
+// ---- flow control: a client that asks for windows gets them; one that does not, does not ----
+function sendserver(int $port) {
+    $p = proc_open([PHP_BINARY, __DIR__ . '/sendserver.php', (string)$port], [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+    fgets($pipes[1]);
+    return $p;
+}
+$bulkPort = $fast + 4000; $bulk2 = $fast + 5000;
+$sb1 = sendserver($bulkPort); $sb2 = sendserver($bulk2);
+$fcRun = function (string $caps, int $port, callable $script) {
+    $c = new MemCarrier(); $m = new Mux($c); $m->resolver = fn(string $h) => [$h];
+    $n = 0;
+    $m->onTick = function (Mux $mm) use (&$n, $c, $port, $caps, $script) { $n++; if ($n === 1) { $c->feed(Mux::OPEN, 1, "127.0.0.1:$port" . $caps); } return $script($n, $c, $mm); };
+    $m->run(30);
+    return $c;
+};
+$got = fn(MemCarrier $c) => $c->dataBytes[1] ?? 0;
+$okPayload = fn(MemCarrier $c) => (function () use ($c) { foreach ($c->out as $o) { if ($o[0] === Mux::OPEN_OK && $o[1] === 1) { return $o[2]; } } return null; })();
+
+$noAck = $fcRun("\0fc", $bulkPort, fn($n, $c, $mm) => $n < 4);
+$check('OPEN with the fc suffix is answered OPEN_OK "fc"', $okPayload($noAck) === 'fc');
+$check('without acks the exit stops at about one window', $got($noAck) >= 262144 && $got($noAck) <= 262144 + 2 * 65536);
+
+$acked = $fcRun("\0fc", $bulkPort, function ($n, $c, $mm) {
+    if ($n >= 2 && $n <= 6) {                       // the client consumes what it got, and says so
+        $have = $c->dataBytes[1] ?? 0;
+        $c->feed(Mux::ACK, 1, pack('N', $have & 0xFFFFFFFF));
+    }
+    return $n < 7;
+});
+$check('acks let the stream run past a window', $got($acked) > 2 * 262144);
+
+$old = $fcRun('', $bulkPort + 1000, fn($n, $c, $mm) => $n < 4);
+$check('a client that did not ask gets OPEN_OK with no caps', $okPayload($old) === '');
+$check('and no windows: data flows far past one window without acks', $got($old) > 3 * 262144);
+
+// the exit acknowledges what it writes to destinations (running total, so a lost ack is repaired by the next)
+$upAck = $fcRun("\0fc", $fast, function ($n, $c, $mm) {
+    if ($n === 2) { foreach (str_split(str_repeat('u', 100000), 25000) as $part) { $c->feed(Mux::DATA, 1, $part); } }
+    return $n < 5;
+});
+$total = 0; foreach ($upAck->out as $o) { if ($o[0] === Mux::ACK && $o[1] === 1) { $total = unpack('N', $o[2])[1]; } }
+$check('the exit acks the bytes it wrote (running total = 100000)', $total === 100000);
+foreach ([$sb1, $sb2] as $p) { proc_terminate($p); }
 
 foreach ([$s1, $s2, $s3] as $p) { proc_terminate($p); }
 echo $ok ? "MUX TEST PASS\n" : "MUX TEST FAIL\n" . implode("\n", array_slice($logs, -15)) . "\n";

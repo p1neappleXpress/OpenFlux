@@ -316,6 +316,7 @@ final class PhpboxNode
 
         $mux = new Mux($carrier);
         $mux->sensitive = $sensitive;
+        if (isset($_GET['win'])) { $w = max(0, min(4194304, (int)$_GET['win'])); $mux->streamWindow = $w; $mux->totalWindow = $w * 2; }   // 0 = no flow control
         if (isset($_GET['idle'])) { $mux->idleTimeout = max(0, min(3600, (int)$_GET['idle'])); }
         if (isset($_GET['chunk'])) { $mux->readChunk = max(2048, min(262144, (int)$_GET['chunk'])); }
         $mux->log = fn(string $lvl, string $m) => $log->write($lvl, $m);

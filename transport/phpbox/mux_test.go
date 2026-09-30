@@ -82,7 +82,9 @@ func (e *goStreamExit) feed(b []byte) {
 func (e *goStreamExit) apply(f Frame) {
 	switch f.Type {
 	case FrameOpen:
-		c, err := net.DialTimeout("tcp", string(f.Payload), 3*time.Second)
+		// An exit from before flow control: it does not know the "\x00fc" suffix a client appends to
+		// OPEN, so it must tolerate it the way phpbox.php does, and it answers OPEN_OK with no caps.
+		c, err := net.DialTimeout("tcp", strings.SplitN(string(f.Payload), "\x00", 2)[0], 3*time.Second)
 		if err != nil {
 			e.emit(Frame{Type: FrameOpenErr, StreamID: f.StreamID, Payload: []byte(err.Error())})
 			return

@@ -9,6 +9,12 @@
 //   - writes to a destination are queued when its socket is full (a partial
 //     fwrite used to drop the rest of the frame);
 //   - the frame buffer is consumed by offset, not re-copied on every frame.
+// Flow control: a client that says so in OPEN ("host:port\0fc") gets windows. The exit
+// reads a destination only while that stream (and all streams together) have less than a
+// window of DATA unacknowledged, and acknowledges what it wrote to destinations. Without
+// it a saturated carrier's queue (a document server's) grows by megabytes and every small
+// frame - a TLS handshake, a CLOSE - waits behind it: downloads starved new connections.
+// Acks carry running totals (uint32), so a lost one is repaired by the next.
 // Hooks ($log, $onTick) let the node report what happens without the mux
 // knowing about files or pages.
 
@@ -25,7 +31,10 @@ interface Carrier
 
 final class Mux
 {
-    const OPEN = 1, DATA = 2, CLOSE = 3, OPEN_OK = 4, OPEN_ERR = 5;
+    const OPEN = 1, DATA = 2, CLOSE = 3, OPEN_OK = 4, OPEN_ERR = 5, ACK = 6;
+    const MASK = 0xFFFFFFFF;
+    const ACK_EVERY = 32768;          // ack after this many bytes were written to a destination (or when its queue empties)
+    const STALL_AFTER = 20;           // seconds blocked on a window with no ack: assume the acks were lost
     const ATTEMPT_TO = 3.0;        // seconds to wait for one address of a destination to accept
     const MAX_TRIES  = 3;          // addresses tried before the client is told the open failed
     // Bytes read from a destination per frame. Measured over Mail.ru: 64 KB frames move 3 parallel 4 MB downloads in
@@ -45,6 +54,9 @@ final class Mux
     /** false = draining: keep serving the streams we have, ignore new OPENs (a newer generation owns them). */
     /** bytes read from a destination per DATA frame: bigger frames cost fewer carrier messages */
     public int $readChunk = self::READ_CHUNK;
+    /** flow-control windows in bytes: per stream, and over all streams; 0 = never honour a client's request for them */
+    public int $streamWindow = 262144;
+    public int $totalWindow = 524288;
     /** seconds a stream may carry no data either way before the exit closes it (its CLOSE can be lost on the way); 0 = never */
     public int $idleTimeout = 300;
     public bool $accepting = true;
@@ -60,6 +72,9 @@ final class Mux
     private array  $pending = [];  // stream_id => ['s' => socket|null, 'until' => float, 'ips' => untried addresses, 'tries', 'port', 'label', 't0']
     private array  $wbuf    = [];  // stream_id => bytes waiting for the socket to accept them
     private array  $act     = [];  // stream_id => last time data moved on it
+    private array  $fc      = [];  // stream_id => ['sent','acked','wrote','ackedSent','since'] for streams with flow control
+    private array  $ackDirty = []; // stream_id => true: bytes written since the last ack
+    private int    $inAll   = 0;   // unacknowledged DATA over all streams
 
     public function __construct(private Carrier $c)
     {
@@ -139,7 +154,10 @@ final class Mux
                 $this->reconnect();                  // the link to the room/document is gone: join again
                 $carrierSocks = $this->c->sockets();
             }
-            $read = array_merge($carrierSocks, array_values($this->socks));
+            $read = $carrierSocks;
+            foreach ($this->socks as $sid => $sock) {
+                if (!$this->blocked($sid, $now)) { $read[] = $sock; }
+            }
             $write = [];
             foreach ($this->pending as $p) {
                 if ($p['s']) { $write[] = $p['s']; }
@@ -166,6 +184,7 @@ final class Mux
                     }
                 }
             }
+            $this->flushAcks();
         }
         // Tell the client which streams end with us, so it reconnects at once instead of waiting for a timeout.
         foreach (array_keys($this->socks + $this->pending) as $sid) {
@@ -222,8 +241,10 @@ final class Mux
                 $this->say('debug', "stream $sid taken by the other generation");
                 return;
             }
-            [$host, $port] = array_pad(explode(':', $payload, 2), 2, '');
+            [$target, $caps] = array_pad(explode("\0", $payload, 2), 2, '');
+            [$host, $port] = array_pad(explode(':', $target, 2), 2, '');
             $port  = (int)$port;
+            $wantFc = $this->streamWindow > 0 && in_array('fc', explode(',', $caps), true);
             $label = $this->label($host, $port);
             if (isset($this->socks[$sid]) || isset($this->pending[$sid])) {
                 $this->closeStream($sid, false);     // the client reuses an id: the old one is gone
@@ -241,7 +262,7 @@ final class Mux
                 $this->sendFrame(self::OPEN_ERR, $sid, !$ips ? 'dns' : 'blocked');
                 return;
             }
-            $this->pending[$sid] = ['s' => null, 'ips' => $ips, 'port' => $port, 'tries' => 0, 'label' => $label, 't0' => microtime(true)];
+            $this->pending[$sid] = ['s' => null, 'ips' => $ips, 'port' => $port, 'tries' => 0, 'label' => $label, 't0' => microtime(true), 'fc' => $wantFc];
             $this->dial($sid);
         } elseif ($type === self::DATA) {
             if (isset($this->socks[$sid])) {
@@ -249,6 +270,18 @@ final class Mux
             } elseif (isset($this->pending[$sid])) {
                 $this->stats['up'] += strlen($payload);
                 $this->wbuf[$sid] = ($this->wbuf[$sid] ?? '') . $payload;   // sent when the dial completes
+            }
+        } elseif ($type === self::ACK) {
+            if (isset($this->fc[$sid]) && strlen($payload) === 4) {
+                $v = unpack('N', $payload)[1];
+                $f = &$this->fc[$sid];
+                $delta = ($v - $f['acked']) & self::MASK;
+                if ($delta !== 0 && $delta <= (($f['sent'] - $f['acked']) & self::MASK)) {   // never beyond what was sent
+                    $f['acked'] = $v;
+                    $f['since'] = 0.0;
+                    $this->inAll -= $delta;
+                }
+                unset($f);
             }
         } elseif ($type === self::CLOSE) {
             if (isset($this->socks[$sid]) || isset($this->pending[$sid])) {
@@ -313,6 +346,7 @@ final class Mux
                 $this->closeStream($sid, true);
                 return;
             }
+            $this->wrote($sid, $n);
             if ($n < strlen($data)) {
                 $this->wbuf[$sid] = substr($data, $n);
             }
@@ -338,9 +372,12 @@ final class Mux
             unset($this->pending[$sid]);
             $this->socks[$sid] = $s;
             $this->act[$sid] = microtime(true);
+            if (!empty($p['fc'])) {
+                $this->fc[$sid] = ['sent' => 0, 'acked' => 0, 'wrote' => 0, 'ackedSent' => 0, 'since' => 0.0];
+            }
             $this->stats['opened']++;
             $this->say('debug', sprintf('stream %d open %s (%d ms)', $sid, $p['label'], (int)((microtime(true) - $p['t0']) * 1000)));
-            $this->sendFrame(self::OPEN_OK, $sid, '');
+            $this->sendFrame(self::OPEN_OK, $sid, isset($this->fc[$sid]) ? 'fc' : '');
         } else {
             $sid = array_search($s, $this->socks, true);
             if ($sid === false) { return; }
@@ -351,8 +388,10 @@ final class Mux
                 $this->closeStream($sid, true);
             } elseif ($n >= strlen($this->wbuf[$sid])) {
                 unset($this->wbuf[$sid]);
+                $this->wrote($sid, $n);
             } elseif ($n > 0) {
                 $this->wbuf[$sid] = substr($this->wbuf[$sid], $n);
+                $this->wrote($sid, $n);
             }
         }
     }
@@ -368,7 +407,63 @@ final class Mux
         }
         $this->stats['down'] += strlen($d);
         $this->act[$sid] = microtime(true);
+        if (isset($this->fc[$sid])) {
+            $this->fc[$sid]['sent'] = ($this->fc[$sid]['sent'] + strlen($d)) & self::MASK;
+            $this->inAll += strlen($d);
+        }
         $this->sendFrame(self::DATA, $sid, $d);
+    }
+
+    /** True while a stream has a window of unacknowledged DATA out (or all streams together do): stop reading it. */
+    private function blocked(int $sid, float $now): bool
+    {
+        if (!isset($this->fc[$sid])) {
+            return false;
+        }
+        $f = &$this->fc[$sid];
+        $inflight = ($f['sent'] - $f['acked']) & self::MASK;
+        if ($inflight === 0 || ($inflight < $this->streamWindow && $this->inAll < $this->totalWindow)) {
+            $f['since'] = 0.0;
+            return false;                          // a stream with nothing in flight may always read
+        }
+        if ($f['since'] === 0.0) {
+            $f['since'] = $now;
+        } elseif ($now - $f['since'] > self::STALL_AFTER) {
+            $this->say('warn', "stream $sid: no ack for " . self::STALL_AFTER . "s with " . self::human($inflight) . ' in flight; assuming they were lost');
+            $this->inAll -= $inflight;
+            $f['acked'] = $f['sent'];
+            $f['since'] = 0.0;
+            return false;
+        }
+        return true;
+    }
+
+    /** $n more bytes reached a destination: owe the client an ack for them. */
+    private function wrote(int $sid, int $n): void
+    {
+        if (isset($this->fc[$sid]) && $n > 0) {
+            $this->fc[$sid]['wrote'] = ($this->fc[$sid]['wrote'] + $n) & self::MASK;
+            $this->ackDirty[$sid] = true;
+        }
+    }
+
+    /** Send owed acks: after a real chunk was written, or once a stream's write queue has emptied (keeps the client's pipe full). */
+    private function flushAcks(): void
+    {
+        foreach ($this->ackDirty as $sid => $_) {
+            if (!isset($this->fc[$sid])) {
+                unset($this->ackDirty[$sid]);
+                continue;
+            }
+            $f = &$this->fc[$sid];
+            $due = ($f['wrote'] - $f['ackedSent']) & self::MASK;
+            if ($due >= self::ACK_EVERY || ($due > 0 && !isset($this->wbuf[$sid]))) {
+                $f['ackedSent'] = $f['wrote'];
+                unset($this->ackDirty[$sid]);
+                $this->sendFrame(self::ACK, $sid, pack('N', $f['wrote']));
+            }
+            unset($f);
+        }
     }
 
     /** Close streams that carried nothing for $idleTimeout s: a lost CLOSE must not leak a socket on the host. */
@@ -402,6 +497,10 @@ final class Mux
             $this->stats['closed']++;
         } elseif (isset($this->pending[$sid]) && $this->pending[$sid]['s']) {
             @fclose($this->pending[$sid]['s']);
+        }
+        if (isset($this->fc[$sid])) {
+            $this->inAll -= ($this->fc[$sid]['sent'] - $this->fc[$sid]['acked']) & self::MASK;
+            unset($this->fc[$sid], $this->ackDirty[$sid]);
         }
         unset($this->socks[$sid], $this->pending[$sid], $this->wbuf[$sid], $this->act[$sid]);
         if ($notify) {

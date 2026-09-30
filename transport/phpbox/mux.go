@@ -1,7 +1,9 @@
 package phpbox
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +52,35 @@ type Mux struct {
 
 	// onClosed, if set, is called once when the carrier ends on its own.
 	onClosed func()
+
+	// Flow control (see FrameAck). Windows bound how much DATA is in flight, per stream and in
+	// all, so a saturated carrier cannot bury small frames (a TLS handshake, a CLOSE) behind
+	// megabytes of bulk: the carrier's own queue (a document server's, a socket buffer) is what
+	// grows otherwise, and every other stream waits behind it.
+	fcMu         sync.Mutex
+	streamWindow uint32            // bytes one stream may have unacknowledged; 0 = no flow control
+	totalWindow  uint32            // the same over all streams (a stream may always have one frame out)
+	totalUp      int64             // unacknowledged bytes over all streams we send on
+	fcEvt        chan struct{}     // closed and replaced whenever an ack or a close may unblock a writer
+	ackQ         map[uint32]uint32 // stream -> consumed total, waiting to be sent
+	ackSig       chan struct{}
+}
+
+// Default windows: about a second of a 300-500 KB/s carrier, in flight at most.
+const (
+	defaultStreamWindow = 256 << 10
+	defaultTotalWindow  = 512 << 10
+	ackEvery            = 32 << 10 // a stream acks after this much was consumed (or when its buffer runs dry)
+	maxFrame            = 65536    // fewer, larger carrier messages: the carriers charge per message, not per byte
+	ackStallAfter       = 10 * time.Second
+)
+
+// SetFlowControl sets the per-stream and total windows in bytes; 0 turns flow
+// control off (streams then behave as before acks existed). Call before Dial.
+func (m *Mux) SetFlowControl(stream, total int) {
+	m.fcMu.Lock()
+	m.streamWindow, m.totalWindow = uint32(stream), uint32(total)
+	m.fcMu.Unlock()
 }
 
 // NewMux wires the mux to carrier's receive callback. Call Start to bring the
@@ -60,8 +91,15 @@ func NewMux(carrier Carrier) *Mux {
 		streams: map[uint32]*conn{},
 		nextID:  1,
 		closed:  make(chan struct{}),
+
+		streamWindow: defaultStreamWindow,
+		totalWindow:  defaultTotalWindow,
+		fcEvt:        make(chan struct{}),
+		ackQ:         map[uint32]uint32{},
+		ackSig:       make(chan struct{}, 1),
 	}
 	carrier.Receive(m.onBytes)
+	go m.ackLoop()
 	return m
 }
 
@@ -82,7 +120,14 @@ func (m *Mux) Dial(ctx context.Context, host string, port int) (net.Conn, error)
 	m.mu.Unlock()
 
 	utils.Debugf("[STREAM] stream %d: dialing %s:%d", id, host, port)
-	if err := m.sendFrame(Frame{Type: FrameOpen, StreamID: id, Payload: []byte(net.JoinHostPort(host, strconv.Itoa(port)))}); err != nil {
+	open := net.JoinHostPort(host, strconv.Itoa(port))
+	m.fcMu.Lock()
+	wantFC := m.streamWindow > 0
+	m.fcMu.Unlock()
+	if wantFC {
+		open += "\x00fc" // we understand acks; an exit that does answers OPEN_OK "fc"
+	}
+	if err := m.sendFrame(Frame{Type: FrameOpen, StreamID: id, Payload: []byte(open)}); err != nil {
 		m.dropStream(id)
 		return nil, fmt.Errorf("phpbox: open %s:%d: %w", host, port, err)
 	}
@@ -197,7 +242,14 @@ func (m *Mux) dispatch(f Frame) {
 	}
 	switch f.Type {
 	case FrameOpenOK:
+		if bytes.Contains(f.Payload, []byte("fc")) {
+			st.fc.Store(true) // the exit honours acks on this stream: we must too, both ways
+		}
 		st.signalOpen("")
+	case FrameAck:
+		if len(f.Payload) == 4 {
+			m.onAck(st, binary.BigEndian.Uint32(f.Payload))
+		}
 	case FrameOpenErr:
 		st.signalOpen(string(f.Payload))
 	case FrameData:
@@ -213,6 +265,7 @@ func (m *Mux) dropStream(id uint32) {
 	delete(m.streams, id)
 	m.mu.Unlock()
 	if st != nil {
+		m.fcForget(st)
 		st.shutdown()
 	}
 }
@@ -248,11 +301,20 @@ type conn struct {
 	rbuf     rbuffer
 	closed   atomic.Bool
 	openOnce sync.Once
+
+	// Flow control: fc once the exit agreed; the counters are guarded by m.fcMu and are running
+	// totals (uint32, wrapping), so a lost ack is made good by the next one.
+	fc        atomic.Bool
+	sent      uint32 // DATA bytes we wrote on this stream
+	acked     uint32 // how many of those the exit says it consumed
+	consumed  uint32 // DATA bytes the app read from this stream
+	ackedSent uint32 // the value of consumed we last told the exit
 }
 
 func newConn(m *Mux, id uint32) *conn {
 	st := &conn{m: m, id: id, openRes: make(chan string, 1)}
 	st.rbuf.cond = sync.NewCond(&st.rbuf.mu)
+	st.rbuf.onRead = st.noteConsumed
 	return st
 }
 
@@ -268,6 +330,9 @@ func (s *conn) shutdown() {
 	s.closed.Store(true)
 	s.rbuf.close()
 	s.signalOpen("session closed")
+	s.m.fcMu.Lock()
+	s.m.fcWake()
+	s.m.fcMu.Unlock()
 }
 
 func (s *conn) Read(p []byte) (int, error) { return s.rbuf.read(p) }
@@ -276,17 +341,147 @@ func (s *conn) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-	const max = 65536 // fewer, larger carrier messages: the carriers charge per message, not per byte
-	for off := 0; off < len(p); off += max {
-		end := off + max
+	for off := 0; off < len(p); {
+		end := off + maxFrame
 		if end > len(p) {
 			end = len(p)
+		}
+		if err := s.waitWindow(uint32(end - off)); err != nil {
+			return off, err
 		}
 		if err := s.m.sendFrame(Frame{Type: FrameData, StreamID: s.id, Payload: append([]byte(nil), p[off:end]...)}); err != nil {
 			return off, err
 		}
+		s.m.fcSent(s, uint32(end-off))
+		off = end
 	}
 	return len(p), nil
+}
+
+// waitWindow blocks while the stream (or all streams together) already has a
+// window of unacknowledged data out. A stream with nothing in flight always
+// may send one frame, so progress is guaranteed; and if no ack arrives for
+// ackStallAfter the acks are assumed lost and the stream carries on.
+func (s *conn) waitWindow(n uint32) error {
+	if !s.fc.Load() {
+		return nil
+	}
+	m := s.m
+	var stalled time.Time
+	for {
+		m.fcMu.Lock()
+		inflight := s.sent - s.acked
+		ok := inflight == 0 || (inflight+n <= m.streamWindow && m.totalUp+int64(n) <= int64(m.totalWindow))
+		if ok {
+			m.fcMu.Unlock()
+			return nil
+		}
+		if stalled.IsZero() {
+			stalled = time.Now()
+		} else if time.Since(stalled) > ackStallAfter {
+			utils.Infof("[STREAM] stream %d: no ack for %v with %d bytes in flight; assuming they were lost", s.id, ackStallAfter, inflight)
+			m.totalUp -= int64(s.sent - s.acked)
+			s.acked = s.sent
+			m.fcMu.Unlock()
+			return nil
+		}
+		evt := m.fcEvt
+		m.fcMu.Unlock()
+		select {
+		case <-evt:
+		case <-time.After(time.Second):
+		case <-m.closed:
+			return ErrSessionClosed
+		}
+		if s.closed.Load() {
+			return io.ErrClosedPipe
+		}
+	}
+}
+
+// fcSent records DATA we just sent.
+func (m *Mux) fcSent(s *conn, n uint32) {
+	if !s.fc.Load() {
+		return
+	}
+	m.fcMu.Lock()
+	s.sent += n
+	m.totalUp += int64(n)
+	m.fcMu.Unlock()
+}
+
+// onAck applies the exit's running total of consumed bytes for a stream.
+func (m *Mux) onAck(s *conn, v uint32) {
+	m.fcMu.Lock()
+	delta := v - s.acked
+	if delta != 0 && delta <= s.sent-s.acked { // never beyond what was sent (a stale ack)
+		s.acked = v
+		m.totalUp -= int64(delta)
+		m.fcWake()
+	}
+	m.fcMu.Unlock()
+}
+
+// fcForget drops a finished stream's unacknowledged bytes from the total.
+func (m *Mux) fcForget(s *conn) {
+	m.fcMu.Lock()
+	m.totalUp -= int64(s.sent - s.acked)
+	s.acked = s.sent
+	m.fcWake()
+	m.fcMu.Unlock()
+}
+
+// fcWake releases every writer waiting on a window. Caller holds fcMu.
+func (m *Mux) fcWake() {
+	close(m.fcEvt)
+	m.fcEvt = make(chan struct{})
+}
+
+// noteConsumed is called after the app read n bytes from the stream; empty says
+// its buffer ran dry. It queues an ack when enough was consumed, or when the
+// buffer is empty (so the exit keeps the pipe full instead of waiting).
+func (s *conn) noteConsumed(n int, empty bool) {
+	if !s.fc.Load() || n <= 0 {
+		return
+	}
+	m := s.m
+	m.fcMu.Lock()
+	s.consumed += uint32(n)
+	due := s.consumed - s.ackedSent
+	if due >= ackEvery || (empty && due > 0) {
+		s.ackedSent = s.consumed
+		m.ackQ[s.id] = s.consumed
+		select {
+		case m.ackSig <- struct{}{}:
+		default:
+		}
+	}
+	m.fcMu.Unlock()
+}
+
+// ackLoop sends the queued acks off the readers' path (a busy carrier must not
+// block an app's Read) and coalesces: only the latest total per stream is sent.
+func (m *Mux) ackLoop() {
+	for {
+		select {
+		case <-m.ackSig:
+		case <-m.closed:
+			return
+		}
+		m.fcMu.Lock()
+		q := m.ackQ
+		m.ackQ = map[uint32]uint32{}
+		m.fcMu.Unlock()
+		for id, v := range q {
+			var p [4]byte
+			binary.BigEndian.PutUint32(p[:], v)
+			if err := m.sendFrame(Frame{Type: FrameAck, StreamID: id, Payload: p[:]}); err != nil {
+				if errors.Is(err, ErrSessionClosed) {
+					return
+				}
+			}
+		}
+	}
 }
 
 func (s *conn) Close() error {
@@ -317,6 +512,9 @@ type rbuffer struct {
 	cond *sync.Cond
 	buf  []byte
 	eof  bool
+
+	// onRead, if set, is told how much a Read took and whether the buffer is now empty.
+	onRead func(n int, empty bool)
 }
 
 func (r *rbuffer) write(p []byte) {
@@ -337,14 +535,19 @@ func (r *rbuffer) close() {
 
 func (r *rbuffer) read(p []byte) (int, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for len(r.buf) == 0 {
 		if r.eof {
+			r.mu.Unlock()
 			return 0, io.EOF
 		}
 		r.cond.Wait()
 	}
 	n := copy(p, r.buf)
 	r.buf = r.buf[n:]
+	empty := len(r.buf) == 0
+	r.mu.Unlock()
+	if r.onRead != nil {
+		r.onRead(n, empty)
+	}
 	return n, nil
 }

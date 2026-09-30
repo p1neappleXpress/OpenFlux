@@ -50,6 +50,9 @@ func Read(link string) Result {
 	if err != nil {
 		return Failed(err)
 	}
+	if c.Mode == ModeStream {
+		return Result{Config: &c} // no encryption in stream mode: no context to derive
+	}
 	return Result{Config: &c, Context: ContextOf(c)}
 }
 
@@ -67,8 +70,8 @@ func Read(link string) Result {
 func Make(c Config) Result {
 	c.Name = strings.TrimSpace(c.Name)
 	c.Context = strings.TrimSpace(c.Context)
-	if c.Codec == "batched" {
-		c.Codec = ""
+	if c.Codec == "batched" || c.Mode == ModeStream {
+		c.Codec = "" // stream mode has no codec to choose
 	}
 	ts := make([]Transport, len(c.Transports))
 	for i, t := range c.Transports {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"github.com/p1neappleXpress/OpenFlux/socks5"
+	"github.com/p1neappleXpress/OpenFlux/streamproxy"
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/transport/control"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
@@ -544,7 +545,7 @@ DEPRECATED (removed in v2)
 		if *sensitive || *sensitiveAlias {
 			utils.SetSensitive(true)
 		}
-		runStreamClient(*transportType, globalDocUrl, *socksAddr)
+		runStreamClient(*transportType, globalDocUrl, *socksAddr, *httpProxyAddr, *ipcSocketPath)
 		return
 	}
 
@@ -1068,9 +1069,11 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 }
 
 // runStreamClient runs the --mode=stream client: a raw transport carries the
-// phpbox stream mux, and a local SOCKS5 server dials each app connection out
-// as a mux stream to the phpbox exit. No gVisor, no IP packets.
-func runStreamClient(transportType, url, socksAddr string) {
+// phpbox stream mux, and a local SOCKS5 (and optional HTTP) proxy dials each
+// app connection out as a mux stream to the phpbox exit. No gVisor, no IP
+// packets. The proxying itself is package streamproxy, shared with the
+// mobile bridges.
+func runStreamClient(transportType, url, socksAddr, httpProxyAddr, ipcSocket string) {
 	cfg := transport.DefaultConfig()
 	var carrier phpbox.Carrier
 	switch transportType {
@@ -1090,15 +1093,48 @@ func runStreamClient(transportType, url, socksAddr string) {
 		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
 	}
 
-	m := phpbox.NewMux(carrier)
-	if err := m.Start(); err != nil {
-		log.Fatalf("--mode=stream: start carrier: %v", err)
+	p, err := streamproxy.Start(streamproxy.Options{Carrier: carrier, Socks: socksAddr, HTTP: httpProxyAddr, Label: transportType})
+	if err != nil {
+		log.Fatalf("--mode=stream: %v", err)
 	}
-	defer m.Close()
+	defer p.Stop()
 
+	// The app's IPC bridge works here too: traffic totals for its speed counters.
+	if ipcSocket != "" {
+		var exchanger transport.CookieExchanger
+		if x, ok := carrier.(transport.CookieExchanger); ok {
+			exchanger = x
+		}
+		srv := ipc.NewServer(ipcSocket, &coreIPCHandler{exchanger: exchanger})
+		if err := srv.Listen(); err != nil {
+			log.Fatalf("IPC listen %s: %v", ipcSocket, err)
+		}
+		defer srv.Close()
+		statusServer = srv
+		go streamStatusLoop(srv, p)
+	}
+
+	if httpProxyAddr != "" {
+		log.Printf("HTTP proxy on %s", httpProxyAddr)
+	}
 	log.Printf("Running as CLIENT (stream mux over %s, SOCKS5 on %s)", transportType, socksAddr)
-	srv := socks5.NewSOCKS5Server(socksAddr, phpbox.NewSocksDialer(m))
-	log.Fatal(srv.Start())
+	select {}
+}
+
+// streamStatusLoop reports the stream client to the app every second.
+func streamStatusLoop(srv *ipc.Server, p *streamproxy.Proxy) {
+	started := time.Now()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for range tick.C {
+		_ = srv.SendStatus(&ipc.StatusPayload{
+			Running:   true,
+			Connected: p.Connected(),
+			BytesIn:   uint64(p.BytesReceived()),
+			BytesOut:  uint64(p.BytesSent()),
+			UptimeMs:  time.Since(started).Milliseconds(),
+		})
+	}
 }
 
 func runClient(trans transport.Transport, inbound, socksAddr, httpProxyAddr string, exitMode tunnel.ExitMode) {
