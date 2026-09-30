@@ -5,6 +5,8 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-01
+
 ### Added
 
 - phpbox page (`deploy/phpbox`): opening an exit's URL in a browser shows a
