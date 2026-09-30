@@ -1,4 +1,5 @@
 <?php
+if (is_file(__DIR__ . '/config.php')) { require_once __DIR__ . '/config.php'; }   // token of a deployed node
 /**
  * phpbox.php - stream-mux exit for the OpenFlux client on plain PHP hosting
  * (including free shared hosting that cannot run a binary, hold a process,

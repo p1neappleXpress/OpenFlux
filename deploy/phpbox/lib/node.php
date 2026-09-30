@@ -175,6 +175,7 @@ final class PhpboxNode
         }
 
         if ($action === 'wasm')   { $this->serveAsset('share.wasm.gz', 'application/wasm', true); }
+        if ($action === 'ping')   { $this->json($this->ping()); }   // what a deploy step asks: is this the node, and can this host run it?
         if ($action === 'ui')     { $this->servePage($target); }
 
         if ($target === '') {
@@ -416,6 +417,33 @@ final class PhpboxNode
         fwrite($fp, "GET $path?$qs HTTP/1.1\r\nHost: $hostport\r\nUser-Agent: phpbox-chain\r\nAccept: text/plain\r\nConnection: close\r\n\r\n");
         fclose($fp);                                   // do not wait: the successor outlives this socket
         return true;
+    }
+
+    // ---- ping -----------------------------------------------------------
+
+    /** Facts about this host for the installer: what the node needs, and whether the host has it. */
+    private function ping(): array
+    {
+        $dir = PhpboxUtil::stateDir();
+        $needs = [
+            'fsockopen'     => function_exists('fsockopen'),
+            'stream_select' => function_exists('stream_select'),
+            'stream_socket_client' => function_exists('stream_socket_client'),
+            'usleep'        => function_exists('usleep'),
+            'openssl'       => extension_loaded('openssl'),
+            'json'          => function_exists('json_encode'),
+        ];
+        return [
+            'phpbox'    => self::VERSION,
+            'carrier'   => $this->carrier,
+            'php'       => PHP_VERSION,
+            'sapi'      => PHP_SAPI,
+            'needs'     => $needs,
+            'missing'   => array_keys(array_filter($needs, fn($ok) => !$ok)),
+            'state_dir' => is_dir($dir) && is_writable($dir),
+            'parser'    => is_file(dirname(__DIR__) . '/assets/share.wasm.gz'),
+            'time'      => time(),
+        ];
     }
 
     // ---- status ---------------------------------------------------------

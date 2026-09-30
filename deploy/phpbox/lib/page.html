@@ -143,6 +143,7 @@ footer{margin-top:22px;color:var(--hint);font-size:12px;text-align:center}
     <section class="card">
       <h2 id="h-qr"></h2>
       <div class="qrbox"><canvas id="qr" width="1" height="1" hidden></canvas><div class="empty" id="qrempty"></div>
+        <code class="k" id="qrlink" style="max-width:100%"></code>
         <div class="row" style="margin:0"><button class="soft" id="qr-save" hidden></button><button class="soft" id="qr-copy" hidden></button></div></div>
     </section>
 
@@ -174,7 +175,7 @@ const $ = id => document.getElementById(id);
 // ---- words (the core only answers with codes; the page words them) -------
 const L = {
 ru:{
- sub:'Бесплатный выход на обычном PHP-хостинге', node:'Нода', link:'Ссылка или адрес', qr:'QR-код', log:'Журнал',
+ sub:'Бесплатный выход на обычном PHP-хостинге', node:'Нода', link:'Ссылка или адрес', qr:'QR для приложений', log:'Журнал',
  idle:'Остановлена', connecting:'Подключается…', serving:'Работает', already:'Уже запущена',
  start:'Запустить', stop:'Остановить', starting:'Запуск…',
  streams:'потоков', opened:'открыто', up:'на сервер', down:'к вам',
@@ -190,14 +191,14 @@ ru:{
  secret_set:'задан, {n} симв. (на сервер не отправляется)', secret_none:'нет', session:'сессия (negotiate)', classic:'классический',
  used:'используется', unused:'не подходит этому выходу',
  cp_kick:'Копировать адрес для пингера', cp_cmd:'Копировать команду клиента', copied:'Скопировано',
- qr_empty:'QR появится, когда вы вставите ссылку openflux://', qr_save:'Сохранить PNG', qr_copy:'Копировать ссылку',
+ qr_empty:'QR для приложений появится, когда будет адрес ноды (вставьте ссылку или адрес)', qr_save:'Сохранить PNG', qr_copy:'Копировать ссылку',
  scroll:'автопрокрутка', sens:'писать адреса назначения в журнал', lcopy:'Копировать', lclear:'Очистить',
  noparser:'Разбор ссылок openflux:// недоступен: на хосте нет assets/share.wasm.gz. Адреса комнат и документов работают и без него.',
  parser_loading:'Загружаю разбор ссылок из ядра…', parser_ok:'разбор ссылок: ядро (wasm)', parser_bad:'разбор ссылок: недоступен',
  nocarrier:'В ссылке нет транспорта «{t}», который умеет этот выход.',
  warn_secret:'В ссылке есть секрет шифрования. Режим phpbox сейчас без шифрования: на клиенте используйте --mode=stream, секрет не применится.',
  warn_session:'Ссылка для сессии. phpbox-выход не говорит по сессионному протоколу: клиент идёт в режиме --mode=stream.',
- warn_apps:'Приложения пока не умеют режим stream: клиент запускайте из командной строки.',
+ warn_apps:'Клиент: приложение OpenFlux (режим «без сервера», отсканируйте QR справа) или ядро с --mode=stream.',
  already_banner:'Нода по этому адресу уже запущена (запуск №{g}, работает {s} с). Новую запускать не нужно: страница подключилась к ней.',
  started_elsewhere:'Запущена другим окном или пингером.',
  need_target:'Вставьте ссылку или адрес, чтобы запустить ноду.',
@@ -211,7 +212,7 @@ ru:{
  foot:'phpbox {v} · PHP {p} · журнал и состояние хранятся на хосте и стираются при переполнении'
 },
 en:{
- sub:'A free exit on plain PHP hosting', node:'Node', link:'Link or address', qr:'QR code', log:'Log',
+ sub:'A free exit on plain PHP hosting', node:'Node', link:'Link or address', qr:'QR for the apps', log:'Log',
  idle:'Stopped', connecting:'Connecting…', serving:'Running', already:'Already running',
  start:'Start', stop:'Stop', starting:'Starting…',
  streams:'streams', opened:'opened', up:'to server', down:'to you',
@@ -227,14 +228,14 @@ en:{
  secret_set:'set, {n} chars (never sent to the server)', secret_none:'none', session:'session (negotiate)', classic:'classic',
  used:'used', unused:'does not fit this exit',
  cp_kick:'Copy address for a pinger', cp_cmd:'Copy client command', copied:'Copied',
- qr_empty:'The QR appears when you paste an openflux:// link', qr_save:'Save PNG', qr_copy:'Copy link',
+ qr_empty:'The QR for the apps appears once the node has an address (paste a link or an address)', qr_save:'Save PNG', qr_copy:'Copy link',
  scroll:'autoscroll', sens:'log destination addresses', lcopy:'Copy', lclear:'Clear',
  noparser:'openflux:// link parsing is unavailable: assets/share.wasm.gz is not on the host. Room and document addresses work without it.',
  parser_loading:'Loading the core link parser…', parser_ok:'link parser: core (wasm)', parser_bad:'link parser: unavailable',
  nocarrier:'The link has no “{t}” transport, which is what this exit speaks.',
  warn_secret:'The link carries an encryption secret. phpbox has no encryption yet: use --mode=stream on the client, the secret will not apply.',
  warn_session:'This is a session link. A phpbox exit does not speak the session protocol: the client runs with --mode=stream.',
- warn_apps:'The apps do not support stream mode yet: run the client from the command line.',
+ warn_apps:'Client: the OpenFlux app (the “no server” mode, scan the QR on the right) or the core with --mode=stream.',
  already_banner:'A node on this address is already running (run #{g}, up {s} s). No need to start another: the page attached to it.',
  started_elsewhere:'Started by another window or a pinger.',
  need_target:'Paste a link or an address to start the node.',
@@ -330,9 +331,18 @@ function renderParsed(){
 
 // ---- QR (bitmap from the core) --------------------------------------------
 let qrLink='';
+// The link an app scans to use this node: the core makes it (mode "stream", one carrier, no secret).
+function clientLink(){
+  if(!core||!target) return '';
+  try{
+    const r=JSON.parse(core.make(JSON.stringify({name:'phpbox · '+C.title,mode:'stream',transports:[{type:C.carrier,url:target}]})));
+    return r.link||'';
+  }catch(e){return ''}
+}
 function renderQr(){
   const cv=$('qr'), empty=$('qrempty');
-  qrLink = parsed && parsed.link ? parsed.link : '';
+  qrLink = clientLink();
+  $('qrlink').textContent = qrLink ? qrLink.slice(0,46)+'…' : '';
   const ok = qrLink && core;
   cv.hidden=!ok; empty.hidden=!!ok; $('qr-save').hidden=!ok; $('qr-copy').hidden=!ok;
   if(!ok) return;

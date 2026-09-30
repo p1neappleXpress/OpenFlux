@@ -1,4 +1,5 @@
 <?php
+if (is_file(__DIR__ . '/config.php')) { require_once __DIR__ . '/config.php'; }   // token of a deployed node
 /**
  * cupsexit.php - a phpbox exit that reaches the client over cups.online.
  *

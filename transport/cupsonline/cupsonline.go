@@ -462,6 +462,23 @@ func CreateRoomList(ctx context.Context) (string, error) {
 	return packRooms(ids), nil
 }
 
+// CreateRoom creates one room and returns its uuid: what a phpbox exit, which
+// joins exactly one room, needs.
+func CreateRoom(ctx context.Context) (string, error) {
+	cfg := DefaultCupsonlineConfig()
+	auths, err := createRooms(ctx, baseRoomURL, 1, cfg.RoomCreatePause)
+	if err != nil {
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
+			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
+		}
+		return "", err
+	}
+	if len(auths) == 0 {
+		return "", errors.New("cups.online не создал комнату")
+	}
+	return auths[0].roomUUID, nil
+}
+
 func packRooms(ids []string) string {
 	raw, _ := json.Marshal(ids)
 	return base64.RawURLEncoding.EncodeToString(raw)

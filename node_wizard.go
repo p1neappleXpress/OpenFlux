@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/p1neappleXpress/OpenFlux/provision"
+	"github.com/p1neappleXpress/OpenFlux/provision/phphost"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
@@ -103,6 +104,8 @@ func runNodeWizard(in io.Reader, out io.Writer) int {
 		var resp map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			resp = wizardFailure(errors.New("неверный запрос"), nil)
+		} else if strings.HasPrefix(req.Method, "php.") {
+			resp = phpCall(req, enc)
 		} else {
 			resp = w.handle(req)
 		}
@@ -281,4 +284,25 @@ func (w *nodeWizard) checkDocument(documentURL string) map[string]interface{} {
 		return wizardFailure(errors.New("по ссылке документ открывается только на просмотр, нужен доступ на редактирование"), nil)
 	}
 	return wizardOK(map[string]interface{}{"editable": true})
+}
+
+// phpCall serves the "php.*" methods of the same protocol: putting the PHP
+// exit on a free web host over FTP (package phphost does every step; this only
+// carries its answers). Method "php.deploy" is phphost's "deploy", and so on.
+// While it runs, upload progress goes out as extra lines
+// {"id": N, "progress": {...}} before the final answer, which is
+// {"id": N, "ok": true, "data": ...} or {"id": N, "ok": false, "error": "...",
+// "code": "...", "param": "..."}: the code and param are what the app words.
+func phpCall(req wizardRequest, enc *json.Encoder) map[string]interface{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	res := phphost.Call(ctx, strings.TrimPrefix(req.Method, "php."), req.Params, func(p phphost.Progress) {
+		_ = enc.Encode(map[string]interface{}{"id": req.ID, "progress": p})
+	})
+	var resp map[string]interface{}
+	_ = json.Unmarshal([]byte(res.JSON()), &resp)
+	if resp == nil {
+		resp = map[string]interface{}{"ok": false, "error": "internal error"}
+	}
+	return resp
 }

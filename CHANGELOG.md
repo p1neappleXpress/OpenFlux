@@ -40,7 +40,7 @@ All notable changes to the OpenFlux core. Format loosely follows
   optional HTTP proxy, with counters) used by `--mode=stream` and, next, the
   mobile bridges; `--mode=stream` also takes `--http-proxy` and `--ipc-socket`.
 - `openflux://` links and QR codes can name the stream mode (`share.Config.Mode`,
-  `"stream"`): one carrier (cups.online, Mail.ru, Yandex), no session, no secret.
+  `"stream"`): one carrier (cups.online or Mail.ru: the two the PHP exit has ports for), no session, no secret.
   Links without a mode are the classic tunnel as before; codes `unknown_mode`,
   `stream_transport`, `stream_one_transport`, `stream_plain_only`.
 - phpbox flow control: windows per stream (256 KB) and over all streams (512 KB)
@@ -49,6 +49,23 @@ All notable changes to the OpenFlux core. Format loosely follows
   frames: over Mail.ru, four parallel downloads starved new TLS handshakes and
   uploads for minutes. With it (same test): 60 of 60 handshakes complete while four
   8 MB downloads run, and a 4 MB upload takes 33 s instead of timing out.
+
+- Own node without a server: `provision/phphost` puts the PHP exit on any web
+  host over FTP and checks that it runs. `probe` finds the web folder and
+  whether it is writable, `deploy` uploads the bundle embedded in the core
+  (`deploy/phpbox`, with the link parser as WebAssembly), keeps the token of an
+  earlier install and checks file sizes, `check` asks the site (passing the
+  iFastNet-style AES browser check in plain Go, so no browser is needed),
+  `start` runs the node and waits for it, plus `stop`, `node`, `newRoom`, `link`,
+  `remove`. Answers are codes (`ftp_login`, `ftp_no_webroot`, `site_antibot`,
+  `php_missing`, ...), never text. One dispatcher, `phphost.Call`, serves the
+  desktop wizard (`--node-wizard`, methods `php.*`, with progress lines), the
+  Android bridge (`PhpCall`, `PhpProgress`, `PhpCancel`) and the iOS C API
+  (`OpenFluxPhpCall`). The node answers `a=ping` for it.
+- Android and iOS start the stream mode: `StartStreamProxy` /
+  `OpenFluxStartStreamClient` (SOCKS5 with the usual auth and bypass list).
+- The node's page shows the link and QR code apps scan for that node (made by
+  the core as a stream-mode `openflux://` link).
 
 ### Fixed
 

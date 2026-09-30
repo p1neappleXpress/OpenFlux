@@ -3,15 +3,15 @@ module openflux-mobile
 go 1.26.4
 
 require (
-	golang.org/x/net v0.59.0
 	github.com/p1neappleXpress/OpenFlux v0.0.0
+	golang.org/x/net v0.59.0
 )
 
 require (
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/jlaffaye/ftp v0.2.4 // indirect
 	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
 	github.com/pion/datachannel v1.5.8 // indirect
@@ -30,10 +30,11 @@ require (
 	github.com/pion/transport/v2 v2.2.10 // indirect
 	github.com/pion/turn/v2 v2.1.6 // indirect
 	github.com/pion/webrtc/v3 v3.3.6 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e // indirect
-	github.com/stretchr/testify v1.9.0 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
+	github.com/xjasonlyu/windivert-go v0.0.0-20201010013527-4239d0afa76f // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc // indirect
 	golang.org/x/mobile v0.0.0-20260908204917-8b95e45f8d3e // indirect
@@ -42,7 +43,6 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.50.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gvisor.dev/gvisor v0.0.0-20260530041128-23ef90c42be7 // indirect
 )
 

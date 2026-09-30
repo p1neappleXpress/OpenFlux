@@ -15,6 +15,11 @@ js() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)" 2>/dev/null
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/dummyexit.php?k=wrong&$T")
 check "wrong token -> 404" $([ "$code" = 404 ] && echo 1 || echo 0) "$code"
 
+pg=$(curl -s "$base&a=ping")
+check "ping: says what this host can do" $(echo "$pg" | grep -q '"phpbox":"0' && echo "$pg" | grep -q '"missing":\[\]' && echo 1 || echo 0) "$pg"
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/dummyexit.php?k=wrong&a=ping")
+check "ping: needs the token" $([ "$code" = 404 ] && echo 1 || echo 0) "$code"
+
 page=$(curl -s -H 'Accept: text/html,application/xhtml+xml' -H 'Sec-Fetch-Mode: navigate' "$base&$T")
 check "browser navigation -> the status page" $(echo "$page" | grep -q '<title>test · OpenFlux</title>' && echo 1 || echo 0)
 check "page carries its config (target, carrier)" $(echo "$page" | grep -q '"carrier":"mailru"' && echo "$page" | grep -q '"target":"doc1"' && echo 1 || echo 0)

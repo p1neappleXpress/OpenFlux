@@ -1,4 +1,5 @@
 <?php
+if (is_file(__DIR__ . '/config.php')) { require_once __DIR__ . '/config.php'; }   // token of a deployed node
 /**
  * mailruexit.php - a phpbox exit that reaches the client over Mail.ru's cloud
  * document editor (docs.datacloudmail.ru), the sibling of cupsexit.php.

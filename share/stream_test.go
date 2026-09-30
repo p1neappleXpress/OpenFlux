@@ -11,7 +11,6 @@ func TestStreamModeRoundTrip(t *testing.T) {
 	for _, c := range []struct{ typ, url string }{
 		{"cupsonline", "https://interview.cups.online/live-coding/?room=11111111-2222-3333-4444-555555555555"},
 		{"mailru", "https://cloud.mail.ru/public/Vuri/d5nuZ5aQp"},
-		{"yandex", "https://docs.yandex.ru/x"},
 	} {
 		r := Make(streamCfg(c.typ, c.url))
 		if r.Error != "" {
@@ -42,6 +41,7 @@ func TestStreamModeCodes(t *testing.T) {
 		{"two transports", Config{Mode: ModeStream, Transports: []Transport{{Type: "mailru", URL: "x"}, {Type: "cupsonline"}}}, CodeStreamOneTransport},
 		{"no transport", Config{Mode: ModeStream}, CodeNoTransports},
 		{"a carrier the PHP exit has no port for", streamCfg("boards", "https://b"), CodeStreamTransport},
+		{"yandex has none either", streamCfg("yandex", "https://docs.yandex.ru/x"), CodeStreamTransport},
 		{"direct", Config{Mode: ModeStream, Transports: []Transport{{Type: "direct", Dial: "1.2.3.4:5"}}}, CodeStreamTransport},
 		{"a session", Config{Mode: ModeStream, Negotiate: true, Secret: "0123456789abcdef", Transports: []Transport{{Type: "mailru", URL: "x"}}}, CodeStreamPlainOnly},
 		{"a secret", Config{Mode: ModeStream, Secret: "0123456789abcdef", Transports: []Transport{{Type: "mailru", URL: "x"}}}, CodeStreamPlainOnly},

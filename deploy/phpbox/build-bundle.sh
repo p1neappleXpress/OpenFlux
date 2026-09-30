@@ -32,9 +32,5 @@ if (!defined('PHPBOX_CONFIG_LOADED')) {
     if (!defined('PHPBOX_TOKEN')) define('PHPBOX_TOKEN', '$token');
 }
 PHP
-# the exits read the token from the environment or the constant: load config first
-for f in cupsexit.php mailruexit.php phpbox.php; do
-  awk 'NR==1{print; print "require_once __DIR__ . \"/config.php\";"; next} {print}' "$out/$f" > "$out/$f.tmp" && mv "$out/$f.tmp" "$out/$f"
-done
 find "$out" -name '*.php' -exec php -l {} \; | grep -v '^No syntax errors' || true
 echo "bundle: $out"; (cd "$out" && find . -type f | sort | sed 's/^/  /')
