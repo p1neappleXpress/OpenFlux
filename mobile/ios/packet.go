@@ -52,13 +52,30 @@ var tunnelUDP atomic.Bool
 func OpenFluxSetTunnelUDP(on C.int) { tunnelUDP.Store(on != 0) }
 
 // extensionLimits keeps the Network Extension under its 50 MB cap: a Go
-// heap limit with headroom for what lives outside it (TLS, WebSocket
+// heap limit with headroom for what lives outside it (zstd, TLS, WebSocket
 // buffers, the runtime), and the phone resource profile of the carriers.
 func extensionLimits() {
-	debug.SetMemoryLimit(32 << 20)
-	debug.SetGCPercent(100)
+	debug.SetMemoryLimit(24 << 20)
+	debug.SetGCPercent(80)
 	mobile.SetLowMemory(true)
+	// SetMemoryLimit bounds only the Go heap; jetsam kills by RSS. Under
+	// load the freed heap has to go back to the OS or RSS keeps growing
+	// (a speed test ended the extension, a captcha hand-off failed):
+	// FreeOSMemory (MADV_DONTNEED) on a slow tick trades a little
+	// throughput for the extension staying alive. One ticker for the
+	// process, however many times the tunnel starts.
+	freeOSMemory.Do(func() {
+		go func() {
+			for range time.Tick(freeOSMemoryEvery) {
+				debug.FreeOSMemory()
+			}
+		}()
+	})
 }
+
+var freeOSMemory sync.Once
+
+const freeOSMemoryEvery = 8 * time.Second
 
 // OpenFluxStartPacketTunnel starts the packet tunnel for a classic profile
 // (see OpenFluxStartClient for the arguments; the secret comes from
