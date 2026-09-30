@@ -98,8 +98,14 @@ final class CupsCarrier implements Carrier
 
     public function onReadable($sock): void
     {
-        $msg = $this->ws->readFrame(0.2);
-        if ($msg === null || $msg === '') { return; }
+        do {                                   // keep reading while PHP already holds more (select cannot see its buffer)
+            $msg = $this->ws->readFrame(0.2);
+            if ($msg !== null && $msg !== '') { $this->onMessage($msg); }
+        } while ($this->ws->pending());
+    }
+
+    private function onMessage(string $msg): void
+    {
         foreach (explode("\n", trim($msg)) as $line) {
             if ($line === '') { continue; }
             if ($line === '{}') { $this->ws->writeText('{}'); continue; }

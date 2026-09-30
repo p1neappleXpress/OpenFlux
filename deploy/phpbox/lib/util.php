@@ -62,15 +62,25 @@ final class PhpboxUtil
         return ($p['scheme'] ?? 'https') . '://' . ($p['host'] ?? '');
     }
 
-    /** Host -> IP, looked up once per run ('' when it does not resolve). */
-    public static function resolve(string $host): string
+    /** Host -> every address it has (IPv4 first), looked up once per run; [] when it does not resolve. */
+    public static function resolveAll(string $host): array
     {
         static $cache = [];
         if (!isset($cache[$host])) {
-            $ip = filter_var($host, FILTER_VALIDATE_IP) ? $host : gethostbyname($host);
-            $cache[$host] = filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
+            if (filter_var($host, FILTER_VALIDATE_IP)) {
+                $cache[$host] = [$host];
+            } else {
+                $ips = @gethostbynamel($host) ?: [];
+                $cache[$host] = array_values(array_filter($ips, fn($ip) => filter_var($ip, FILTER_VALIDATE_IP)));
+            }
         }
         return $cache[$host];
+    }
+
+    /** Host -> its first address ('' when it does not resolve). */
+    public static function resolve(string $host): string
+    {
+        return self::resolveAll($host)[0] ?? '';
     }
 
     /** Local testing only: lifts the private-address and port guards. Never set on a real host. */
@@ -79,15 +89,22 @@ final class PhpboxUtil
         return getenv('PHPBOX_ALLOW_PRIVATE') === '1' || (defined('PHPBOX_ALLOW_PRIVATE') && PHPBOX_ALLOW_PRIVATE === '1');
     }
 
-    /** Refuse loopback / private / reserved targets (no SSRF into the host LAN). */
+    /** Refuse loopback / private / reserved targets (no SSRF into the host LAN): any address that is one blocks the host. */
     public static function isPrivate(string $host): bool
     {
         if (self::testMode()) {
             return false;
         }
-        $ip = self::resolve($host);
-        return $ip === '' || !filter_var($ip, FILTER_VALIDATE_IP,
-            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        $ips = self::resolveAll($host);
+        if (!$ips) {
+            return true;
+        }
+        foreach ($ips as $ip) {
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Where run state and logs live: a writable dir that is not web-served when the host has one. */

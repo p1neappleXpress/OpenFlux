@@ -79,16 +79,38 @@ final class MailruCarrier implements Carrier
 
     public function onReadable($sock): void
     {
-        $msg = $this->ws->readFrame(0.2);
-        if ($msg === null || $msg === '') { return; }
+        do {                                   // keep reading while PHP already holds more (select cannot see its buffer)
+            $msg = $this->ws->readFrame(0.2);
+            if ($msg !== null && $msg !== '') { $this->onMessage($msg); }
+        } while ($this->ws->pending());
+    }
+
+    private function onMessage(string $msg): void
+    {
         if ($msg === '2') { $this->ws->writeText('3'); return; }   // Socket.IO ping
         if ($msg === '3') { return; }
-        if (str_contains($msg, '---KA---')) { return; }
-        if (!str_contains($msg, 'cursor')) { return; }
-        if (!preg_match('/"cursor":"[^;]+;([^"]+)"/', $msg, $m)) { return; }
-        $pkt = base64_decode($m[1], true);
-        if ($pkt === false || $pkt === '') { return; }
-        $this->mux->onPacket($pkt);                                // one message = one packet
+        foreach (self::payloads($msg) as $pkt) {
+            $this->mux->onPacket($pkt);                            // one cursor entry = one packet
+        }
+    }
+
+    /**
+     * Every data packet in a server message, in order. The server batches several cursor entries into one
+     * message under load and a peer's keep-alive may come first, so taking only the first entry (or
+     * dropping any message that mentions ---KA---) loses data: that is what broke TLS handshakes.
+     */
+    public static function payloads(string $msg): array
+    {
+        if (!str_contains($msg, 'cursor') || !preg_match_all('/"cursor":"[^;]+;([^"]+)"/', $msg, $all)) {
+            return [];
+        }
+        $out = [];
+        foreach ($all[1] as $b64) {
+            if ($b64 === '---KA---') { continue; }
+            $pkt = base64_decode($b64, true);
+            if ($pkt !== false && $pkt !== '') { $out[] = $pkt; }
+        }
+        return $out;
     }
 
     public function sendPacket(string $frame): void
@@ -149,6 +171,12 @@ final class MailruCarrier implements Carrier
             $ok = $ok && $pass;
             printf("selftest len=%-5d %s\n", strlen($p), $pass ? 'OK' : 'FAIL');
         }
+        $entry = fn(string $p) => '{"cursor":"18;' . $p . '","time":1,"user":"a"}';
+        $batch = '42["message",{"type":"cursor","messages":[' . $entry('---KA---') . ',' . $entry(base64_encode('one')) . ',' . $entry(base64_encode('two')) . ']}]';
+        $got = self::payloads($batch);
+        $pass = $got === ['one', 'two'] && self::payloads('42["message",{"type":"cursor","messages":[' . $entry('---KA---') . ']}]') === [];
+        $ok = $ok && $pass;
+        printf("selftest batched cursors %s\n", $pass ? 'OK' : 'FAIL');
         echo $ok ? "SELFTEST PASS\n" : "SELFTEST FAIL\n";
         exit($ok ? 0 : 1);
     }

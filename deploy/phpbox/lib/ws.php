@@ -41,6 +41,9 @@ final class WsClient
             return false;
         }
         $this->sock = $s;
+        $this->closed = false;
+        $this->rx = $this->frag = '';
+        $this->q = [];
         return true;
     }
 
@@ -64,70 +67,132 @@ final class WsClient
             $frame .= chr(0x80 | 127) . pack('J', $len);
         }
         $mask = random_bytes(4);
-        $frame .= $mask;
-        for ($i = 0; $i < $len; $i++) {
-            $frame .= $payload[$i] ^ $mask[$i % 4];
-        }
+        // PHP XORs strings byte by byte up to the shorter one: no per-byte loop.
+        $frame .= $mask . ($payload ^ str_repeat($mask, intdiv($len, 4) + 1));
         @fwrite($this->sock, $frame);
     }
 
+    // ---- reading ---------------------------------------------------------
+    // Bytes are buffered and whole frames parsed out of the buffer, so a frame that
+    // arrives in pieces (a 22 KB message on a slow link) is never cut short, which
+    // used to desynchronise the stream and break TLS inside the tunnel. Fragmented
+    // messages are reassembled. "Closed" is a state ($closed), not a timeout.
+
+    /** True once the server closed the socket, sent a close frame, or the link broke. */
+    public bool $closed = false;
+
+    private string $rx = '';
+    private array  $q = [];          // complete messages not yet handed out
+    private string $frag = '';       // a fragmented message being assembled
+
+    /** More is ready without waiting on the network: a parsed message, or bytes already inside PHP's stream buffer
+     *  (stream_select cannot see those, so a reader must keep reading while this is true). */
+    public function pending(): bool
+    {
+        if ($this->q) {
+            return true;
+        }
+        if (!$this->sock) {
+            return false;
+        }
+        $m = stream_get_meta_data($this->sock);
+        return ($m['unread_bytes'] ?? 0) > 0;
+    }
+
     /**
-     * readFrame reads one message. Returns the text payload, '' for a handled
-     * control frame (WS ping is auto-ponged), or null on close/timeout.
+     * readFrame returns the next message: its text; '' when bytes were consumed but no whole message is
+     * ready yet (or a control frame was handled); null when nothing came within $timeout or the link is
+     * closed (check $closed).
      */
     public function readFrame(float $timeout): ?string
     {
+        if ($this->q) {
+            return array_shift($this->q);
+        }
         if (!$this->sock) {
             return null;
         }
-        stream_set_timeout($this->sock, (int)$timeout, (int)(($timeout - (int)$timeout) * 1e6));
-        $b0 = @fread($this->sock, 1);
-        if ($b0 === '' || $b0 === false) {
-            return null;
-        }
-        $b1 = @fread($this->sock, 1);
-        if ($b1 === '' || $b1 === false) {
-            return null;
-        }
-        $opcode = ord($b0) & 0x0f;
-        $len = ord($b1) & 0x7f;
-        $masked = (ord($b1) & 0x80) !== 0;
-        if ($len === 126) {
-            $len = unpack('n', $this->readN(2))[1];
-        } elseif ($len === 127) {
-            $len = unpack('J', $this->readN(8))[1];
-        }
-        $mask = $masked ? $this->readN(4) : '';
-        $data = $this->readN($len);
-        if ($masked && strlen($mask) === 4) {
-            for ($i = 0; $i < strlen($data); $i++) {
-                $data[$i] = $data[$i] ^ $mask[$i % 4];
+        if (!$this->pending()) {
+            $r = [$this->sock]; $w = $e = null;
+            if (!@stream_select($r, $w, $e, (int)$timeout, (int)(($timeout - (int)$timeout) * 1e6))) {
+                return null;
             }
         }
-        if ($opcode === 0x8) {
-            return null;                       // close
+        $chunk = @fread($this->sock, 65536);
+        if ($chunk === false || ($chunk === '' && feof($this->sock))) {
+            $this->markClosed();
+            return null;
         }
-        if ($opcode === 0x9) {
-            $this->writeFrame(0xA, $data);     // ping -> pong
-            return '';
+        if ($chunk === '') {
+            return null;
         }
-        if ($opcode === 0xA) {
-            return '';                         // pong
+        $this->rx .= $chunk;
+        $this->parse();
+        if ($this->q) {
+            return array_shift($this->q);
         }
-        return $data;                          // text / binary / continuation
+        return $this->closed ? null : '';
     }
 
-    private function readN(int $n): string
+    private function parse(): void
     {
-        $data = '';
-        while (strlen($data) < $n) {
-            $chunk = @fread($this->sock, $n - strlen($data));
-            if ($chunk === '' || $chunk === false) {
-                break;
+        while (strlen($this->rx) >= 2) {
+            $b0 = ord($this->rx[0]);
+            $b1 = ord($this->rx[1]);
+            $len = $b1 & 0x7f;
+            $off = 2;
+            if ($len === 126) {
+                if (strlen($this->rx) < 4) { return; }
+                $len = unpack('n', substr($this->rx, 2, 2))[1];
+                $off = 4;
+            } elseif ($len === 127) {
+                if (strlen($this->rx) < 10) { return; }
+                $len = unpack('J', substr($this->rx, 2, 8))[1];
+                $off = 10;
             }
-            $data .= $chunk;
+            $masked = ($b1 & 0x80) !== 0;
+            if ($masked) { $off += 4; }
+            if ($len > 67108864) {                       // 64 MB: not a real message
+                $this->markClosed();
+                return;
+            }
+            if (strlen($this->rx) < $off + $len) {
+                return;                                  // the rest of the frame is still on its way
+            }
+            $data = substr($this->rx, $off, $len);
+            if ($masked) {
+                $mask = substr($this->rx, $off - 4, 4);
+                $data = $data ^ str_repeat($mask, intdiv($len, 4) + 1);
+            }
+            $this->rx = substr($this->rx, $off + $len);
+            $opcode = $b0 & 0x0f;
+            $fin = ($b0 & 0x80) !== 0;
+            if ($opcode === 0x8) {                       // close
+                $this->markClosed();
+                return;
+            }
+            if ($opcode === 0x9) {                       // ping -> pong
+                $this->writeFrame(0xA, $data);
+                continue;
+            }
+            if ($opcode === 0xA) {                       // pong
+                continue;
+            }
+            if ($opcode !== 0x0) {                       // text/binary starts a message
+                $this->frag = '';
+            }
+            $this->frag .= $data;
+            if ($fin) {
+                $this->q[] = $this->frag;
+                $this->frag = '';
+            }
         }
-        return $data;
+    }
+
+    private function markClosed(): void
+    {
+        $this->closed = true;
+        $this->close();
     }
 
     public function close(): void
@@ -136,5 +201,7 @@ final class WsClient
             @fclose($this->sock);
             $this->sock = null;
         }
+        $this->rx = '';
+        $this->frag = '';
     }
 }

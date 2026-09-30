@@ -52,4 +52,26 @@ st=$(curl -s "$base&a=status&$T"); check "it ends by itself at the cap" $([ "$(e
 out=$(curl -s -m 8 "$base&a=run&url=fail"); check "a node that cannot join reports it" $(echo "$out" | grep -q 'connect failed' && echo 1 || echo 0) "$out"
 st=$(curl -s "$base&a=status&url=fail"); check "and is not left 'running'" $([ "$(echo "$st" | js "d['running']")" = False ] && echo 1 || echo 0) "$st"
 
+# ---- self-renewing chain (cap 12s: hands over at ~8s, so a generation every ~8s) ----
+export PHPBOX_ALLOW_PRIVATE=1
+pkill -f "php -S 127.0.0.1:$port" 2>/dev/null; sleep 0.5
+(cd "$here" && PHPBOX_ALLOW_PRIVATE=1 php -S 127.0.0.1:$port >/dev/null 2>&1 &) ; sleep 1
+C="url=chain1"
+curl -s -m 30 "$base&a=run&chain=1&cap=12&$C" >/dev/null &
+sleep 27
+st=$(curl -s "$base&a=status&$C"); gen=$(echo "$st" | js "d['state']['gen']")
+check "chain: still running after 27s (cap is 12s)" $([ "$(echo "$st" | js "d['running']")" = True ] && echo 1 || echo 0) "$st"
+check "chain: several generations took over (gen >= 3)" $([ "${gen:-0}" -ge 3 ] && echo 1 || echo 0) "gen=$gen"
+check "chain: status reports continuous mode" $([ "$(echo "$st" | js "d['chain']")" = True ] && echo 1 || echo 0)
+lg=$(curl -s "$base&a=log&$C&since=0")
+check "chain: log shows the handover" $(echo "$lg" | grep -q 'handed over to gen 2' && echo 1 || echo 0)
+check "chain: no generation died or broke the chain" $(echo "$lg" | grep -q 'chain broken\|died' && echo 0 || echo 1)
+second=$(curl -s -m 5 "$base&a=run&chain=1&$C"); check "chain: a pinger during the chain just attaches" $(echo "$second" | grep -q 'already running' && echo 1 || echo 0) "$second"
+curl -s "$base&a=stop&$C" >/dev/null; sleep 3.5
+st=$(curl -s "$base&a=status&$C"); g1=$(echo "$st" | js "d['state']['gen']")
+check "chain: stop ends the whole chain" $([ "$(echo "$st" | js "d['running']")" = False ] && echo 1 || echo 0) "$st"
+sleep 11
+st=$(curl -s "$base&a=status&$C"); g2=$(echo "$st" | js "d['state']['gen']")
+check "chain: nothing respawns after a stop" $([ "$g1" = "$g2" ] && [ "$(echo "$st" | js "d['running']")" = False ] && echo 1 || echo 0) "$g1 -> $g2"
+
 echo; [ $fail = 0 ] && echo "NODE TEST PASS" || echo "NODE TEST FAIL"; exit $fail

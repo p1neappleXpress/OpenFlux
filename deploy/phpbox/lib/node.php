@@ -10,6 +10,18 @@
 // second (plus an flock), so a second open - or a pinger - never starts a
 // second node on the same target; it just reports the first one.
 //
+// Self-renewing tunnel (&chain=1, what the page asks for): a request lives only
+// ~cap seconds on these hosts, so before it ends a node starts its successor -
+// a request to its own host, which passes the host's bot check because it comes
+// from the host itself - and they hand over:
+//   1. the successor joins and reports "serving";
+//   2. the old generation stops taking NEW streams ("draining") and keeps
+//      serving the ones it has until they end or its own cap;
+//   3. while both are up, a new stream goes to whichever creates its marker
+//      directory first (mkdir is atomic), so no stream is served twice.
+// Only one generation ever takes new streams; a stop (the page, &a=stop) ends
+// the whole chain and keeps a dying generation from spawning another.
+//
 // Links are NOT parsed here. The page parses openflux:// links in the browser
 // with the core's own parser (WebAssembly), so there is one parser for every
 // client; this file only ever sees the carrier's own address (?url=).
@@ -102,14 +114,36 @@ final class PhpboxState
 
     public static function alive(array $s): bool
     {
-        return in_array($s['phase'] ?? '', ['connecting', 'serving'], true)
+        return in_array($s['phase'] ?? '', ['connecting', 'serving', 'draining'], true)
             && (time() - (int)($s['beat'] ?? 0)) < self::STALE;
+    }
+
+    /** Alive and still taking new streams (not draining). */
+    public static function accepting(array $s): bool
+    {
+        return self::alive($s) && ($s['phase'] ?? '') !== 'draining';
+    }
+
+    /** All generations of one node that have a state file: gen => state. */
+    public static function generations(string $dir, string $key): array
+    {
+        $out = [];
+        foreach (glob("$dir/$key.g*.json") ?: [] as $f) {
+            if (preg_match('/\.g(\d+)\.json$/', $f, $m)) {
+                $o = json_decode((string)@file_get_contents($f), true);
+                if (is_array($o)) { $out[(int)$m[1]] = $o; }
+            }
+        }
+        ksort($out);
+        return $out;
     }
 }
 
 final class PhpboxNode
 {
-    const VERSION = '0.3';
+    const VERSION = '0.4';
+    const CHAIN_CAP = 240;      // lifetime of one generation in chain mode (plain mode: the exit's own cap, 140)
+    const MAX_DRAIN = 60;       // seconds a generation keeps serving its streams after handing over
 
     /**
      * @param string   $carrier  'cupsonline' | 'mailru' - the transport type a link must carry to fit this exit
@@ -146,25 +180,24 @@ final class PhpboxNode
         if ($target === '') {
             $this->json(['error' => 'need_target'], 400);
         }
-        $key   = substr(sha1($this->carrier . '|' . $target), 0, 12);
-        $dir   = PhpboxUtil::stateDir();
-        $log   = new PhpboxLog("$dir/$key.log");
-        $state = new PhpboxState("$dir/$key.state.json");
+        $key = substr(sha1($this->carrier . '|' . $target), 0, 12);
+        $dir = PhpboxUtil::stateDir();
+        $log = new PhpboxLog("$dir/$key.log");
 
         switch ($action) {
             case 'status':
-                $this->json($this->status($state));
+                $this->json($this->status($dir, $key));
             case 'log':
                 $this->json($log->tail((int)($_GET['since'] ?? 0)));
             case 'stop':
-                $alive = PhpboxState::alive($state->read());
+                $alive = array_filter(PhpboxState::generations($dir, $key), fn($g) => PhpboxState::alive($g));
                 if ($alive) {
-                    @touch("$dir/$key.stop");
+                    @touch("$dir/$key.stop");   // every generation sees it; none spawns another
                     $log->write('info', 'stop requested from the page');
                 }
-                $this->json(['ok' => true, 'was_running' => $alive]);
+                $this->json(['ok' => true, 'was_running' => (bool)$alive]);
             case 'run':
-                $this->run($target, $key, $dir, $log, $state);
+                $this->run($target, $key, $dir, $log);
                 exit;
             default:
                 $this->json(['error' => 'unknown_action'], 400);
@@ -173,7 +206,7 @@ final class PhpboxNode
 
     // ---- run ------------------------------------------------------------
 
-    private function run(string $target, string $key, string $dir, PhpboxLog $log, PhpboxState $state): void
+    private function run(string $target, string $key, string $dir, PhpboxLog $log): void
     {
         header('Content-Type: text/plain; charset=utf-8');
         header('Cache-Control: no-store');
@@ -183,41 +216,75 @@ final class PhpboxNode
         @set_time_limit(0);           // disabled on some free hosts; harmless there
         while (ob_get_level() > 0) { ob_end_flush(); }
 
-        $prev = $state->read();
-        if (PhpboxState::alive($prev)) {
-            $log->write('info', 'another open asked to start the node: already running (gen ' . ($prev['gen'] ?? '?') . ')');
-            echo "already running\n";
-            return;
+        $chain = !empty($_GET['chain']);
+        $succ  = !empty($_GET['succ']);            // started by the previous generation, not by a person
+        $from  = (int)($_GET['from'] ?? 0);
+        $cap   = $chain ? self::CHAIN_CAP : $this->cap;
+        if (isset($_GET['cap'])) {
+            $cap = max(PhpboxUtil::testMode() ? 6 : 30, min(900, (int)$_GET['cap']));
         }
-        $lock = @fopen("$dir/$key.lock", 'c');
-        if ($lock && !flock($lock, LOCK_EX | LOCK_NB)) {
-            echo "already running\n";   // another request holds the lock but has not beaten yet
-            return;
-        }
-        @unlink("$dir/$key.stop");
+        $drain   = min(self::MAX_DRAIN, intdiv($cap, 3));
+        $spawnAt = $cap - $drain;                  // when this generation starts its successor
 
-        $gen = (int)($prev['gen'] ?? 0) + 1;
+        $gens = PhpboxState::generations($dir, $key);
+        if (!$succ) {
+            $accepting = array_filter($gens, fn($g) => PhpboxState::accepting($g));
+            if ($accepting) {
+                $g = max(array_keys($accepting));
+                $log->write('info', "another open asked to start the node: already running (gen $g)");
+                echo "already running\n";
+                return;
+            }
+            @unlink("$dir/$key.stop");             // a person starting it again clears an earlier stop
+        } elseif (is_file("$dir/$key.stop")) {
+            $log->write('info', 'successor not started: stop was requested');
+            echo "stopped\n";
+            return;
+        }
+        $gen = $succ ? $from + 1 : ($gens ? max(array_keys($gens)) : 0) + 1;
+        if ($succ && isset($gens[$gen]) && PhpboxState::alive($gens[$gen])) {
+            echo "already running\n";            // a duplicate successor request
+            return;
+        }
+        $lock = @fopen("$dir/$key.g$gen.lock", 'c');
+        if ($lock && !flock($lock, LOCK_EX | LOCK_NB)) {
+            echo "already running\n";              // another request holds this generation but has not beaten yet
+            return;
+        }
+        foreach ($gens as $old => $_) {            // forget generations long gone
+            if ($old < $gen - 4) { @unlink("$dir/$key.g$old.json"); @unlink("$dir/$key.g$old.lock"); }
+        }
+
+        $state   = new PhpboxState("$dir/$key.g$gen.json");
         $started = time();
         $sensitive = !empty($_GET['sensitive']);
         $s = [
             'carrier' => $this->carrier, 'pid' => getmypid(), 'gen' => $gen, 'phase' => 'connecting',
-            'started' => $started, 'beat' => $started, 'cap' => $this->cap, 'elapsed' => 0,
+            'started' => $started, 'beat' => $started, 'cap' => $cap, 'elapsed' => 0,
+            'chain' => $chain, 'spawn_at' => $spawnAt, 'from' => $succ ? $from : null,
             'streams' => 0, 'opened' => 0, 'failed' => 0, 'up' => 0, 'down' => 0,
             'sensitive' => $sensitive, 'php' => PHP_VERSION, 'version' => self::VERSION,
         ];
         $state->write($s);
-        $log->write('info', "node gen $gen starting on {$this->carrier} (phpbox " . self::VERSION . ', php ' . PHP_VERSION . ')');
+        $log->write('info', "node gen $gen starting on {$this->carrier}" . ($succ ? " (successor of gen $from)" : '')
+            . ' (phpbox ' . self::VERSION . ', php ' . PHP_VERSION . ')');
 
         // Whatever a carrier echoes is also a log line (and still goes to the response).
-        ob_start(function (string $buf) use ($log) {
+        ob_start(function (string $buf) use ($log, $gen) {
             foreach (preg_split('/\R/', $buf) as $l) {
                 if (trim($l) !== '') { $log->write('info', trim($l)); }
             }
             return $buf;
         }, 1);
 
+        $ownMine = "$dir/$key.own.$gen";           // markers for streams while a successor is coming up
+        $ownPrev = "$dir/$key.own.$from";          // ... and while we are the successor
+        $rmOwn = function (string $d) {
+            foreach (glob("$d/*") ?: [] as $f) { @rmdir($f); }
+            @rmdir($d);
+        };
         $ended = false;
-        $finish = function (string $why, string $lvl = 'info') use (&$s, $state, $log, &$ended) {
+        $finish = function (string $why, string $lvl = 'info') use (&$s, $state, $log, &$ended, $rmOwn, $ownMine) {
             if ($ended) { return; }
             $ended = true;
             $s['phase'] = 'idle';
@@ -225,6 +292,7 @@ final class PhpboxNode
             $s['elapsed'] = time() - $s['started'];
             $s['reason'] = $why;
             $state->write($s);
+            $rmOwn($ownMine);
             $log->write($lvl, "node gen {$s['gen']} ended: $why");
         };
         register_shutdown_function(function () use (&$finish) {   // CPU limit, fatal error
@@ -242,13 +310,34 @@ final class PhpboxNode
         $s['phase'] = 'serving';
         $s['beat'] = time();
         $state->write($s);
-        $log->write('info', "joined; serving up to {$this->cap}s" . ($sensitive ? ' (destinations are logged)' : ' (destinations are hidden: add &sensitive=1 to log them)'));
-        echo "{$this->carrier} exit ready; serving up to {$this->cap}s\n";
+        $log->write('info', "joined; serving" . ($chain ? ", handing over to a successor at {$spawnAt}s" : '') . " up to {$cap}s"
+            . ($sensitive ? ' (destinations are logged)' : ' (destinations are hidden: add &sensitive=1 to log them)'));
+        echo "{$this->carrier} exit ready; serving up to {$cap}s\n";
 
         $mux = new Mux($carrier);
         $mux->sensitive = $sensitive;
+        if (isset($_GET['idle'])) { $mux->idleTimeout = max(0, min(3600, (int)$_GET['idle'])); }
+        if (isset($_GET['chunk'])) { $mux->readChunk = max(2048, min(262144, (int)$_GET['chunk'])); }
         $mux->log = fn(string $lvl, string $m) => $log->write($lvl, $m);
-        $mux->onTick = function (Mux $m) use (&$s, $state, $started, $dir, $key) {
+
+        // Handover bookkeeping (chain mode).
+        $asSucc = $succ;                                 // the previous generation may still take the same OPENs
+        $asPred = false;                                 // we spawned a successor that may take them too
+        $spawned = false; $lastSpawn = 0; $frozen = false; $endWhy = '';
+        $predState = $succ ? new PhpboxState("$dir/$key.g$from.json") : null;
+        $succState = new PhpboxState("$dir/$key." . 'g' . ($gen + 1) . '.json');
+        if ($asSucc) { @mkdir($ownPrev, 0700, true); }
+        $mux->claim = function (int $sid) use (&$asSucc, &$asPred, $ownPrev, $ownMine): bool {
+            // mkdir is atomic: the first generation to create the marker owns the stream. Recursive, because the
+            // previous generation removes its marker directory when it ends, up to a second before we notice.
+            if ($asSucc && !@mkdir("$ownPrev/$sid", 0700, true)) { return false; }
+            if ($asPred && !@mkdir("$ownMine/$sid", 0700, true)) { return false; }
+            return true;
+        };
+
+        $mux->onTick = function (Mux $m) use (&$s, $state, $started, $dir, $key, $chain, $spawnAt, $target, $cap, $sensitive, $gen,
+                                              $log, &$asSucc, &$asPred, &$spawned, &$lastSpawn, &$frozen, &$endWhy,
+                                              $predState, $succState, $ownMine) {
             $s['beat'] = time();
             $s['elapsed'] = time() - $started;
             $s['streams'] = $m->activeStreams();
@@ -257,31 +346,103 @@ final class PhpboxNode
             $s['up'] = $m->stats['up'];
             $s['down'] = $m->stats['down'];
             $state->write($s);
-            if (file_exists("$dir/$key.stop")) {
-                @unlink("$dir/$key.stop");
+            if (file_exists("$dir/$key.stop")) {          // left in place: every generation and any spawn sees it
+                $endWhy = 'stopped';
+                return false;
+            }
+            if ($asSucc && !PhpboxState::accepting($predState->read())) {
+                $asSucc = false;                          // the previous generation no longer takes streams: no contest
+                $log->write('debug', 'previous generation stopped taking new streams');
+            }
+            if ($chain && !$frozen) {
+                if ($s['elapsed'] >= $spawnAt && time() - $lastSpawn >= 15) {
+                    $lastSpawn = time();
+                    @mkdir($ownMine, 0700, true);
+                    $asPred = true;                       // from now on new streams are claimed, not assumed
+                    if ($this->spawn($target, $gen, $cap, $sensitive, $log)) {
+                        $spawned = true;
+                        $log->write('info', "started gen " . ($gen + 1) . ' to take over');
+                    } else {
+                        $log->write('warn', 'could not start the successor; retrying');
+                    }
+                }
+                if ($spawned) {
+                    $n = $succState->read();
+                    if (PhpboxState::alive($n) && ($n['phase'] ?? '') === 'serving') {
+                        $m->accepting = false;            // the successor takes every new stream from here
+                        $frozen = true;
+                        $asPred = false;
+                        $s['phase'] = 'draining';
+                        $state->write($s);
+                        $log->write('info', 'handed over to gen ' . ($gen + 1) . "; draining {$m->activeStreams()} stream(s)");
+                    }
+                }
+            }
+            if ($frozen && $m->activeStreams() === 0) {
+                $endWhy = 'handed';
                 return false;
             }
             return true;
         };
-        $why = $mux->run($this->cap);
-        $finish($why === 'stopped' ? 'stopped from the page' : "reached the {$this->cap}s cap");
+        $why = $mux->run($cap);
+        if ($endWhy === 'stopped')     { $finish('stopped from the page'); }
+        elseif ($endWhy === 'handed')  { $finish('handed over to gen ' . ($gen + 1) . ' (its streams ended)'); }
+        elseif ($frozen)               { $finish('handed over to gen ' . ($gen + 1) . "; {$cap}s cap cut the streams still open"); }
+        elseif ($chain)                { $finish("chain broken: no successor was serving before the {$cap}s cap", 'error'); }
+        else                           { $finish("reached the {$cap}s cap"); }
         echo "exit done\n";
+    }
+
+    /** Start the next generation: a request to our own host, which the host's bot check lets through. */
+    private function spawn(string $target, int $gen, int $cap, bool $sensitive, PhpboxLog $log): bool
+    {
+        $hostport = (string)($_SERVER['HTTP_HOST'] ?? '');
+        if ($hostport === '') { return false; }
+        [$h, $p] = array_pad(explode(':', $hostport, 2), 2, null);
+        $tls = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https' || ($_SERVER['SERVER_PORT'] ?? '') === '443';
+        $port = (int)($p ?: ($tls ? 443 : 80));
+        $path = (string)strtok((string)($_SERVER['REQUEST_URI'] ?? '/'), '?');
+        $qs = http_build_query([
+            'k' => (string)$_GET['k'], 'a' => 'run', 'url' => $target, 'succ' => 1, 'from' => $gen,
+            'chain' => 1, 'cap' => $cap, 'sensitive' => $sensitive ? 1 : 0,
+        ]);
+        $fp = @fsockopen(($tls ? 'ssl://' : '') . $h, $port, $en, $es, 10);
+        if (!$fp) {
+            $log->write('debug', "self-request failed: $en $es");
+            return false;
+        }
+        fwrite($fp, "GET $path?$qs HTTP/1.1\r\nHost: $hostport\r\nUser-Agent: phpbox-chain\r\nAccept: text/plain\r\nConnection: close\r\n\r\n");
+        fclose($fp);                                   // do not wait: the successor outlives this socket
+        return true;
     }
 
     // ---- status ---------------------------------------------------------
 
-    private function status(PhpboxState $state): array
+    private function status(string $dir, string $key): array
     {
-        $s = $state->read();
-        $alive = PhpboxState::alive($s);
-        if ($alive) {
-            $s['elapsed'] = max((int)($s['elapsed'] ?? 0), time() - (int)$s['started']);
+        $gens  = PhpboxState::generations($dir, $key);
+        $alive = array_filter($gens, fn($g) => PhpboxState::alive($g));
+        $accepting = array_filter($alive, fn($g) => PhpboxState::accepting($g));
+        // The state shown: the generation taking streams, else one that is winding down, else the last one that ran.
+        $cur = $accepting ? $accepting[max(array_keys($accepting))]
+            : ($alive ? $alive[max(array_keys($alive))] : ($gens ? $gens[max(array_keys($gens))] : []));
+        if (PhpboxState::alive($cur)) {
+            $cur['elapsed'] = max((int)($cur['elapsed'] ?? 0), time() - (int)$cur['started']);
         }
+        foreach (['streams', 'opened', 'failed', 'up', 'down'] as $f) {      // totals across overlapping generations
+            $cur[$f] = array_sum(array_map(fn($g) => (int)($g[$f] ?? 0), $alive ?: [$cur]));
+        }
+        $draining = count($alive) - count($accepting);
         return [
-            'running' => $alive,
-            'state'   => $s,
-            'age'     => isset($s['beat']) ? time() - (int)$s['beat'] : null,
-            'now'     => time(),
+            'running'  => (bool)$accepting,
+            'draining' => $draining,
+            'chain'    => !empty($cur['chain']),
+            'next_in'  => ($accepting && !empty($cur['chain'])) ? max(0, (int)$cur['spawn_at'] - (int)$cur['elapsed']) : null,
+            'stopping' => $alive && is_file("$dir/$key.stop"),
+            'state'    => $cur,
+            'age'      => isset($cur['beat']) ? time() - (int)$cur['beat'] : null,
+            'now'      => time(),
         ];
     }
 

@@ -10,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/p1neappleXpress/OpenFlux/network"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // Carrier is a bidirectional byte-stream link the mux rides on. Its shape is
@@ -78,16 +81,23 @@ func (m *Mux) Dial(ctx context.Context, host string, port int) (net.Conn, error)
 	m.streams[id] = st
 	m.mu.Unlock()
 
-	m.send(Frame{Type: FrameOpen, StreamID: id, Payload: []byte(net.JoinHostPort(host, strconv.Itoa(port)))})
+	utils.Debugf("[STREAM] stream %d: dialing %s:%d", id, host, port)
+	if err := m.sendFrame(Frame{Type: FrameOpen, StreamID: id, Payload: []byte(net.JoinHostPort(host, strconv.Itoa(port)))}); err != nil {
+		m.dropStream(id)
+		return nil, fmt.Errorf("phpbox: open %s:%d: %w", host, port, err)
+	}
 
 	select {
 	case res := <-st.openRes:
 		if res != "" {
+			utils.Debugf("[STREAM] stream %d: open %s:%d refused: %s", id, host, port, res)
 			m.dropStream(id)
 			return nil, fmt.Errorf("phpbox: open %s:%d: %s", host, port, res)
 		}
+		utils.Debugf("[STREAM] stream %d: open %s:%d", id, host, port)
 		return st, nil
 	case <-ctx.Done():
+		utils.Debugf("[STREAM] stream %d: dial %s:%d abandoned: %v", id, host, port, ctx.Err())
 		m.dropStream(id)
 		return nil, ctx.Err()
 	case <-m.closed:
@@ -115,13 +125,45 @@ func (m *Mux) Close() error {
 	return err
 }
 
-func (m *Mux) send(f Frame) {
-	select {
-	case <-m.closed:
-		return
-	default:
+// sendPatience is how long a frame waits for a busy or reconnecting carrier
+// before the send is given up on. A frame dropped silently would corrupt the
+// stream (a lost byte inside a TLS record breaks the handshake), so the
+// caller is told instead.
+const sendPatience = 15 * time.Second
+
+// sendFrame hands f to the carrier, waiting (with backoff) while the carrier
+// pushes back - its write queue full, or the link reconnecting - instead of
+// dropping the frame. It returns an error only when the mux is closed or the
+// carrier stayed unusable for sendPatience.
+func (m *Mux) sendFrame(f Frame) error {
+	b := Encode(nil, f)
+	deadline := time.Now().Add(sendPatience)
+	wait := time.Millisecond
+	var lastLog time.Time
+	for {
+		select {
+		case <-m.closed:
+			return ErrSessionClosed
+		default:
+		}
+		err := m.carrier.Send(b)
+		if err == nil {
+			logFrame(network.DirOutbound, f)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			utils.Infof("[STREAM] stream %d: carrier unusable for %v (%v); dropping the %s frame", f.StreamID, sendPatience, err, frameName(f.Type))
+			return err
+		}
+		if time.Since(lastLog) > 2*time.Second { // one line per stall, not per retry
+			utils.Debugf("[STREAM] stream %d: carrier busy (%v); holding the %s frame", f.StreamID, err, frameName(f.Type))
+			lastLog = time.Now()
+		}
+		time.Sleep(wait)
+		if wait < 50*time.Millisecond {
+			wait *= 2
+		}
 	}
-	_ = m.carrier.Send(Encode(nil, f))
 }
 
 // onBytes receives arbitrary byte chunks from the carrier, reassembles frames
@@ -145,10 +187,12 @@ func (m *Mux) onBytes(b []byte) {
 }
 
 func (m *Mux) dispatch(f Frame) {
+	logFrame(network.DirInbound, f)
 	m.mu.Lock()
 	st := m.streams[f.StreamID]
 	m.mu.Unlock()
 	if st == nil {
+		utils.Debugf("[STREAM] stream %d: %s for a stream that is gone (dropped)", f.StreamID, frameName(f.Type))
 		return
 	}
 	switch f.Type {
@@ -214,7 +258,10 @@ func newConn(m *Mux, id uint32) *conn {
 
 func (s *conn) signalOpen(res string) { s.openOnce.Do(func() { s.openRes <- res }) }
 func (s *conn) deliver(p []byte)      { s.rbuf.write(p) }
-func (s *conn) remoteClosed()         { s.rbuf.close() }
+func (s *conn) remoteClosed() {
+	utils.Debugf("[STREAM] stream %d: closed by the exit", s.id)
+	s.rbuf.close()
+}
 
 // shutdown ends the stream locally without sending CLOSE (the whole mux died).
 func (s *conn) shutdown() {
@@ -229,13 +276,15 @@ func (s *conn) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-	const max = 32768 // keep a single frame a reasonable size on the wire
+	const max = 65536 // fewer, larger carrier messages: the carriers charge per message, not per byte
 	for off := 0; off < len(p); off += max {
 		end := off + max
 		if end > len(p) {
 			end = len(p)
 		}
-		s.m.send(Frame{Type: FrameData, StreamID: s.id, Payload: append([]byte(nil), p[off:end]...)})
+		if err := s.m.sendFrame(Frame{Type: FrameData, StreamID: s.id, Payload: append([]byte(nil), p[off:end]...)}); err != nil {
+			return off, err
+		}
 	}
 	return len(p), nil
 }
@@ -244,7 +293,8 @@ func (s *conn) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
-	s.m.send(Frame{Type: FrameClose, StreamID: s.id})
+	utils.Debugf("[STREAM] stream %d: closed by the app", s.id)
+	_ = s.m.sendFrame(Frame{Type: FrameClose, StreamID: s.id})
 	s.m.dropStream(s.id)
 	s.rbuf.close()
 	return nil

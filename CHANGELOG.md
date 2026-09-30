@@ -25,6 +25,38 @@ All notable changes to the OpenFlux core. Format loosely follows
   a link is mangled by chats and terminals, unknown JSON fields, and the
   stability of the error codes.
 
+- phpbox self-renewing tunnel (`&chain=1`, what the page asks for): before a
+  generation ends it starts the next one with a request to its own host; the
+  new one joins, takes every new stream, and the old one drains the streams
+  it has. A stream goes to exactly one generation (an atomic `mkdir` marker
+  decides while both are up). `a=stop` ends the whole chain.
+- `--mode=stream` logs like the packet modes: `-d` one line per mux frame
+  (`[STREAM] -> 526 bytes - stream 7 DATA`), `-dd` operational logs (streams
+  opening and closing, a busy carrier), `-ddd` hexdumps of DATA payloads.
+  Until now the level was set after the stream branch had returned, so none
+  of it showed.
+
+### Fixed
+
+- Mail.ru transport dropped data under load: the server batches several
+  cursor entries into one message, and only the first was read; a message
+  that merely mentioned a peer's keep-alive was dropped whole. Every entry
+  is delivered now, in order (`cursorPayloads`).
+- Stream client: `Mux.send` ignored the carrier's "write queue full" and
+  dropped the frame, which corrupts the stream (a lost byte inside a TLS
+  record fails the handshake). Sends wait with backoff, for up to 15 s, and
+  report an error instead of losing data; `conn.Write` passes it on.
+- phpbox WebSocket client: a frame arriving in pieces (a 22 KB message on a
+  slow link) was cut short and desynchronised the stream; frames already in
+  PHP's TLS buffer were not seen by `stream_select`; fragmented messages
+  were not reassembled; a closed link was indistinguishable from a timeout,
+  so a node stayed deaf after the server dropped it. Reading is buffered,
+  fragments are reassembled, and the mux reconnects (with backoff).
+- phpbox mux: when a run ends, the client is told (CLOSE) about the streams
+  that end with it; streams idle for 300 s are closed (a lost CLOSE no
+  longer leaks a socket); a destination with several addresses is retried on
+  the next one when the first does not answer.
+
 ### Changed
 
 - phpbox mux: destinations are dialed asynchronously (a slow one no longer

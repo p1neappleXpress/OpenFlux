@@ -58,6 +58,9 @@ button:disabled{opacity:.45;cursor:default}
 .m{background:var(--tonal);border-radius:12px;padding:10px 12px}
 .m b{display:block;font-size:20px;line-height:24px;font-weight:600;font-variant-numeric:tabular-nums}
 .m span{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+.chainrow{display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:10px 12px;border-radius:12px;background:var(--tonal);cursor:pointer}
+.chainrow input{margin-top:3px;accent-color:var(--accent)}
+.chainrow b{font-weight:600}
 .banner{display:none;margin-top:14px;padding:10px 12px;border-radius:12px;background:var(--warn-soft);color:var(--text);border:1px solid var(--warn);font-size:13px}
 .banner.show{display:block}
 textarea,input[type=text]{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:10px 12px;font:12px/18px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical}
@@ -124,6 +127,7 @@ footer{margin-top:22px;color:var(--hint);font-size:12px;text-align:center}
         <div class="m"><b id="m-up">0 B</b><span id="l-up"></span></div>
         <div class="m"><b id="m-down">0 B</b><span id="l-down"></span></div>
       </div>
+      <label class="chainrow"><input type="checkbox" id="f-chain" checked><span><b id="l-chain"></b><br><span class="sub" id="l-chainhint"></span></span></label>
     </section>
 
     <section class="card">
@@ -175,6 +179,8 @@ ru:{
  start:'Запустить', stop:'Остановить', starting:'Запуск…',
  streams:'потоков', opened:'открыто', up:'на сервер', down:'к вам',
  left:'осталось', of:'из', cap:'Один запуск живёт до {n} с, потом его можно перезапустить.',
+ chain:'Держать туннель непрерывно', chain_hint:'До конца запуска нода сама поднимает следующее поколение: новые соединения переходят без разрыва, старые доживают до конца (не дольше {n} с).',
+ chain_on:'непрерывный режим', next_in:'смена поколения через {n} с', winding:'Завершается', winding_sub:'потоков ещё: {n}', stopping:'останавливается…',
  gen:'запуск №', last:'Последний конец:', never:'Ещё не запускалась на этом адресе.',
  ph_cups:'Вставьте ссылку openflux://… или ссылку комнаты cups.online (или её uuid)',
  ph_mailru:'Вставьте ссылку openflux://… или публичную ссылку на документ Mail.ru',
@@ -210,6 +216,8 @@ en:{
  start:'Start', stop:'Stop', starting:'Starting…',
  streams:'streams', opened:'opened', up:'to server', down:'to you',
  left:'left', of:'of', cap:'One run lives up to {n} s, then it can be started again.',
+ chain:'Keep the tunnel up continuously', chain_hint:'Before a run ends the node starts the next generation itself: new connections move over without a break, old ones finish (for at most {n} s).',
+ chain_on:'continuous mode', next_in:'next generation in {n} s', winding:'Winding down', winding_sub:'streams left: {n}', stopping:'stopping…',
  gen:'run #', last:'Last ended:', never:'Never started on this address yet.',
  ph_cups:'Paste an openflux://… link or a cups.online room link (or its uuid)',
  ph_mailru:'Paste an openflux://… link or a public Mail.ru document link',
@@ -338,7 +346,7 @@ function renderQr(){
 
 // ---- node control ----------------------------------------------------------
 let st = {running:false, state:{}}, startedHere=false, lastPhase='';
-function kickUrl(){ return location.origin+q({a:'run',url:target}) }
+function kickUrl(){ return location.origin+q({a:'run',url:target,chain:$('f-chain').checked?'1':''}) }
 function cmd(){
   const flag = C.carrier==='cupsonline'?'cupsonline':'mailru';
   return 'openflux --role=client --mode=stream --transport='+flag+' --url "'+target+'" --socks5 127.0.0.1:1080';
@@ -354,7 +362,7 @@ async function startNode(){
   if(!target){ toast(t('need_target')); return }
   startedHere=true;
   $('start').disabled=true; $('start').textContent=t('starting');
-  fetch(q({a:'run',url:target,sensitive:$('f-sens').checked?'1':''}),{cache:'no-store'}).catch(()=>{});   // the request IS the node; it survives us closing it
+  fetch(q({a:'run',url:target,chain:$('f-chain').checked?'1':'',sensitive:$('f-sens').checked?'1':''}),{cache:'no-store'}).catch(()=>{});   // the request IS the node; it survives us closing it
   for(let i=0;i<8;i++){ await new Promise(r=>setTimeout(r,700)); await pollStatus(); if(st.running)break }
 }
 async function stopNode(){ await fetch(q({a:'stop',url:target})).catch(()=>{}); toast(t('stop')); setTimeout(pollStatus,900) }
@@ -366,19 +374,22 @@ function renderButtons(){
   $('copy-kick').disabled = $('copy-cmd').disabled = !target;
 }
 function renderStatus(){
-  const s=st.state||{}, run=!!st.running, pill=$('pill');
-  pill.className='pill '+(run?(s.phase==='connecting'?'busy':'on'):(s.reason&&/died|could not/.test(s.reason)?'bad':''));
-  let txt = run ? (s.phase==='connecting'?t('connecting'):(startedHere?t('serving'):t('already'))) : t('idle');
+  const s=st.state||{}, run=!!st.running, wind=!run&&(st.draining||0)>0, pill=$('pill');
+  pill.className='pill '+(run?(s.phase==='connecting'?'busy':'on'):(wind?'busy':(s.reason&&/died|could not|broken/.test(s.reason)?'bad':'')));
+  let txt = run ? (s.phase==='connecting'?t('connecting'):(startedHere?t('serving'):t('already'))) : (wind?t('winding'):t('idle'));
   $('pilltext').textContent=txt;
-  $('pillsub').textContent = run ? t('gen')+s.gen : (s.ended ? t('last')+' '+fmtTime(s.ended*1000)+(s.reason?' — '+s.reason:'') : (target?t('never'):t('need_target')));
+  const chainTag = st.chain ? ' · '+t('chain_on') : '';
+  $('pillsub').textContent = run ? t('gen')+s.gen+chainTag+(st.stopping?' · '+t('stopping'):'')
+    : (wind ? t('winding_sub',{n:s.streams||0}) : (s.ended ? t('last')+' '+fmtTime(s.ended*1000)+(s.reason?' — '+s.reason:'') : (target?t('never'):t('need_target'))));
   const cap=s.cap||C.cap, el=run?(s.elapsed||0):0;
-  $('bar').style.width = run ? Math.min(100,el/cap*100)+'%' : '0';
-  $('barlabel').textContent = run ? Math.max(0,cap-el)+' s '+t('left')+' · '+t('of')+' '+cap+' s' : t('cap',{n:cap});
+  const span = (st.chain&&s.spawn_at)?s.spawn_at:cap;        // in chain mode the bar runs to the handover
+  $('bar').style.width = run ? Math.min(100,el/span*100)+'%' : '0';
+  $('barlabel').textContent = run ? (st.chain&&st.next_in!=null ? t('next_in',{n:st.next_in}) : Math.max(0,cap-el)+' s '+t('left')+' · '+t('of')+' '+cap+' s') : t('cap',{n:cap});
   $('m-streams').textContent=s.streams||0; $('m-opened').textContent=s.opened||0;
   $('m-up').textContent=human(s.up||0); $('m-down').textContent=human(s.down||0);
   const b=$('banner');
   if(run && !startedHere){ b.textContent=t('already_banner',{g:s.gen,s:el})+' '+t('started_elsewhere'); b.classList.add('show') } else b.classList.remove('show');
-  if(lastPhase==='serving' && !run) startedHere=false;
+  if(lastPhase==='serving' && !run && !wind) startedHere=false;
   lastPhase = run ? s.phase : 'idle';
   renderButtons();
   if(run && $('start').textContent!==t('start')) $('start').textContent=t('start');
@@ -413,6 +424,7 @@ function render(){
   $('l-streams').textContent=t('streams'); $('l-opened').textContent=t('opened'); $('l-up').textContent=t('up'); $('l-down').textContent=t('down');
   $('copy-kick').textContent=t('cp_kick'); $('copy-cmd').textContent=t('cp_cmd');
   $('qrempty').textContent=t('qr_empty'); $('qr-save').textContent=t('qr_save'); $('qr-copy').textContent=t('qr_copy');
+  $('l-chain').textContent=t('chain'); $('l-chainhint').textContent=t('chain_hint',{n:60});
   $('l-scroll').textContent=t('scroll'); $('l-sens').textContent=t('sens'); $('log-copy').textContent=t('lcopy'); $('log-clear').textContent=t('lclear');
   $('input').placeholder = t(C.carrier==='cupsonline'?'ph_cups':(C.carrier==='mailru'?'ph_mailru':'ph_any'));
   $('foot').textContent=t('foot',{v:C.version,p:C.php})+' · '+t(coreState==='ok'?'parser_ok':(coreState==='loading'?'parser_loading':'parser_bad'));

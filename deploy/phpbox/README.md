@@ -136,3 +136,41 @@ Free-host facts this code relies on (measured on InfinityFree): `sleep`,
 `set_time_limit`, `putenv`, `proc_open` and `socket_*` are disabled, so the
 code uses `usleep`, `stream_select` and `define()`; the 60 s limit counts CPU
 time, not wall time.
+
+## Keeping the tunnel up (chain mode, v0.4)
+
+A request lives only a few minutes on these hosts (the 60 s limit counts CPU
+time, so a waiting node is nearly free, but the host ends the request after a
+while). With `&chain=1` (the page's "keep the tunnel up continuously" box, on
+by default) a node starts its successor before it ends:
+
+1. at `cap - 60 s` (cap 240 s) the running generation asks its own host, which
+   lets the request through the bot check, to start generation N+1;
+2. N+1 joins the room, reports "serving", and takes every new stream;
+3. N stops taking new streams ("draining"), keeps serving the ones it has
+   (they end by themselves, or at its cap), and exits when none are left.
+
+While both are up a new stream goes to whichever generation creates its marker
+directory first (`mkdir` is atomic), so no stream is ever served twice. A stop
+(`Stop` on the page or `&a=stop`) leaves a marker that ends every generation
+and keeps the dying one from spawning another. A pinger that hits the URL
+while the chain is alive just attaches ("already running"); if the chain ever
+breaks (the host refused the self-request) the next open or ping starts it again.
+
+Streams that are still open when the last generation of their chain ends are
+cut with a CLOSE, and the client reconnects; MTProto and short HTTPS tolerate it.
+
+## Client logs
+
+`--mode=stream` obeys the same levels as the packet modes: `-d` prints one line
+per mux frame (`[STREAM] -> 526 bytes - stream 7 DATA`, `OPEN host:443`,
+`<- ... OPEN_OK`), `-dd` adds the operational lines, `-ddd` hexdumps DATA
+payloads. On the PHP side the page's log has `info` and `debug` lines;
+destinations are hidden (`*:443`) unless `&sensitive=1`.
+
+## Tuning (query parameters of a run)
+
+`&cap=` seconds one generation lives (30-900), `&chunk=` bytes read from a
+destination per frame (2048-262144, default 65536; bigger frames cost fewer carrier messages),
+`&idle=` seconds before an idle stream is closed (0 = never), `&sensitive=1`,
+`&chain=1`.

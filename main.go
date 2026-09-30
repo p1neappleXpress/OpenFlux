@@ -538,7 +538,12 @@ DEPRECATED (removed in v2)
 	// local SOCKS5 hands each app connection to a mux stream. The exit is a
 	// phpbox exit (deploy/phpbox over cups). This is a circuit-level TCP
 	// tunnel, not L7 - the exit never parses the application protocol.
+	// The debug level is set here, not only further down: this branch returns before that code runs.
 	if *role == roleClient && *mode == "stream" {
+		utils.SetLevel(*debug)
+		if *sensitive || *sensitiveAlias {
+			utils.SetSensitive(true)
+		}
 		runStreamClient(*transportType, globalDocUrl, *socksAddr)
 		return
 	}
