@@ -11,8 +11,8 @@ package main
 // Request:  {"id": 1, "method": "connect", "params": {...}}
 // Response: {"id": 1, "ok": true, ...} or {"id": 1, "ok": false, "error": "..."}
 //
-// Secrets (SSH and sudo passwords, private key, channel key, Yandex
-// cookies) arrive only on stdin and never go to the log or the command line.
+// Secrets (SSH and sudo passwords, private key, channel key) arrive only
+// on stdin and never go to the log or the command line.
 
 import (
 	"bufio"
@@ -21,14 +21,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"strconv"
 	"strings"
 	"time"
 
-	"openflux/provision"
-	"openflux/share"
-	"openflux/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/provision"
+	"github.com/p1neappleXpress/OpenFlux/provision/phphost"
+	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
 
 type wizardRequest struct {
@@ -47,12 +46,27 @@ type wizardParams struct {
 	HostKey      string `json:"hostKey"`
 	Channel      string `json:"channel"`
 	ChannelPort  int    `json:"channelPort"`
-	WithCookies  bool   `json:"withCookies"`
 	DocumentURL  string `json:"documentUrl"`
 	Key          string `json:"key"`
 	SudoPassword string `json:"sudoPassword"`
-	Cookies      string `json:"cookies"`
 	Name         string `json:"name"`
+	// Transports are the channel's carriers besides direct. Without them,
+	// DocumentURL alone means a Yandex document (older apps).
+	Transports []provision.ChannelTransport `json:"transports"`
+	AutoUpdate bool                         `json:"autoUpdate"`
+}
+
+// transports is the channel's carriers from the request.
+func (p wizardParams) transports() []provision.ChannelTransport {
+	if p.Transports == nil && p.DocumentURL != "" {
+		return []provision.ChannelTransport{{Type: "vyandex", URL: p.DocumentURL}}
+	}
+	return p.Transports
+}
+
+// channel is the channel the request describes, its key aside.
+func (p wizardParams) channel() provision.Channel {
+	return provision.Channel{ID: p.Channel, Transports: p.transports(), Port: p.ChannelPort, AutoUpdate: p.AutoUpdate}
 }
 
 // nodeWizard holds the SSH connection between calls.
@@ -62,6 +76,7 @@ type nodeWizard struct {
 	dial      func(context.Context, provision.Target) (*provision.Conn, error)
 	checkDoc  func(string) (yandex.VolgaDocument, error)
 	newScript func() provision.Script
+	newRooms  func(context.Context) (string, error)
 }
 
 func newNodeWizard() *nodeWizard {
@@ -69,6 +84,7 @@ func newNodeWizard() *nodeWizard {
 		dial:      provision.Dial,
 		checkDoc:  func(u string) (yandex.VolgaDocument, error) { return yandex.CheckVolgaDocument(u, nil) },
 		newScript: provision.Pinned,
+		newRooms:  cupsonline.CreateRoomList,
 	}
 }
 
@@ -88,6 +104,8 @@ func runNodeWizard(in io.Reader, out io.Writer) int {
 		var resp map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			resp = wizardFailure(errors.New("неверный запрос"), nil)
+		} else if strings.HasPrefix(req.Method, "php.") {
+			resp = phpCall(req, enc)
 		} else {
 			resp = w.handle(req)
 		}
@@ -143,7 +161,7 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
-		plan, err := conn.Plan(p.Channel, p.ChannelPort, p.WithCookies)
+		plan, err := conn.Plan(p.channel())
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
@@ -153,26 +171,9 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
-		ch := provision.Channel{ID: p.Channel, URL: p.DocumentURL, Key: p.Key, Port: p.ChannelPort}
-		if p.Cookies != "" {
-			if ch.Cookies, _, err = provision.CookieStore(p.DocumentURL, p.Cookies); err != nil {
-				return wizardFailure(err, nil)
-			}
-		}
+		ch := p.channel()
+		ch.Key = p.Key
 		if err := conn.Apply(ch, p.SudoPassword); err != nil {
-			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
-		}
-		return wizardOK(nil)
-	case "setCookies":
-		conn, err := w.connected()
-		if err != nil {
-			return wizardFailure(err, nil)
-		}
-		cookies, _, err := provision.CookieStore(p.DocumentURL, p.Cookies)
-		if err != nil {
-			return wizardFailure(err, nil)
-		}
-		if err := conn.SetCookies(p.Channel, cookies, p.SudoPassword); err != nil {
 			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
 		}
 		return wizardOK(nil)
@@ -185,13 +186,18 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
 		}
 		return wizardOK(nil)
-	case "signedIn":
-		_, signedIn, err := provision.CookieStore("x", p.Cookies)
-		return wizardOK(map[string]interface{}{"signedIn": err == nil && signedIn})
 	case "checkDocument":
 		return w.checkDocument(p.DocumentURL)
+	case "createRooms":
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rooms, err := w.newRooms(ctx)
+		if err != nil {
+			return wizardFailure(fmt.Errorf("не удалось создать комнаты cups.online: %v", err), nil)
+		}
+		return wizardOK(map[string]interface{}{"rooms": rooms})
 	case "shareLink":
-		link, err := nodeShareLink(p.Name, p.DocumentURL, p.Key, p.Host, p.ChannelPort)
+		link, err := provision.ShareLink(p.Name, p.Key, p.Host, p.ChannelPort, p.transports())
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
@@ -280,21 +286,23 @@ func (w *nodeWizard) checkDocument(documentURL string) map[string]interface{} {
 	return wizardOK(map[string]interface{}{"editable": true})
 }
 
-// nodeShareLink is the openflux:// link of a new channel, as the wizard
-// builds it: the Yandex document first, direct to host:port as the backup.
-// It carries the channel key.
-func nodeShareLink(name, documentURL, key, host string, port int) (string, error) {
-	if host == "" || port <= 0 || port > 65535 {
-		return "", errors.New("нет адреса или порта ноды")
-	}
-	return share.Encode(share.Config{
-		Name:      name,
-		Negotiate: true,
-		Secret:    key,
-		Context:   documentURL,
-		Transports: []share.Transport{
-			{Type: "vyandex", URL: documentURL, Priority: 100},
-			{Type: "direct", Dial: net.JoinHostPort(host, strconv.Itoa(port)), Priority: 50},
-		},
+// phpCall serves the "php.*" methods of the same protocol: putting the PHP
+// exit on a free web host over FTP (package phphost does every step; this only
+// carries its answers). Method "php.deploy" is phphost's "deploy", and so on.
+// While it runs, upload progress goes out as extra lines
+// {"id": N, "progress": {...}} before the final answer, which is
+// {"id": N, "ok": true, "data": ...} or {"id": N, "ok": false, "error": "...",
+// "code": "...", "param": "..."}: the code and param are what the app words.
+func phpCall(req wizardRequest, enc *json.Encoder) map[string]interface{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	res := phphost.Call(ctx, strings.TrimPrefix(req.Method, "php."), req.Params, func(p phphost.Progress) {
+		_ = enc.Encode(map[string]interface{}{"id": req.ID, "progress": p})
 	})
+	var resp map[string]interface{}
+	_ = json.Unmarshal([]byte(res.JSON()), &resp)
+	if resp == nil {
+		resp = map[string]interface{}{"ok": false, "error": "internal error"}
+	}
+	return resp
 }

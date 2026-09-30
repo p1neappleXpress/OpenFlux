@@ -4,9 +4,9 @@ import (
 	"net"
 	"sync"
 
-	"openflux/transport"
-	"openflux/tunnel"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // Local TCP ports of the side stack that carries the exit's captcha page.

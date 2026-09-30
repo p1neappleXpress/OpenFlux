@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/manager"
-	"openflux/tunnel"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
 )
 
 // stubCarrier is a cookie-carrying transport on the exit that never

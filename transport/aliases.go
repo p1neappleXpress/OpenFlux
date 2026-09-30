@@ -1,6 +1,6 @@
 package transport
 
-import "openflux/transport/control"
+import "github.com/p1neappleXpress/OpenFlux/transport/control"
 
 // Re-exports for callers that still spell these as transport.Capability*.
 //

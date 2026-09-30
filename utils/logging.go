@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Debug levels. Each level prints everything the ones below it do.
@@ -169,8 +170,35 @@ func emit(message string) {
 
 // Infof always logs, regardless of debug level. Used for user-facing status
 // lines (e.g. cups room open/close) that must be visible without --debug.
+//
+// With a log sink set (an embedding app: the Android and iOS bridges) the
+// line goes there, so the app's log screen shows the same status lines as
+// the CLI's output; otherwise to the standard log.
 func Infof(format string, args ...interface{}) {
-	log.Output(2, fmt.Sprintf(format, args...))
+	message := fmt.Sprintf(format, args...)
+	logSinkMu.RLock()
+	sink := logSink
+	logSinkMu.RUnlock()
+	if sink != nil {
+		sink(message)
+		return
+	}
+	log.Output(2, message)
+}
+
+// throttle remembers when each Throttled key last fired.
+var throttle sync.Map // key -> time.Time
+
+// Throttled reports whether a message identified by key may be logged now:
+// true at most once per every. For warnings that would otherwise repeat on
+// every packet (a key mismatch drops each one).
+func Throttled(key string, every time.Duration) bool {
+	now := time.Now()
+	if last, ok := throttle.Load(key); ok && now.Sub(last.(time.Time)) < every {
+		return false
+	}
+	throttle.Store(key, now)
+	return true
 }
 
 // SafeGo runs fn in a new goroutine, recovering from any panic so a crash in

@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/control"
-	"openflux/transport/ipc"
-	"openflux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport/ipc"
+	"github.com/p1neappleXpress/OpenFlux/transport/manager"
 )
 
 // e2eTransport is a fake raw transport that implements ErrorNotifier and

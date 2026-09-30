@@ -11,10 +11,11 @@ import (
 	"strings"
 	"sync"
 
-	"openflux/socks5"
-	"openflux/transport"
-	"openflux/tunnel"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/socks5"
+	"github.com/p1neappleXpress/OpenFlux/streamproxy"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 var proxy = proxyState{}
@@ -25,6 +26,8 @@ type proxyState struct {
 	transport transport.Transport
 	tun       *tunnel.TCPTunnel
 	server    *socks5.SOCKS5Server
+	// stream is the phpbox stream-mode proxy (StartStreamProxy) when that is what runs.
+	stream *streamproxy.Proxy
 }
 
 // StartProxy launches the local SOCKS5 proxy in classic single-transport
@@ -122,10 +125,12 @@ func StopProxy() {
 	proxy.mu.Lock()
 	server := proxy.server
 	trans := proxy.transport
+	stream := proxy.stream
 	proxy.running = false
 	proxy.transport = nil
 	proxy.tun = nil
 	proxy.server = nil
+	proxy.stream = nil
 	proxy.mu.Unlock()
 	detachCaptcha()
 	CancelCaptcha()
@@ -138,6 +143,9 @@ func StopProxy() {
 	if trans != nil {
 		_ = trans.Stop()
 	}
+	if stream != nil {
+		stream.Stop()
+	}
 }
 
 func ProxyIsRunning() bool {
@@ -149,7 +157,11 @@ func ProxyIsRunning() bool {
 func ProxyIsConnected() bool {
 	proxy.mu.Lock()
 	trans := proxy.transport
+	stream := proxy.stream
 	proxy.mu.Unlock()
+	if stream != nil {
+		return stream.Connected()
+	}
 	return trans != nil && trans.IsConnected()
 }
 
@@ -160,7 +172,11 @@ func ProxyIsConnected() bool {
 func ProxyBytesSent() int64 {
 	proxy.mu.Lock()
 	server := proxy.server
+	stream := proxy.stream
 	proxy.mu.Unlock()
+	if stream != nil {
+		return stream.BytesSent()
+	}
 	if server == nil {
 		return 0
 	}
@@ -170,7 +186,11 @@ func ProxyBytesSent() int64 {
 func ProxyBytesReceived() int64 {
 	proxy.mu.Lock()
 	server := proxy.server
+	stream := proxy.stream
 	proxy.mu.Unlock()
+	if stream != nil {
+		return stream.BytesReceived()
+	}
 	if server == nil {
 		return 0
 	}

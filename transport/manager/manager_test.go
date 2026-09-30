@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
 
 // fakeTransport is a minimal in-process Transport.

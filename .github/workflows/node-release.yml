@@ -48,6 +48,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # What the node runs: the newest released section of CHANGELOG.md.
+          {
+            echo "Ядро выходной ноды для мастера «Своя нода» в OpenFlux (десктоп и Android). Хеши сверены с deploy/node-install.sh."
+            echo
+            awk 'index($0, "## [")==1 { if (f) exit; if (index($0, "Unreleased") == 0) { f = 1; print "## Ядро " substr($0, 4) }; next } f' CHANGELOG.md
+          } > notes.md
           gh release create "$GITHUB_REF_NAME" dist/openflux-linux-* dist/SHA256SUMS \
             --title "OpenFlux node $GITHUB_REF_NAME" \
-            --notes "Ядро выходной ноды для мастера «Своя нода» в OpenFlux (десктоп и Android). Хеши сверены с deploy/node-install.sh."
+            --notes-file notes.md

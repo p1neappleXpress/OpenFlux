@@ -77,7 +77,10 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag="${GITHUB_REF#refs/tags/}"
           else tag="v${{ inputs.version }}"; fi
+          # The release shows its CHANGELOG.md section, then what the assets are.
+          awk -v v="${tag#v}" 'index($0, "## [")==1 { if (f) exit; f = (index($0, "## [" v "]") == 1); next } f' CHANGELOG.md > notes.md
+          printf '\n%s\n' "Кросс-платформенная сборка CLI (клиент/выходная нода): \`openflux-<os>-<arch>[.exe]\`. Контрольные суммы — в \`SHA256SUMS.txt\`. Для установки выходной ноды по SSH из приложения используется отдельный релиз \`node-v*\` (см. deploy/node-install.sh)." >> notes.md
           gh release create "$tag" dist/* \
             --title "OpenFlux $tag" \
             --generate-notes \
-            --notes "Кросс-платформенная сборка CLI (клиент/выходная нода): \`openflux-<os>-<arch>[.exe]\`. Контрольные суммы — в \`SHA256SUMS.txt\`. Для установки выходной ноды по SSH из приложения используется отдельный релиз \`node-v*\` (см. deploy/node-install.sh)."
+            --notes-file notes.md

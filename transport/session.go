@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/transport/control"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // Session is one logical session between a client and an exit node.
@@ -64,7 +64,42 @@ type Session struct {
 	cntCtrlRecv    atomic.Uint64
 	cntDecodeErr   atomic.Uint64
 	cntUnknownKind atomic.Uint64
+
+	// Classic fallback, see SetClassic.
+	classic      ClassicMode
+	classicCodec string
+	classicLink  *transportLink // exit: the carrier a classic client was last heard on
+	classicSeen  bool           // client: the exit answered in classic mode
+	classicSince time.Time      // client: when data started going out classic
+	alternates   []string       // KDF contexts the peer may derive instead, see KDFContexts
+
+	cntClassicSent atomic.Uint64
+	cntClassicRecv atomic.Uint64
+	cntClassicDrop atomic.Uint64
 }
+
+// ClassicMode is how a Session treats peers of the classic (pre-Session)
+// layering.
+type ClassicMode int
+
+const (
+	// ClassicOff: Session peers only (--negotiate, and every exit that was
+	// configured as a Session). Classic frames are dropped with a log line.
+	ClassicOff ClassicMode = iota
+	// ClassicFallback (client, one carrier): until the exit answers the
+	// Session handshake, IPv4 goes out in the classic layering, so an exit
+	// that predates Session, or runs classic, still works; the client keeps
+	// offering the handshake and switches to the Session once answered.
+	ClassicFallback
+	// ClassicAccept (exit configured classic): the exit also serves
+	// classic clients, as long as no Session client is active. Session
+	// clients get a Session, so an updated client never runs classic.
+	ClassicAccept
+)
+
+// classicWait is how long a client with classic fallback waits for the
+// Session handshake before letting data go out classic.
+const classicWait = 3 * time.Second
 
 type candidatePeer struct {
 	sender  [32]byte
@@ -80,13 +115,93 @@ const (
 type transportLink struct {
 	name      string
 	raw       Transport
+	demux     *frameDemux
 	encrypted *EncryptedTransport
 	batched   *BatchedTransport
 	priority  int
 
+	// The classic pipeline on the same carrier, nil unless SetClassic:
+	// classicEnc(classicCodec(classic side of demux)).
+	classicEnc   *EncryptedTransport
+	classicCodec *CodecTransport
+	classicHeard time.Time
+
 	started   bool
 	lastHeard time.Time
 	dead      bool
+}
+
+// SetClassic lets this Session also speak the classic layering: a client
+// falls back to it while the exit does not answer the handshake
+// (ClassicFallback), an exit serves classic clients (ClassicAccept). codec is
+// the preferred classic framing (CodecBatched or CodecLegacy); the other one
+// is accepted too and tried when the peer stays silent. Call before
+// AddTransport.
+func (s *Session) SetClassic(codec string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exit {
+		s.classic = ClassicAccept
+	} else {
+		s.classic = ClassicFallback
+	}
+	s.classicCodec = codec
+	utils.Debugf("[SESSION] classic mode: %s (preferred codec %s)", s.classic, codecName(codec != CodecLegacy))
+}
+
+func (m ClassicMode) String() string {
+	switch m {
+	case ClassicFallback:
+		return "fallback"
+	case ClassicAccept:
+		return "accept"
+	}
+	return "off"
+}
+
+// SetAlternateContexts gives every carrier, present and future, the KDF
+// contexts the peer may derive its keys from instead of this side's (see
+// KDFContexts and EncryptedTransport).
+func (s *Session) SetAlternateContexts(contexts []string) {
+	s.mu.Lock()
+	s.alternates = append(s.alternates, contexts...)
+	links := make([]*transportLink, 0, len(s.links))
+	for _, l := range s.links {
+		links = append(links, l)
+	}
+	s.mu.Unlock()
+	for _, l := range links {
+		l.encrypted.SetAlternateContexts(contexts)
+	}
+}
+
+// newLink builds a carrier's pipelines: the Session's
+// batched(encrypted(session side)) and, with classic mode on, the classic
+// encrypted(codec(classic side)) sharing its keys.
+func (s *Session) newLink(name string, raw Transport, secret, context string, priority int) (*transportLink, error) {
+	d := newFrameDemux(raw, name)
+	enc, err := NewEncryptedTransport(d.side(true), secret, context, s.exit)
+	if err != nil {
+		return nil, fmt.Errorf("session: wrap %q: %w", name, err)
+	}
+	s.mu.Lock()
+	alternates := append([]string(nil), s.alternates...)
+	classic, codec := s.classic, s.classicCodec
+	s.mu.Unlock()
+	enc.SetAlternateContexts(alternates)
+	link := &transportLink{
+		name:      name,
+		raw:       raw,
+		demux:     d,
+		encrypted: enc,
+		batched:   NewBatchedTransport(enc),
+		priority:  priority,
+	}
+	if classic != ClassicOff {
+		link.classicCodec = NewCodecTransport(d.side(false), codec, !s.exit)
+		link.classicEnc = enc.SharingKeys(link.classicCodec)
+	}
+	return link, nil
 }
 
 func NewSession(p PeerParameters, exit bool) (*Session, error) {
@@ -146,18 +261,9 @@ func (s *Session) AddTransport(name string, raw Transport, secret, context strin
 	}
 	s.mu.Unlock()
 
-	enc, err := NewEncryptedTransport(raw, secret, context, s.exit)
+	link, err := s.newLink(name, raw, secret, context, priority)
 	if err != nil {
-		return fmt.Errorf("session: wrap %q: %w", name, err)
-	}
-	bat := NewBatchedTransport(enc)
-
-	link := &transportLink{
-		name:      name,
-		raw:       raw,
-		encrypted: enc,
-		batched:   bat,
-		priority:  priority,
+		return err
 	}
 
 	s.mu.Lock()
@@ -220,18 +326,28 @@ func (s *Session) Start() error {
 	timeout := s.handshakeTimeout
 	local := s.local
 	order := append([]string(nil), s.order...)
+	if s.classic == ClassicFallback && len(links) != 1 {
+		// A classic exit has exactly one carrier; several can only mean a
+		// Session exit.
+		utils.Debugf("[SESSION] classic fallback off: %d carriers (a classic exit has one)", len(links))
+		s.classic = ClassicOff
+		for _, l := range links {
+			l.classicEnc, l.classicCodec = nil, nil
+		}
+	}
+	classic := s.classic
 	s.mu.Unlock()
 
 	role := "client"
 	if exit {
 		role = "exit"
 	}
-	utils.Debugf("[SESSION] Start role=%s timeout=%v local=%s transports=%v",
-		role, timeout, shortID(local), order)
+	utils.Debugf("[SESSION] Start role=%s timeout=%v local=%s transports=%v classic=%s",
+		role, timeout, shortID(local), order, classic)
 
 	for _, link := range links {
 		if err := s.startLink(link); err != nil {
-			utils.Debugf("[SESSION] transport %q start: %v; retrying in background", link.name, err)
+			utils.Infof("[SESSION] carrier %q failed to start: %v; retrying in the background", link.name, err)
 			s.superviseLink(link)
 		} else {
 			utils.Debugf("[SESSION] transport %q started (priority=%d)", link.name, link.priority)
@@ -247,6 +363,26 @@ func (s *Session) Start() error {
 	s.wg.Add(1)
 	go s.helloLoop()
 
+	if classic == ClassicFallback {
+		wait := min(classicWait, timeout)
+		if err := s.waitReady(wait); err == nil {
+			s.logHandshake()
+			return nil
+		}
+		s.mu.Lock()
+		stopped := s.stopped
+		if !stopped && !s.ready {
+			s.classicSince = time.Now()
+		}
+		s.mu.Unlock()
+		if stopped {
+			return errors.New("session: stopped")
+		}
+		utils.Infof("[SESSION] no Session handshake from the exit within %v on %q: sending in classic mode meanwhile; "+
+			"switching to the Session as soon as the exit answers", wait, order[0])
+		return nil
+	}
+
 	utils.Debugf("[SESSION] client: waiting for handshake (timeout=%v)", timeout)
 	if err := s.waitReady(timeout); err != nil {
 		utils.Debugf("[SESSION] handshake FAILED after %v: %v", timeout, err)
@@ -255,6 +391,11 @@ func (s *Session) Start() error {
 		return fmt.Errorf("session: handshake failed: %w", err)
 	}
 
+	s.logHandshake()
+	return nil
+}
+
+func (s *Session) logHandshake() {
 	s.mu.Lock()
 	peer := s.peer
 	remote := s.remote
@@ -262,7 +403,6 @@ func (s *Session) Start() error {
 	utils.Debugf("[SESSION] handshake OK: peer=%s caps=0x%x maxPacket=%d",
 		shortID(peer), remote.Capabilities, remote.MaxPacketSize)
 	s.dumpDiagnostics("handshake-success")
-	return nil
 }
 
 func (s *Session) dumpDiagnostics(why string) {
@@ -279,11 +419,51 @@ func (s *Session) dumpDiagnostics(why string) {
 			name, l.started, l.dead, time.Since(l.lastHeard).Round(time.Millisecond), l.raw.IsConnected())
 		if l.encrypted != nil {
 			so, se, ro, rf, rr, bh, bl := l.encrypted.CryptoStats()
-			utils.Debugf("[SESSION-DIAG]   crypto link=%q sendOK=%d sendErr=%d recvOK=%d recvFail=%d recvReplay=%d badHdr=%d badLen=%d",
-				name, so, se, ro, rf, rr, bh, bl)
+			utils.Debugf("[SESSION-DIAG]   crypto link=%q sendOK=%d sendErr=%d recvOK=%d recvFail=%d recvReplay=%d badHdr=%d badLen=%d ctx=%q",
+				name, so, se, ro, rf, rr, bh, bl, l.encrypted.Context())
+		}
+		if l.classicCodec != nil {
+			utils.Debugf("[SESSION-DIAG]   classic link=%q codec=%s heard=%v", name, l.classicCodec.Current(), !l.classicHeard.IsZero())
 		}
 	}
+	utils.Debugf("[SESSION-DIAG] classic mode=%s sent=%d recv=%d drop=%d", s.classic, s.cntClassicSent.Load(), s.cntClassicRecv.Load(), s.cntClassicDrop.Load())
 	s.mu.Unlock()
+	if why != "handshake-success" {
+		utils.Infof("[SESSION] handshake not complete (%s): %s", why, s.diagnose())
+	}
+}
+
+// diagnose names the likeliest reason the exit has not answered the
+// handshake, from what did arrive on the carriers.
+func (s *Session) diagnose() string {
+	s.mu.Lock()
+	var recv, ok, fail uint64
+	connected := false
+	for _, l := range s.links {
+		recv += l.raw.Stats().PacketsRecv
+		connected = connected || l.raw.IsConnected()
+		if l.encrypted != nil {
+			_, _, ro, rf, _, _, _ := l.encrypted.CryptoStats()
+			ok += ro
+			fail += rf
+		}
+	}
+	classicHeard := s.classicSeen
+	s.mu.Unlock()
+	hellos := s.cntHelloRecv.Load()
+	switch {
+	case !connected:
+		return "no carrier is connected on this side (document unreachable, captcha, or network)"
+	case classicHeard:
+		return "the exit answers in classic mode only (an old or classic exit); traffic flows classic"
+	case recv == 0:
+		return "nothing arrived from the exit on any carrier: it is not running, uses another document/room, or is on another carrier"
+	case ok == 0 && fail > 0:
+		return "packets arrived but none decrypted under any KDF context: the encryption key differs from the exit's"
+	case ok > 0 && hellos == 0:
+		return "packets decrypted but none was a Session hello: the exit runs classic mode"
+	}
+	return fmt.Sprintf("%d frames arrived, %d decrypted, %d hellos; see [SESSION-DIAG] at -dd", recv, ok, hellos)
 }
 
 func (s *Session) startLink(link *transportLink) error {
@@ -291,6 +471,13 @@ func (s *Session) startLink(link *transportLink) error {
 		return err
 	}
 	link.batched.Receive(func(p []byte) { s.receive(link, p) })
+	if link.classicCodec != nil {
+		if err := link.classicCodec.Start(); err != nil {
+			utils.Debugf("[SESSION] %q classic pipeline: %v", link.name, err)
+		} else {
+			link.classicEnc.Receive(func(p []byte) { s.receiveClassic(link, p) })
+		}
+	}
 
 	s.mu.Lock()
 	stopped := s.stopped
@@ -300,8 +487,7 @@ func (s *Session) startLink(link *transportLink) error {
 	}
 	s.mu.Unlock()
 	if stopped {
-		_ = link.batched.Stop()
-		_ = link.raw.Stop()
+		link.stop()
 		return errors.New("session stopped")
 	}
 	// A carrier that comes up in an established session (e.g. once a check
@@ -334,10 +520,13 @@ func (s *Session) superviseLink(link *transportLink) {
 			attempt++
 			err := s.startLink(link)
 			if err == nil {
-				utils.Debugf("[SESSION] transport %q up after %d retries", link.name, attempt)
+				utils.Infof("[SESSION] carrier %q up after %d retries", link.name, attempt)
 				return
 			}
 			utils.Debugf("[SESSION] transport %q start retry #%d: %v", link.name, attempt, err)
+			if utils.Throttled("session.restart."+link.name, 2*time.Minute) {
+				utils.Infof("[SESSION] carrier %q still not up after %d retries: %v", link.name, attempt, err)
+			}
 			if delay *= 2; delay > s.restartMax {
 				delay = s.restartMax
 			}
@@ -345,21 +534,41 @@ func (s *Session) superviseLink(link *transportLink) {
 	}()
 }
 
+// helloBackoff is when the hello pace drops from helloInterval to
+// helloSlow; an exit proven classic gets one every helloClassic.
+const (
+	helloBackoff = 20 * time.Second
+	helloSlow    = 2 * time.Second
+	helloClassic = 10 * time.Second
+)
+
 func (s *Session) helloLoop() {
 	defer s.wg.Done()
 	tick := time.NewTicker(s.helloInterval)
 	defer tick.Stop()
 	attempt := 0
+	started := time.Now()
+	var lastSent time.Time
 	for {
 		s.mu.Lock()
 		ready := s.ready
+		pace := s.helloInterval
+		if time.Since(started) > helloBackoff {
+			pace = max(pace, helloSlow)
+		}
+		if s.classicSeen {
+			pace = max(pace, helloClassic)
+		}
 		var names []string
-		if !ready {
+		if !ready && time.Since(lastSent) >= pace {
 			for _, name := range s.order {
 				if s.links[name].started {
 					names = append(names, name)
 				}
 			}
+		}
+		if ready {
+			started = time.Now()
 		}
 		local := s.local
 		peer := s.peer
@@ -371,10 +580,17 @@ func (s *Session) helloLoop() {
 					attempt, names, shortID(local), shortID(peer))
 			}
 		}
+		if len(names) > 0 {
+			lastSent = time.Now()
+		}
 		for _, name := range names {
 			if err := s.helloVia(name); err != nil {
 				utils.Debugf("[SESSION] hello via %q: %v", name, err)
 			}
+		}
+		if attempt == 80 && !ready {
+			attempt++
+			s.dumpDiagnostics("handshake-slow")
 		}
 		select {
 		case <-s.done:
@@ -397,7 +613,7 @@ func (s *Session) keepaliveLoop() {
 		s.mu.Lock()
 		if !s.exit && s.ready && s.peerKeepalive && s.peerSilentLocked() {
 			s.resetLocked()
-			utils.Debugf("[SESSION] peer silent on every transport; handshaking again")
+			utils.Infof("[SESSION] exit silent on every carrier for %v: handshaking again", s.linkTimeout)
 		}
 		var quiet []*transportLink
 		if s.ready {
@@ -446,7 +662,7 @@ func (s *Session) waitReady(timeout time.Duration) error {
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 	lastLog := time.Now()
-	for !s.IsConnected() {
+	for !s.handshakeDone() {
 		select {
 		case <-s.done:
 			return errors.New("session stopped")
@@ -480,22 +696,115 @@ func (s *Session) Stop() error {
 		}
 		s.mu.Unlock()
 		for _, l := range links {
-			_ = l.batched.Stop()
-			_ = l.raw.Stop()
+			l.stop()
 		}
 	})
 	s.wg.Wait()
 	return nil
 }
 
+// stop takes down the carrier once: the batched wrapper stops it through
+// the encryption layer and the demux, the classic pipeline only its own
+// queue.
+func (l *transportLink) stop() {
+	if l.classicCodec != nil {
+		_ = l.classicCodec.Stop()
+	}
+	_ = l.batched.Stop()
+}
+
 func (s *Session) IsConnected() bool {
 	s.mu.Lock()
 	ready := s.ready && !s.stopped
+	classic := s.classicConnectedLocked()
 	s.mu.Unlock()
+	if classic {
+		return true
+	}
 	if !ready {
 		return false
 	}
 	return s.anyLive()
+}
+
+// handshakeDone reports whether the Session handshake completed and a
+// carrier reaches the peer (IsConnected also counts classic mode).
+func (s *Session) handshakeDone() bool {
+	s.mu.Lock()
+	ready := s.ready && !s.stopped
+	s.mu.Unlock()
+	return ready && s.anyLive()
+}
+
+// classicConnectedLocked: a classic-fallback client counts as connected
+// while its carrier is (what classic mode always reported); an exit while
+// a classic client was heard lately. Caller holds s.mu.
+func (s *Session) classicConnectedLocked() bool {
+	if s.stopped || s.ready {
+		return false
+	}
+	switch s.classic {
+	case ClassicFallback:
+		l := s.classicTargetLocked()
+		return l != nil && s.connectedLocked(l)
+	case ClassicAccept:
+		l := s.classicLink
+		return l != nil && time.Since(l.classicHeard) < s.linkTimeout
+	}
+	return false
+}
+
+// classicTargetLocked is the carrier classic IPv4 goes out on, or nil.
+// Caller holds s.mu.
+func (s *Session) classicTargetLocked() *transportLink {
+	switch s.classic {
+	case ClassicFallback:
+		if len(s.order) == 1 {
+			if l := s.links[s.order[0]]; l.started && l.classicEnc != nil {
+				return l
+			}
+		}
+	case ClassicAccept:
+		return s.classicLink
+	}
+	return nil
+}
+
+// sessionActiveLocked reports whether the Session client was heard
+// recently enough that a classic client must not take the exit's replies
+// from it: a live client sends a keepalive at least every
+// keepaliveInterval, so half that again covers one lost. A client that
+// went away yields to a classic one after that, not after linkTimeout.
+// Caller holds s.mu.
+func (s *Session) sessionActiveLocked() bool {
+	if !s.ready {
+		return false
+	}
+	window := s.keepaliveInterval * 3 / 2
+	for _, l := range s.links {
+		if s.connectedLocked(l) && time.Since(l.lastHeard) < window {
+			return true
+		}
+	}
+	return false
+}
+
+// Mode names what IPv4 currently goes out as: "session", "classic" or ""
+// (nothing yet).
+func (s *Session) Mode() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.stopped:
+		return ""
+	case s.exit && s.classicLink != nil && !s.sessionActiveLocked():
+		return "classic"
+	case s.ready:
+		return "session"
+	case s.classicTargetLocked() != nil:
+		return "classic"
+	}
+	return ""
 }
 
 func (s *Session) anyLive() bool {
@@ -520,6 +829,11 @@ func (s *Session) heardLocked(l *transportLink) bool {
 func (s *Session) ActiveTransport() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.classicConnectedLocked() {
+		if l := s.classicTargetLocked(); l != nil {
+			return l.name
+		}
+	}
 	if !s.ready || s.stopped {
 		return ""
 	}
@@ -566,6 +880,11 @@ func topLinks(links []*transportLink) []*transportLink {
 func (s *Session) LiveTransports() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.classicConnectedLocked() {
+		if l := s.classicTargetLocked(); l != nil {
+			return []string{l.name}
+		}
+	}
 	if !s.ready || s.stopped {
 		return nil
 	}
@@ -649,6 +968,14 @@ func (s *Session) helloVia(name string) error {
 
 func (s *Session) Send(p []byte) error {
 	s.mu.Lock()
+	if !s.stopped && s.classic != ClassicOff {
+		// A client whose exit has not answered the handshake, or an exit
+		// whose current client is a classic one: classic layering.
+		if l := s.classicTargetLocked(); l != nil && (!s.ready || (s.exit && !s.sessionActiveLocked())) {
+			s.mu.Unlock()
+			return s.sendClassic(l, p)
+		}
+	}
 	if !s.ready || s.stopped {
 		s.mu.Unlock()
 		return ErrNegotiationPending
@@ -798,6 +1125,67 @@ func permittedPacket(p []byte, limits PeerParameters) error {
 	return nil
 }
 
+// ---- classic layering ----
+
+// sendClassic sends one IPv4 packet in the classic layering on link.
+func (s *Session) sendClassic(link *transportLink, p []byte) error {
+	if len(p) < 20 || p[0]>>4 != 4 {
+		return errors.New("session: classic mode carries IPv4 packets only")
+	}
+	n := s.cntClassicSent.Add(1)
+	if n == 1 || n%500 == 0 {
+		utils.Debugf("[SESSION] classic send #%d via %q size=%d codec=%s ctx=%s",
+			n, link.name, len(p), link.classicCodec.Current(), utils.Sha256Short([]byte(link.classicEnc.Context())))
+	}
+	return link.classicEnc.Send(p)
+}
+
+// receiveClassic takes one decrypted IPv4 packet of the classic layering.
+func (s *Session) receiveClassic(link *transportLink, p []byte) {
+	if len(p) < 20 || p[0]>>4 != 4 {
+		s.cntClassicDrop.Add(1)
+		hint := ""
+		if len(p) > 0 && p[0] == 0xFF {
+			hint = " (a control frame of the iOS fork's own protocol, which this core does not speak; update the app to one built on this core)"
+		}
+		utils.Debugf("[SESSION] classic frame from %q is not IPv4 (%d bytes)%s", link.name, len(p), hint)
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	if s.exit {
+		if s.sessionActiveLocked() {
+			s.cntClassicDrop.Add(1)
+			s.mu.Unlock()
+			if utils.Throttled("session.classic.busy", 30*time.Second) {
+				utils.Infof("[SESSION] classic packets on %q ignored: a Session client is active (one client per exit; another device uses the same key?)", link.name)
+			}
+			return
+		}
+		if s.classicLink != link {
+			utils.Infof("[SESSION] classic client on %q (it does not speak the Session handshake): serving it in classic mode; update the client to get a Session", link.name)
+		}
+		s.classicLink = link
+	} else if !s.classicSeen {
+		s.classicSeen = true
+		utils.Infof("[SESSION] the exit answers in classic mode on %q (it predates Session or runs classic): staying classic, still offering the handshake", link.name)
+	}
+	link.classicHeard = now
+	cb := s.dataCallback
+	s.mu.Unlock()
+	n := s.cntClassicRecv.Add(1)
+	if n == 1 || n%500 == 0 {
+		utils.Debugf("[SESSION] classic recv #%d from %q size=%d", n, link.name, len(p))
+	}
+	if cb != nil {
+		cb(append([]byte(nil), p...))
+	}
+}
+
 // ---- receive ----
 
 func (s *Session) receive(link *transportLink, p []byte) {
@@ -918,6 +1306,9 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 	s.mu.Unlock()
 
 	s.cntHelloAccept.Add(1)
+	if echo && !wasReady && !s.exit && (s.classicSeen || !s.classicSince.IsZero()) {
+		utils.Infof("[SESSION] the exit answered the Session handshake on %q: switching from classic to the Session", link.name)
+	}
 	if echo {
 		utils.Debugf("[SESSION] hello #%d from %q ACCEPT: peer=%s -> ready (accept=%d)",
 			n, link.name, shortID(peer), s.cntHelloAccept.Load())
@@ -956,6 +1347,9 @@ func (s *Session) offerReplacementLocked(link *transportLink, sender [32]byte, p
 		names := append([]string(nil), s.order...)
 		s.mu.Unlock()
 		utils.Debugf("[SESSION] peer REPLACED by %s after fresh challenge echo", shortID(sender))
+		if s.exit {
+			utils.Infof("[SESSION] a new client took over the session on %q: the previous one restarted, or two devices use the same key (the exit serves one client at a time)", link.name)
+		}
 		for _, name := range names {
 			_ = s.helloVia(name)
 		}

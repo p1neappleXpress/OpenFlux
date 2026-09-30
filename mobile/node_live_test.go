@@ -45,7 +45,7 @@ func okResult(t *testing.T, out string) bool {
 }
 
 func TestNodeShareLinkRoundTrip(t *testing.T) {
-	link, err := NodeShareLink("Моя нода", "https://docs.yandex.ru/edit/d/abcdefghijklmnopqrstuv", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "203.0.113.5", 30123)
+	link, err := NodeShareLink("Моя нода", `[{"type":"vyandex","url":"https://docs.yandex.ru/edit/d/abcdefghijklmnopqrstuv"}]`, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "203.0.113.5", 30123)
 	if err != nil {
 		t.Fatal(err)
 	}

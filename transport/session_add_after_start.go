@@ -3,7 +3,7 @@ package transport
 import (
 	"fmt"
 
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // AddTransportPostStart is the runtime version of AddTransport: it is safe
@@ -36,28 +36,23 @@ func (s *Session) AddTransportPostStart(name string, raw Transport, secret, cont
 	}
 	s.mu.Unlock()
 
-	enc, err := NewEncryptedTransport(raw, secret, context, s.exit)
+	link, err := s.newLink(name, raw, secret, context, priority)
 	if err != nil {
-		return fmt.Errorf("session: wrap %q: %w", name, err)
+		return err
 	}
-	bat := NewBatchedTransport(enc)
+	// Post-start carriers are Session-only: classic fallback is for a
+	// single-carrier client, and an exit adds these at a Session client's
+	// request.
+	link.classicEnc, link.classicCodec = nil, nil
 
-	// bat.Start starts raw through the encryption layer.
-	if err := bat.Start(); err != nil {
+	// batched.Start starts raw through the encryption layer and the demux.
+	if err := link.batched.Start(); err != nil {
 		return fmt.Errorf("session: transport %q start: %w", name, err)
 	}
-
-	link := &transportLink{
-		name:      name,
-		raw:       raw,
-		encrypted: enc,
-		batched:   bat,
-		priority:  priority,
-		started:   true,
-	}
+	link.started = true
 	// Same receive path as the bootstrap transports: everything that
 	// arrives on this link goes through Session.receive.
-	bat.Receive(func(p []byte) { s.receive(link, p) })
+	link.batched.Receive(func(p []byte) { s.receive(link, p) })
 
 	s.mu.Lock()
 	s.links[name] = link

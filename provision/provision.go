@@ -14,7 +14,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -75,13 +74,15 @@ var ErrSudoPassword = errors.New("sudo не принял пароль")
 
 // Probe describes the VDS, as node-install.sh probe reports it.
 type Probe struct {
-	Arch       string   `json:"arch"`
-	OS         string   `json:"os"`
-	Systemd    bool     `json:"systemd"`
-	Sudo       string   `json:"sudo"` // root, nopasswd, password, none
-	Downloader string   `json:"downloader"`
-	Firewall   string   `json:"firewall"`
-	Core       string   `json:"core"`
+	Arch       string `json:"arch"`
+	OS         string `json:"os"`
+	Systemd    bool   `json:"systemd"`
+	Sudo       string `json:"sudo"` // root, nopasswd, password, none
+	Downloader string `json:"downloader"`
+	Firewall   string `json:"firewall"`
+	Core       string `json:"core"`
+	// AutoUpdate: the server's core updater (openflux-node-update.timer) is on.
+	AutoUpdate bool     `json:"autoupdate"`
 	Channels   []string `json:"channels"`
 }
 
@@ -97,13 +98,34 @@ type Plan struct {
 
 // Channel is one channel's configuration.
 type Channel struct {
-	ID   string
-	URL  string
-	Key  string
+	ID string
+	// Transports are the carriers besides direct (see CheckTransports);
+	// none leaves the channel with direct only.
+	Transports []ChannelTransport
+	Key        string
+	// Port is direct's port; 0 in a plan lets the script pick one.
 	Port int
-	// Cookies is the channel's Yandex sign-in for the node: the core's
-	// cookie store JSON, base64-encoded (see CookieStore). Empty: none.
-	Cookies string
+	// AutoUpdate turns the server's core updater on, or off: it is one
+	// timer for every channel on the server.
+	AutoUpdate bool
+}
+
+// config is the channel's part of node-install.sh's config, secrets aside.
+func (ch Channel) config() (string, error) {
+	ts, err := CheckTransports(ch.Transports)
+	if err != nil {
+		return "", err
+	}
+	cfg := "channel=" + ch.ID + "\n" + transportLines(ts)
+	if ch.Port != 0 {
+		cfg += "port=" + strconv.Itoa(ch.Port) + "\n"
+	}
+	if ch.AutoUpdate {
+		cfg += "autoupdate=yes\n"
+	} else {
+		cfg += "autoupdate=no\n"
+	}
+	return cfg, nil
 }
 
 // Conn is an SSH connection to the VDS with the script downloaded.
@@ -272,15 +294,12 @@ func (c *Conn) Probe() (*Probe, error) {
 	return &p, nil
 }
 
-// Plan asks what apply would change. port 0 lets the script pick one;
-// withCookies adds the Yandex sign-in step.
-func (c *Conn) Plan(channel string, port int, withCookies bool) (*Plan, error) {
-	cfg := "channel=" + channel + "\n"
-	if port != 0 {
-		cfg += "port=" + strconv.Itoa(port) + "\n"
-	}
-	if withCookies {
-		cfg += "cookies=yes\n"
+// Plan asks what apply would change: ch without its key, Port 0 lets the
+// script pick one.
+func (c *Conn) Plan(ch Channel) (*Plan, error) {
+	cfg, err := ch.config()
+	if err != nil {
+		return nil, err
 	}
 	var p Plan
 	if err := c.script_("plan", []byte(cfg), &p); err != nil {
@@ -292,41 +311,15 @@ func (c *Conn) Plan(channel string, port int, withCookies bool) (*Plan, error) {
 // Apply installs and starts the channel. sudoPassword is used only when the
 // account needs one.
 func (c *Conn) Apply(ch Channel, sudoPassword string) error {
-	cfg := fmt.Sprintf("channel=%s\nurl=%s\nkey=%s\nport=%d\n", ch.ID, ch.URL, ch.Key, ch.Port)
-	if ch.Cookies != "" {
-		cfg += "cookies=" + ch.Cookies + "\n"
+	if ch.Port == 0 {
+		return errors.New("не указан порт из плана")
 	}
-	return c.asRoot("apply", cfg, sudoPassword)
-}
-
-// SetCookies replaces an installed channel's Yandex sign-in (base64 cookie
-// store JSON, see CookieStore) and restarts its node.
-func (c *Conn) SetCookies(channel, cookies, sudoPassword string) error {
-	return c.asRoot("set-cookies", "channel="+channel+"\ncookies="+cookies+"\n", sudoPassword)
-}
-
-// CookieStore turns a Cookie header ("a=1; b=2", as the WebView keeps it
-// for the document) into what Channel.Cookies takes: the core's cookie
-// store JSON, keyed by the document URL like the node looks it up, then
-// base64. signedIn reports whether the header holds a Yandex login.
-func CookieStore(documentURL, header string) (cookies string, signedIn bool, err error) {
-	jar := map[string]string{}
-	for _, part := range strings.Split(header, ";") {
-		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if !ok || name == "" || strings.ContainsAny(name+value, "\r\n") {
-			continue
-		}
-		jar[name] = value
-	}
-	if len(jar) == 0 {
-		return "", false, errors.New("нет cookies Яндекса")
-	}
-	raw, err := json.Marshal(map[string]map[string]string{documentURL: jar})
+	cfg, err := ch.config()
 	if err != nil {
-		return "", false, err
+		return err
 	}
-	_, signedIn = jar["Session_id"]
-	return base64.StdEncoding.EncodeToString(raw), signedIn, nil
+	cfg += "key=" + ch.Key + "\n"
+	return c.asRoot("apply", cfg, sudoPassword)
 }
 
 // Remove stops and deletes the channel; the last one also removes the

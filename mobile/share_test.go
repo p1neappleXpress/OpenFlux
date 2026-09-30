@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"openflux/share"
+	"github.com/p1neappleXpress/OpenFlux/share"
 )
 
 // Phone-as-exit to phone-as-client: the exit's link, decoded and turned
@@ -70,5 +70,61 @@ func TestExitShareLinkConnectsAClient(t *testing.T) {
 func TestParseShareLinkRejectsGarbage(t *testing.T) {
 	if _, err := ParseShareLink("https://example.com"); err == nil {
 		t.Fatal("accepted a non-openflux link")
+	}
+}
+
+type fakeRooms string
+
+func (f fakeRooms) RoomList() string { return string(f) }
+
+// A cupsonline exit started without a room list creates its rooms at start;
+// the link must carry them, or the client has nothing to join.
+func TestExitShareLinkCarriesCreatedCupsRooms(t *testing.T) {
+	tmpl := exitShareSession(`[{"name":"cupsonline","type":"cupsonline","priority":50}]`, "a shared secret of 32 characters")
+	if tmpl == nil || len(tmpl.Transports) != 1 || tmpl.Transports[0].URL != "" {
+		t.Fatalf("template %+v", tmpl)
+	}
+	exitNode.mu.Lock()
+	exitNode.share, exitNode.rooms = tmpl, map[string]roomLister{"cupsonline": fakeRooms("WyJyb29tLTEiXQ")}
+	exitNode.mu.Unlock()
+	t.Cleanup(func() {
+		exitNode.mu.Lock()
+		exitNode.share, exitNode.rooms = nil, nil
+		exitNode.mu.Unlock()
+	})
+
+	link, err := ExitShareLink("", "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := share.Decode(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Transports) != 1 || c.Transports[0].URL != "WyJyb29tLTEiXQ" {
+		t.Fatalf("transports %+v", c.Transports)
+	}
+}
+
+// Android reads and makes links with the same answer as the CLI and iOS:
+// share.Result, byte for byte.
+func TestReadMakeShareLinkAnswerLikeShare(t *testing.T) {
+	cfg := `{"negotiate":true,"secret":"a shared secret of 32 characters","codec":"batched",` +
+		`"transports":[{"type":"yandex","url":"https://disk.yandex.ru/i/abc","priority":100},{"type":"direct","dial":"203.0.113.7:9443"}]}`
+	made := MakeShareLink(cfg)
+	if made != share.MakeJSON(cfg).JSON() {
+		t.Fatalf("MakeShareLink %s", made)
+	}
+	link := share.MakeJSON(cfg).Link
+	for _, in := range []string{link, " " + link[:30] + "\n" + link[30:], "https://example.com"} {
+		if got := ReadShareLink(in); got != share.Read(in).JSON() {
+			t.Errorf("ReadShareLink(%q) = %s", in, got)
+		}
+	}
+	// A Yandex-document channel's link is share.NodeConfig's.
+	doc := "https://docs.yandex.ru/edit/d/AbCdEfGhIjKlMnOpQrStUv"
+	node, err := NodeShareLink("node", `[{"type":"vyandex","url":"`+doc+`"}]`, "a shared secret of 32 characters", "203.0.113.7", 9443)
+	if want := share.Make(share.NodeConfig("node", doc, "a shared secret of 32 characters", "203.0.113.7:9443")).Link; err != nil || node != want {
+		t.Errorf("NodeShareLink %q (%v), want %q", node, err, want)
 	}
 }

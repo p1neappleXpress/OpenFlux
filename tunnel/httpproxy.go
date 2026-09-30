@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"sync"
 
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // NewSideTunnel builds a client TCP stack on a PortDemux side, confined to

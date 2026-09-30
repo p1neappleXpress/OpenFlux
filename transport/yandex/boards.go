@@ -20,9 +20,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/netbind"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 const (
@@ -31,8 +31,10 @@ const (
 		"(KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
 	boardsSocketHostDefault = "socket33.boards.yandex.ru"
 
-	// Engine.io heartbeat. Сервер шлёт pingInterval=25000, pingTimeout=30000.
-	// Мы пингуем сами каждые 20с, чтобы NAT не рвал idle-соединение.
+	// Heartbeat. Сервер шлёт engine.io ping "2" (pingInterval=25000,
+	// pingTimeout=30000), мы отвечаем "3". Сами шлём только heartbeat в
+	// namespace dashboard каждые 20с, чтобы NAT не рвал idle-соединение;
+	// клиентский "2" сервер EIO=4 считает ошибкой и закрывает сокет.
 	boardsPingInterval = 20 * time.Second
 
 	// Дедлайн чтения в основном цикле. С запасом над boardsPingInterval.
@@ -458,10 +460,20 @@ func (t *BoardsTransport) connectLoop(info boardsInfo) {
 			return
 		default:
 		}
-		if err := t.connectAndServe(info); err != nil {
-			utils.Debugf("[BOARDS] ws error: %v", err)
+		began := time.Now()
+		err := t.connectAndServe(info)
+		lasted := time.Since(began)
+		if err != nil {
+			utils.Debugf("[BOARDS] ws error after %v: %v", lasted.Round(time.Second), err)
+			if utils.Throttled("boards.drop", time.Minute) {
+				utils.Infof("[BOARDS] connection to the board dropped after %v: %v; reconnecting", lasted.Round(time.Second), err)
+			}
 		}
 		t.SetConnected(false)
+		if lasted > time.Minute {
+			// A session that held is not part of a failure streak.
+			attempt = 0
+		}
 		select {
 		case <-t.done:
 			return
@@ -547,9 +559,13 @@ func (t *BoardsTransport) connectAndServe(info boardsInfo) error {
 	t.SetConnected(true)
 	utils.SafeGo("boards.writer", func() { t.writerLoop(sess) })
 
+	// No client-side engine.io ping: in EIO=4 the server pings ("2") and the
+	// client answers ("3", see handleMessage). A client "2" is an invalid
+	// heartbeat direction to an engine.io v4 server, which then closes the
+	// socket, so the old pingLoop dropped the board every
+	// boardsPingInterval. The dashboard heartbeat below keeps it busy.
 	kaStop := make(chan struct{})
 	utils.SafeGo("boards.keepalive", func() { t.keepAliveLoop(sess, kaStop) })
-	utils.SafeGo("boards.ping", func() { t.pingLoop(sess, kaStop) })
 	defer close(kaStop)
 
 	for {
@@ -783,24 +799,6 @@ func (t *BoardsTransport) keepAliveLoop(sess *boardsSession, stop chan struct{})
 			}
 			if err := sess.writeEventObj("dashboard", obj); err != nil {
 				utils.Debugf("[BOARDS] heartbeat: %v", err)
-				return
-			}
-		}
-	}
-}
-
-func (t *BoardsTransport) pingLoop(sess *boardsSession, stop chan struct{}) {
-	tick := time.NewTicker(boardsPingInterval)
-	defer tick.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.done:
-			return
-		case <-tick.C:
-			if err := sess.writeRaw("2"); err != nil {
-				utils.Debugf("[BOARDS] engine.io ping: %v", err)
 				return
 			}
 		}

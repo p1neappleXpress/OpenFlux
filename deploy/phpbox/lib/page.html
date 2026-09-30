@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>%%TITLE%% · OpenFlux</title>
+<style>
+:root{
+  --bg:#F8F9FA;--surface:#fff;--tonal:#EEF2FF;--border:#DADCE0;--text:#202124;--text2:#5F6368;--hint:#80868B;
+  --accent:#4F7CFF;--accent-press:#3B5DBF;--accent-soft:rgba(79,124,255,.12);--ok:#1E8E3E;--warn:#D97706;--danger:#D93025;
+  --danger-soft:rgba(217,48,37,.08);--ok-soft:rgba(30,142,62,.10);--warn-soft:rgba(251,191,36,.16);--log:#3C4043;--shadow:0 1px 2px rgba(0,0,0,.06),0 8px 24px rgba(31,41,55,.06);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#080B12;--surface:#131722;--tonal:#1B2233;--border:#2A3446;--text:#fff;--text2:#8A92A6;--hint:#5A6272;
+  --accent-press:#3B5DBF;--accent-soft:rgba(79,124,255,.16);--ok:#34D399;--warn:#FBBF24;--danger:#F28B82;
+  --danger-soft:rgba(242,139,130,.12);--ok-soft:rgba(52,211,153,.12);--warn-soft:rgba(251,191,36,.12);--log:#DADCE0;--shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.35);}}
+:root[data-theme=dark]{
+  --bg:#080B12;--surface:#131722;--tonal:#1B2233;--border:#2A3446;--text:#fff;--text2:#8A92A6;--hint:#5A6272;
+  --accent-press:#3B5DBF;--accent-soft:rgba(79,124,255,.16);--ok:#34D399;--warn:#FBBF24;--danger:#F28B82;
+  --danger-soft:rgba(242,139,130,.12);--ok-soft:rgba(52,211,153,.12);--warn-soft:rgba(251,191,36,.12);--log:#DADCE0;--shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.35);}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:14px/20px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(900px 420px at 85% -10%,var(--accent-soft),transparent 60%)}
+.wrap{max-width:1040px;margin:0 auto;padding:20px 16px 48px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+header svg{width:40px;height:40px;flex:none;filter:drop-shadow(0 4px 10px rgba(79,124,255,.35))}
+h1{font-size:22px;line-height:28px;margin:0;font-weight:700;letter-spacing:-.2px}
+.sub{color:var(--text2);font-size:12px}
+.spacer{flex:1}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;padding:3px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent)}
+.ghost{background:none;border:1px solid var(--border);color:var(--text2);border-radius:10px;padding:6px 10px;font:inherit;font-size:12px;cursor:pointer}
+.ghost:hover{border-color:var(--accent);color:var(--text)}
+.grid{display:grid;grid-template-columns:1.25fr 1fr;gap:16px}
+@media (max-width:860px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px;box-shadow:var(--shadow)}
+.card h2{font-size:11px;font-weight:700;letter-spacing:.9px;text-transform:uppercase;color:var(--text2);margin:0 0 12px;display:flex;align-items:center;gap:8px}
+.full{grid-column:1/-1}
+.hero{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:9px;font-weight:700;font-size:15px;padding:8px 14px;border-radius:999px;background:var(--tonal);border:1px solid var(--border)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--hint);flex:none}
+.on .dot{background:var(--ok);box-shadow:0 0 0 0 var(--ok);animation:pulse 1.8s infinite}
+.busy .dot{background:var(--warn);animation:blink 1s infinite}
+.bad .dot{background:var(--danger)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.55)}70%{box-shadow:0 0 0 9px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+@keyframes blink{50%{opacity:.25}}
+.btns{display:flex;gap:8px;margin-left:auto}
+button.primary,button.danger,button.soft{font:inherit;font-weight:600;border:0;border-radius:12px;padding:9px 16px;cursor:pointer}
+button.primary{background:var(--accent);color:#fff}button.primary:hover{background:var(--accent-press)}
+button.danger{background:var(--danger-soft);color:var(--danger)}
+button.soft{background:var(--accent-soft);color:var(--accent)}
+button:disabled{opacity:.45;cursor:default}
+.bar{height:6px;border-radius:99px;background:var(--tonal);overflow:hidden;margin:14px 0 4px}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),#7aa2ff);border-radius:99px;transition:width .9s linear}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+@media (max-width:520px){.metrics{grid-template-columns:repeat(2,1fr)}}
+.m{background:var(--tonal);border-radius:12px;padding:10px 12px}
+.m b{display:block;font-size:20px;line-height:24px;font-weight:600;font-variant-numeric:tabular-nums}
+.m span{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+.chainrow{display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:10px 12px;border-radius:12px;background:var(--tonal);cursor:pointer}
+.chainrow input{margin-top:3px;accent-color:var(--accent)}
+.chainrow b{font-weight:600}
+.banner{display:none;margin-top:14px;padding:10px 12px;border-radius:12px;background:var(--warn-soft);color:var(--text);border:1px solid var(--warn);font-size:13px}
+.banner.show{display:block}
+textarea,input[type=text]{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:10px 12px;font:12px/18px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical}
+textarea:focus,input:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin-top:12px;font-size:13px}
+.kv dt{color:var(--text2)}.kv dd{margin:0;word-break:break-all}
+.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700;background:var(--accent-soft);color:var(--accent);margin-right:6px}
+.tag.ok{background:var(--ok-soft);color:var(--ok)}.tag.warn{background:var(--warn-soft);color:var(--warn)}.tag.bad{background:var(--danger-soft);color:var(--danger)}
+.note{margin-top:10px;padding:9px 12px;border-radius:12px;font-size:12.5px;background:var(--tonal);color:var(--text2)}
+.note.warn{background:var(--warn-soft);color:var(--text)}.note.bad{background:var(--danger-soft);color:var(--danger)}
+.qrbox{display:flex;flex-direction:column;align-items:center;gap:12px}
+.qrbox canvas{background:#fff;border-radius:14px;padding:0;width:min(100%,280px);height:auto;image-rendering:pixelated;box-shadow:0 0 0 1px var(--border)}
+.qrbox .empty{color:var(--hint);text-align:center;padding:40px 10px;font-size:13px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.log{background:var(--bg);border:1px solid var(--border);border-radius:12px;height:300px;overflow:auto;padding:10px 12px;font:12px/18px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--log)}
+.log div{white-space:pre-wrap;word-break:break-word}
+.log .t{color:var(--hint)}.log .lv{display:inline-block;width:46px;font-weight:700}
+.log .error .lv{color:var(--danger)}.log .warn .lv{color:var(--warn)}.log .info .lv{color:var(--accent)}.log .debug .lv{color:var(--hint)}
+.logbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:var(--text2)}
+.logbar label{display:flex;gap:6px;align-items:center;cursor:pointer}
+code.k{font:12px ui-monospace,Menlo,monospace;background:var(--tonal);padding:2px 6px;border-radius:6px;word-break:break-all}
+footer{margin-top:22px;color:var(--hint);font-size:12px;text-align:center}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:var(--text);color:var(--bg);padding:8px 14px;border-radius:999px;font-weight:600;font-size:13px;opacity:0;transition:.25s;pointer-events:none}
+.toast.show{opacity:1;transform:translateX(-50%)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <svg viewBox="0 0 432 432" aria-hidden="true"><defs><linearGradient id="g" gradientUnits="userSpaceOnUse" x1="192" y1="196.5" x2="64.5" y2="526.5"><stop offset="0" stop-color="#4F7CFF"/><stop offset="1" stop-color="#314D9E"/></linearGradient></defs><rect x="24" y="24" width="384" height="384" rx="86" fill="url(#g)"/><g fill="#FFFFFF" transform="translate(216 216) scale(0.8) translate(-216 -216)">
+    <path d="M236 69C243.732 69 250 75.268 250 83V123C250 130.732 243.732 137 236 137H196C188.268 137 182 130.732 182 123V83C182 75.268 188.268 69 196 69H236ZM200 78C195.029 78 191 82.0294 191 87V119C191 123.971 195.029 128 200 128H232C236.971 128 241 123.971 241 119V87C241 82.0294 236.971 78 232 78H200Z" fill-rule="evenodd"/>
+    <path d="M236 295C243.732 295 250 301.268 250 309V349C250 356.732 243.732 363 236 363H196C188.268 363 182 356.732 182 349V309C182 301.268 188.268 295 196 295H236ZM200 304C195.029 304 191 308.029 191 313V345C191 349.971 195.029 354 200 354H232C236.971 354 241 349.971 241 345V313C241 308.029 236.971 304 232 304H200Z" fill-rule="evenodd"/>
+    <path d="M69 196C69 188.268 75.268 182 83 182H123C130.732 182 137 188.268 137 196V236C137 243.732 130.732 250 123 250H83C75.268 250 69 243.732 69 236V196ZM78 232C78 236.971 82.0294 241 87 241H119C123.971 241 128 236.971 128 232V200C128 195.029 123.971 191 119 191H87C82.0294 191 78 195.029 78 200V232Z" fill-rule="evenodd"/>
+    <path d="M295 196C295 188.268 301.268 182 309 182H349C356.732 182 363 188.268 363 196V236C363 243.732 356.732 250 349 250H309C301.268 250 295 243.732 295 236V196ZM304 232C304 236.971 308.029 241 313 241H345C349.971 241 354 236.971 354 232V200C354 195.029 349.971 191 345 191H313C308.029 191 304 195.029 304 200V232Z" fill-rule="evenodd"/>
+    <path d="M284.605 115.943C288.213 112.335 294.061 112.335 297.669 115.943L316.331 134.605C319.939 138.213 319.939 144.061 316.331 147.669L297.669 166.331C294.061 169.939 288.213 169.939 284.605 166.331L265.943 147.669C262.335 144.061 262.335 138.213 265.943 134.605L284.605 115.943ZM273.497 137.265C271.358 139.403 271.358 142.871 273.497 145.009L287.265 158.777C289.403 160.916 292.871 160.916 295.009 158.777L308.777 145.009C310.916 142.871 310.916 139.403 308.777 137.265L295.009 123.497C292.871 121.358 289.403 121.358 287.265 123.497L273.497 137.265Z" fill-rule="evenodd"/>
+    <path d="M134.605 115.532C138.213 111.924 144.061 111.924 147.669 115.532L166.331 134.194C169.939 137.802 169.939 143.65 166.331 147.258L147.669 165.92C144.061 169.528 138.213 169.528 134.605 165.92L115.943 147.258C112.335 143.65 112.335 137.802 115.943 134.194L134.605 115.532ZM123.497 136.854C121.358 138.992 121.358 142.46 123.497 144.598L137.265 158.366C139.403 160.505 142.871 160.505 145.009 158.366L158.777 144.598C160.916 142.46 160.916 138.992 158.777 136.854L145.009 123.086C142.871 120.947 139.403 120.947 137.265 123.086L123.497 136.854Z" fill-rule="evenodd"/>
+    <path d="M284.194 265.532C287.802 261.924 293.65 261.924 297.258 265.532L315.92 284.194C319.528 287.802 319.528 293.65 315.92 297.258L297.258 315.92C293.65 319.528 287.802 319.528 284.194 315.92L265.532 297.258C261.924 293.65 261.924 287.802 265.532 284.194L284.194 265.532ZM273.086 286.854C270.947 288.992 270.947 292.46 273.086 294.598L286.854 308.366C288.992 310.505 292.46 310.505 294.598 308.366L308.366 294.598C310.505 292.46 310.505 288.992 308.366 286.854L294.598 273.086C292.46 270.947 288.992 270.947 286.854 273.086L273.086 286.854Z" fill-rule="evenodd"/>
+    <path d="M134.194 265.121C137.802 261.514 143.65 261.514 147.258 265.121L165.92 283.783C169.528 287.391 169.528 293.24 165.92 296.847L147.258 315.509C143.65 319.117 137.802 319.117 134.194 315.509L115.532 296.847C111.924 293.24 111.924 287.391 115.532 283.783L134.194 265.121ZM123.086 286.443C120.947 288.582 120.947 292.049 123.086 294.187L136.854 307.955C138.992 310.094 142.46 310.094 144.598 307.955L158.366 294.187C160.505 292.049 160.505 288.582 158.366 286.443L144.598 272.675C142.46 270.536 138.992 270.536 136.854 272.675L123.086 286.443Z" fill-rule="evenodd"/>
+    <path d="M255 216C255 237.539 237.539 255 216 255C194.461 255 177 237.539 177 216C177 194.461 194.461 177 216 177C237.539 177 255 194.461 255 216Z"/>
+    <path d="M134 211H297V221H134V211Z"/>
+    <path d="M210.5 297.5V134.5H220.5V297.5H210.5Z"/>
+    <path d="M151.369 273.06L272.559 151.869L279.63 158.94L158.44 280.131L151.369 273.06Z"/>
+    <path d="M158.569 151.998L281.76 275.19L274.689 282.261L151.498 159.069L158.569 151.998Z"/>
+  </g></svg>
+    <div><h1>OpenFlux <span class="chip">phpbox</span></h1><div class="sub" id="subtitle"></div></div>
+    <div class="spacer"></div>
+    <button class="ghost" id="lang">RU / EN</button>
+  </header>
+
+  <div class="grid">
+    <section class="card full">
+      <h2 id="h-node"></h2>
+      <div class="hero">
+        <div class="pill" id="pill"><span class="dot"></span><span id="pilltext"></span></div>
+        <div class="sub" id="pillsub"></div>
+        <div class="btns"><button class="primary" id="start"></button><button class="danger" id="stop"></button></div>
+      </div>
+      <div class="bar"><i id="bar"></i></div>
+      <div class="sub" id="barlabel"></div>
+      <div class="banner" id="banner"></div>
+      <div class="metrics">
+        <div class="m"><b id="m-streams">0</b><span id="l-streams"></span></div>
+        <div class="m"><b id="m-opened">0</b><span id="l-opened"></span></div>
+        <div class="m"><b id="m-up">0 B</b><span id="l-up"></span></div>
+        <div class="m"><b id="m-down">0 B</b><span id="l-down"></span></div>
+      </div>
+      <label class="chainrow"><input type="checkbox" id="f-chain" checked><span><b id="l-chain"></b><br><span class="sub" id="l-chainhint"></span></span></label>
+    </section>
+
+    <section class="card">
+      <h2 id="h-link"></h2>
+      <textarea id="input" rows="3" spellcheck="false"></textarea>
+      <div id="parsed"></div>
+      <div class="row">
+        <button class="soft" id="copy-kick"></button>
+        <button class="soft" id="copy-cmd"></button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 id="h-qr"></h2>
+      <div class="qrbox"><canvas id="qr" width="1" height="1" hidden></canvas><div class="empty" id="qrempty"></div>
+        <code class="k" id="qrlink" style="max-width:100%"></code>
+        <div class="row" style="margin:0"><button class="soft" id="qr-save" hidden></button><button class="soft" id="qr-copy" hidden></button></div></div>
+    </section>
+
+    <section class="card full">
+      <h2 id="h-log"></h2>
+      <div class="logbar">
+        <label><input type="checkbox" id="f-info" checked> info</label>
+        <label><input type="checkbox" id="f-debug" checked> debug</label>
+        <label><input type="checkbox" id="f-scroll" checked> <span id="l-scroll"></span></label>
+        <label title=""><input type="checkbox" id="f-sens"> <span id="l-sens"></span></label>
+        <span class="spacer"></span>
+        <button class="ghost" id="log-copy"></button><button class="ghost" id="log-clear"></button>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+  <footer id="foot"></footer>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>%%WASMEXEC%%</script>
+<script>
+window.PB = %%CONFIG%%;
+(function(){
+'use strict';
+const C = window.PB;
+const $ = id => document.getElementById(id);
+
+// ---- words (the core only answers with codes; the page words them) -------
+const L = {
+ru:{
+ sub:'Бесплатный выход на обычном PHP-хостинге', node:'Нода', link:'Ссылка или адрес', qr:'QR для приложений', log:'Журнал',
+ idle:'Остановлена', connecting:'Подключается…', serving:'Работает', already:'Уже запущена',
+ start:'Запустить', stop:'Остановить', starting:'Запуск…',
+ streams:'потоков', opened:'открыто', up:'на сервер', down:'к вам',
+ left:'осталось', of:'из', cap:'Один запуск живёт до {n} с, потом его можно перезапустить.',
+ chain:'Держать туннель непрерывно', chain_hint:'До конца запуска нода сама поднимает следующее поколение: новые соединения переходят без разрыва, старые доживают до конца (не дольше {n} с).',
+ chain_on:'непрерывный режим', next_in:'смена поколения через {n} с', winding:'Завершается', winding_sub:'потоков ещё: {n}', stopping:'останавливается…',
+ gen:'запуск №', last:'Последний конец:', never:'Ещё не запускалась на этом адресе.',
+ ph_cups:'Вставьте ссылку openflux://… или ссылку комнаты cups.online (или её uuid)',
+ ph_mailru:'Вставьте ссылку openflux://… или публичную ссылку на документ Mail.ru',
+ ph_any:'Вставьте ссылку openflux://… или адрес',
+ kind_link:'Ссылка openflux://', kind_room:'Комната cups', kind_mailru:'Документ Mail.ru', kind_raw:'Адрес',
+ f_name:'Имя', f_carrier:'Носитель', f_transports:'Транспорты', f_secret:'Секрет', f_codec:'Кодек', f_ctx:'Контекст', f_mode:'Режим',
+ secret_set:'задан, {n} симв. (на сервер не отправляется)', secret_none:'нет', session:'сессия (negotiate)', classic:'классический',
+ used:'используется', unused:'не подходит этому выходу',
+ cp_kick:'Копировать адрес для пингера', cp_cmd:'Копировать команду клиента', copied:'Скопировано',
+ qr_empty:'QR для приложений появится, когда будет адрес ноды (вставьте ссылку или адрес)', qr_save:'Сохранить PNG', qr_copy:'Копировать ссылку',
+ scroll:'автопрокрутка', sens:'писать адреса назначения в журнал', lcopy:'Копировать', lclear:'Очистить',
+ noparser:'Разбор ссылок openflux:// недоступен: на хосте нет assets/share.wasm.gz. Адреса комнат и документов работают и без него.',
+ parser_loading:'Загружаю разбор ссылок из ядра…', parser_ok:'разбор ссылок: ядро (wasm)', parser_bad:'разбор ссылок: недоступен',
+ nocarrier:'В ссылке нет транспорта «{t}», который умеет этот выход.',
+ warn_secret:'В ссылке есть секрет шифрования. Режим phpbox сейчас без шифрования: на клиенте используйте --mode=stream, секрет не применится.',
+ warn_session:'Ссылка для сессии. phpbox-выход не говорит по сессионному протоколу: клиент идёт в режиме --mode=stream.',
+ warn_apps:'Клиент: приложение OpenFlux (режим «без сервера», отсканируйте QR справа) или ядро с --mode=stream.',
+ already_banner:'Нода по этому адресу уже запущена (запуск №{g}, работает {s} с). Новую запускать не нужно: страница подключилась к ней.',
+ started_elsewhere:'Запущена другим окном или пингером.',
+ need_target:'Вставьте ссылку или адрес, чтобы запустить ноду.',
+ e_not_link:'Это не ссылка openflux://.', e_unsupported_version:'Ссылка новее, чем понимает ядро на странице: обновите OpenFlux.',
+ e_case_changed:'В ссылке изменился регистр букв (openflux:// чувствительна к нему): скопируйте её заново.',
+ e_damaged:'Ссылка повреждена или обрезана по дороге.', e_too_large:'Ссылка слишком большая.', e_bad_payload:'Внутри ссылки не настройки.',
+ e_bad_config:'Настройки не читаются.', e_no_transports:'В ссылке нет транспортов.', e_several_need_session:'Несколько транспортов требуют сессии.',
+ e_session_secret:'Для сессии нужен секрет не короче {p} символов.', e_short_secret:'Секрет короче {p} символов.',
+ e_unknown_codec:'Неизвестный кодек «{p}».', e_not_shareable:'Транспорт «{p}» нельзя передавать ссылкой.', e_unknown_transport:'Неизвестный транспорт «{p}».',
+ e_direct_no_dial:'Для direct не указан адрес выхода.', e_direct_needs_session:'direct работает только в сессии.',
+ foot:'phpbox {v} · PHP {p} · журнал и состояние хранятся на хосте и стираются при переполнении'
+},
+en:{
+ sub:'A free exit on plain PHP hosting', node:'Node', link:'Link or address', qr:'QR for the apps', log:'Log',
+ idle:'Stopped', connecting:'Connecting…', serving:'Running', already:'Already running',
+ start:'Start', stop:'Stop', starting:'Starting…',
+ streams:'streams', opened:'opened', up:'to server', down:'to you',
+ left:'left', of:'of', cap:'One run lives up to {n} s, then it can be started again.',
+ chain:'Keep the tunnel up continuously', chain_hint:'Before a run ends the node starts the next generation itself: new connections move over without a break, old ones finish (for at most {n} s).',
+ chain_on:'continuous mode', next_in:'next generation in {n} s', winding:'Winding down', winding_sub:'streams left: {n}', stopping:'stopping…',
+ gen:'run #', last:'Last ended:', never:'Never started on this address yet.',
+ ph_cups:'Paste an openflux://… link or a cups.online room link (or its uuid)',
+ ph_mailru:'Paste an openflux://… link or a public Mail.ru document link',
+ ph_any:'Paste an openflux://… link or an address',
+ kind_link:'openflux:// link', kind_room:'cups room', kind_mailru:'Mail.ru document', kind_raw:'Address',
+ f_name:'Name', f_carrier:'Carrier', f_transports:'Transports', f_secret:'Secret', f_codec:'Codec', f_ctx:'Context', f_mode:'Mode',
+ secret_set:'set, {n} chars (never sent to the server)', secret_none:'none', session:'session (negotiate)', classic:'classic',
+ used:'used', unused:'does not fit this exit',
+ cp_kick:'Copy address for a pinger', cp_cmd:'Copy client command', copied:'Copied',
+ qr_empty:'The QR for the apps appears once the node has an address (paste a link or an address)', qr_save:'Save PNG', qr_copy:'Copy link',
+ scroll:'autoscroll', sens:'log destination addresses', lcopy:'Copy', lclear:'Clear',
+ noparser:'openflux:// link parsing is unavailable: assets/share.wasm.gz is not on the host. Room and document addresses work without it.',
+ parser_loading:'Loading the core link parser…', parser_ok:'link parser: core (wasm)', parser_bad:'link parser: unavailable',
+ nocarrier:'The link has no “{t}” transport, which is what this exit speaks.',
+ warn_secret:'The link carries an encryption secret. phpbox has no encryption yet: use --mode=stream on the client, the secret will not apply.',
+ warn_session:'This is a session link. A phpbox exit does not speak the session protocol: the client runs with --mode=stream.',
+ warn_apps:'Client: the OpenFlux app (the “no server” mode, scan the QR on the right) or the core with --mode=stream.',
+ already_banner:'A node on this address is already running (run #{g}, up {s} s). No need to start another: the page attached to it.',
+ started_elsewhere:'Started by another window or a pinger.',
+ need_target:'Paste a link or an address to start the node.',
+ e_not_link:'This is not an openflux:// link.', e_unsupported_version:'The link is newer than the core on this page understands: update OpenFlux.',
+ e_case_changed:'The link changed letter case on the way (openflux:// is case-sensitive): copy it again.',
+ e_damaged:'The link is damaged or was cut on the way.', e_too_large:'The link is too large.', e_bad_payload:'The link does not contain a configuration.',
+ e_bad_config:'The configuration cannot be read.', e_no_transports:'The link has no transports.', e_several_need_session:'Several transports need a session.',
+ e_session_secret:'A session needs a secret of at least {p} characters.', e_short_secret:'The secret is shorter than {p} characters.',
+ e_unknown_codec:'Unknown codec “{p}”.', e_not_shareable:'Transport “{p}” cannot be shared by link.', e_unknown_transport:'Unknown transport “{p}”.',
+ e_direct_no_dial:'direct has no exit address.', e_direct_needs_session:'direct only works in a session.',
+ foot:'phpbox {v} · PHP {p} · the log and state live on the host and are trimmed when full'
+}};
+let lang = (function(){try{return localStorage.getItem('pbLang')}catch(e){return null}})() || ((navigator.language||'ru').startsWith('ru')?'ru':'en');
+const t = (k,p)=>{let s=(L[lang][k]??L.en[k]??k);if(p)for(const x in p)s=s.replace('{'+x+'}',p[x]);return s};
+const esc = s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const toast=m=>{const e=$('toast');e.textContent=m;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),1400)};
+const copy=async(s)=>{try{await navigator.clipboard.writeText(s)}catch(e){const a=document.createElement('textarea');a.value=s;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}toast(t('copied'))};
+const human=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(2)+' MB';
+const fmtTime=ts=>new Date(ts).toLocaleTimeString([], {hour12:false});
+
+// ---- core parser (WebAssembly) --------------------------------------------
+let core = null, coreState = C.hasWasm ? 'loading' : 'missing';
+const q = (o)=>{const p=new URLSearchParams(Object.assign({k:C.k},o));return C.self+'?'+p.toString()};
+async function loadCore(){
+  if(!C.hasWasm){coreState='missing';return}
+  try{
+    const go = new Go();
+    const res = await fetch(q({a:'wasm'}));
+    const inst = await WebAssembly.instantiateStreaming(res.clone(),go.importObject).catch(async()=>WebAssembly.instantiate(await res.arrayBuffer(),go.importObject));
+    go.run(inst.instance||inst);
+    for(let i=0;i<50&&!window.openfluxShare;i++)await new Promise(r=>setTimeout(r,20));
+    core = window.openfluxShare; coreState = core?'ok':'bad';
+  }catch(e){coreState='bad';console.error(e)}
+  render();
+}
+
+// ---- input -> target -------------------------------------------------------
+let target = C.target || '';
+let parsed = null;            // {kind, config, error, used, warnings[]}
+function roomUrl(s){ return /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(s) ? 'https://interview.cups.online/live-coding/?room='+s.toLowerCase() : s }
+function classify(text){
+  text=text.trim(); if(!text) return null;
+  if(/^openflux:\/\//i.test(text)){
+    if(!core) return {kind:'link', pending:true};
+    const r=JSON.parse(core.read(text));
+    if(r.error||!r.config) return {kind:'link', error:r};
+    const cfg=r.config, ts=cfg.transports||[];
+    const used=ts.find(x=>x.type===C.carrier);
+    const warnings=[];
+    if(cfg.secret) warnings.push('warn_secret'); else if(cfg.negotiate) warnings.push('warn_session');
+    warnings.push('warn_apps');
+    return {kind:'link', link:text.replace(/\s+/g,''), config:cfg, context:r.context, used, warnings, target:used?used.url:''};
+  }
+  const url = C.carrier==='cupsonline'?roomUrl(text):text;
+  return {kind: C.carrier==='cupsonline'?'room':(C.carrier==='mailru'?'mailru':'raw'), target:url};
+}
+function onInput(){
+  parsed = classify($('input').value);
+  target = parsed && parsed.target ? parsed.target : '';
+  renderParsed(); renderQr(); renderButtons();
+  if(target){ pollStatus(true); } else { st={running:false,state:{}}; startedHere=false; renderStatus(); }
+}
+
+function renderParsed(){
+  const el=$('parsed'); let h='';
+  if(!parsed){ el.innerHTML=''; return }
+  const kinds={link:'kind_link',room:'kind_room',mailru:'kind_mailru',raw:'kind_raw'};
+  h+='<div style="margin-top:12px"><span class="tag">'+t(kinds[parsed.kind])+'</span></div>';
+  if(parsed.pending){ h+='<div class="note">'+t(coreState==='missing'?'noparser':'parser_loading')+'</div>'; el.innerHTML=h; return }
+  if(parsed.error){
+    const e=parsed.error, m=L[lang]['e_'+e.code];
+    h+='<div class="note bad">'+esc(m?t('e_'+e.code,{p:e.param}):(e.error||'error'))+'</div>';
+    el.innerHTML=h; return;
+  }
+  if(parsed.config){
+    const c=parsed.config;
+    h+='<dl class="kv">';
+    if(c.name) h+='<dt>'+t('f_name')+'</dt><dd>'+esc(c.name)+'</dd>';
+    h+='<dt>'+t('f_mode')+'</dt><dd>'+t(c.negotiate?'session':'classic')+(c.codec?' · '+esc(c.codec):'')+'</dd>';
+    h+='<dt>'+t('f_transports')+'</dt><dd>'+(c.transports||[]).map(x=>{
+        const ok=x.type===C.carrier;
+        return '<div><span class="tag '+(ok?'ok':'')+'">'+esc(x.type)+'</span>'+(x.priority?'<span class="sub">#'+x.priority+' </span>':'')+esc(x.url||x.dial||'')+(ok?'':' <span class="sub">— '+t('unused')+'</span>')+'</div>'}).join('')+'</dd>';
+    h+='<dt>'+t('f_secret')+'</dt><dd>'+(c.secret?t('secret_set',{n:[...c.secret].length}):t('secret_none'))+'</dd>';
+    if(parsed.context) h+='<dt>'+t('f_ctx')+'</dt><dd>'+esc(parsed.context)+'</dd>';
+    h+='</dl>';
+    if(!parsed.used) h+='<div class="note bad">'+t('nocarrier',{t:C.carrier})+'</div>';
+    for(const w of parsed.warnings) h+='<div class="note warn">'+t(w)+'</div>';
+  } else if(parsed.target){
+    h+='<dl class="kv"><dt>'+t('f_carrier')+'</dt><dd>'+esc(C.carrier)+'</dd><dt>URL</dt><dd>'+esc(parsed.target)+'</dd></dl>';
+  }
+  el.innerHTML=h;
+}
+
+// ---- QR (bitmap from the core) --------------------------------------------
+let qrLink='';
+// The link an app scans to use this node: the core makes it (mode "stream", one carrier, no secret).
+function clientLink(){
+  if(!core||!target) return '';
+  try{
+    const r=JSON.parse(core.make(JSON.stringify({name:'phpbox · '+C.title,mode:'stream',transports:[{type:C.carrier,url:target}]})));
+    return r.link||'';
+  }catch(e){return ''}
+}
+function renderQr(){
+  const cv=$('qr'), empty=$('qrempty');
+  qrLink = clientLink();
+  $('qrlink').textContent = qrLink ? qrLink.slice(0,46)+'…' : '';
+  const ok = qrLink && core;
+  cv.hidden=!ok; empty.hidden=!!ok; $('qr-save').hidden=!ok; $('qr-copy').hidden=!ok;
+  if(!ok) return;
+  const r=JSON.parse(core.qr(qrLink));
+  if(!r.rows){empty.hidden=false;cv.hidden=true;empty.textContent=r.error||'QR error';return}
+  const n=r.rows.length, scale=Math.max(2,Math.floor(560/n));
+  cv.width=cv.height=n*scale;
+  const g=cv.getContext('2d'); g.fillStyle='#fff'; g.fillRect(0,0,cv.width,cv.height); g.fillStyle='#000';
+  r.rows.forEach((row,y)=>{for(let x=0;x<n;x++)if(row[x]==='1')g.fillRect(x*scale,y*scale,scale,scale)});
+}
+
+// ---- node control ----------------------------------------------------------
+let st = {running:false, state:{}}, startedHere=false, lastPhase='';
+function kickUrl(){ return location.origin+q({a:'run',url:target,chain:$('f-chain').checked?'1':''}) }
+function cmd(){
+  const flag = C.carrier==='cupsonline'?'cupsonline':'mailru';
+  return 'openflux --role=client --mode=stream --transport='+flag+' --url "'+target+'" --socks5 127.0.0.1:1080';
+}
+async function pollStatus(force){
+  if(!target){ st={running:false,state:{}}; renderStatus(); return }
+  try{
+    const r=await fetch(q({a:'status',url:target}),{cache:'no-store'}); st=await r.json();
+  }catch(e){ return }
+  renderStatus();
+}
+async function startNode(){
+  if(!target){ toast(t('need_target')); return }
+  startedHere=true;
+  $('start').disabled=true; $('start').textContent=t('starting');
+  fetch(q({a:'run',url:target,chain:$('f-chain').checked?'1':'',sensitive:$('f-sens').checked?'1':''}),{cache:'no-store'}).catch(()=>{});   // the request IS the node; it survives us closing it
+  for(let i=0;i<8;i++){ await new Promise(r=>setTimeout(r,700)); await pollStatus(); if(st.running)break }
+}
+async function stopNode(){ await fetch(q({a:'stop',url:target})).catch(()=>{}); toast(t('stop')); setTimeout(pollStatus,900) }
+
+function renderButtons(){
+  $('start').textContent=t('start'); $('stop').textContent=t('stop');
+  $('start').disabled = !target || !!st.running;
+  $('stop').disabled = !st.running;
+  $('copy-kick').disabled = $('copy-cmd').disabled = !target;
+}
+function renderStatus(){
+  const s=st.state||{}, run=!!st.running, wind=!run&&(st.draining||0)>0, pill=$('pill');
+  pill.className='pill '+(run?(s.phase==='connecting'?'busy':'on'):(wind?'busy':(s.reason&&/died|could not|broken/.test(s.reason)?'bad':'')));
+  let txt = run ? (s.phase==='connecting'?t('connecting'):(startedHere?t('serving'):t('already'))) : (wind?t('winding'):t('idle'));
+  $('pilltext').textContent=txt;
+  const chainTag = st.chain ? ' · '+t('chain_on') : '';
+  $('pillsub').textContent = run ? t('gen')+s.gen+chainTag+(st.stopping?' · '+t('stopping'):'')
+    : (wind ? t('winding_sub',{n:s.streams||0}) : (s.ended ? t('last')+' '+fmtTime(s.ended*1000)+(s.reason?' — '+s.reason:'') : (target?t('never'):t('need_target'))));
+  const cap=s.cap||C.cap, el=run?(s.elapsed||0):0;
+  const span = (st.chain&&s.spawn_at)?s.spawn_at:cap;        // in chain mode the bar runs to the handover
+  $('bar').style.width = run ? Math.min(100,el/span*100)+'%' : '0';
+  $('barlabel').textContent = run ? (st.chain&&st.next_in!=null ? t('next_in',{n:st.next_in}) : Math.max(0,cap-el)+' s '+t('left')+' · '+t('of')+' '+cap+' s') : t('cap',{n:cap});
+  $('m-streams').textContent=s.streams||0; $('m-opened').textContent=s.opened||0;
+  $('m-up').textContent=human(s.up||0); $('m-down').textContent=human(s.down||0);
+  const b=$('banner');
+  if(run && !startedHere){ b.textContent=t('already_banner',{g:s.gen,s:el})+' '+t('started_elsewhere'); b.classList.add('show') } else b.classList.remove('show');
+  if(lastPhase==='serving' && !run && !wind) startedHere=false;
+  lastPhase = run ? s.phase : 'idle';
+  renderButtons();
+  if(run && $('start').textContent!==t('start')) $('start').textContent=t('start');
+}
+
+// ---- log -------------------------------------------------------------------
+let logOff=0, lines=[];
+function logLine(o){
+  const d=document.createElement('div'); d.className=o.l;
+  d.innerHTML='<span class="t">'+fmtTime(o.t)+'</span> <span class="lv">'+o.l+'</span> '+esc(o.m);
+  d.dataset.l=o.l; return d;
+}
+function applyFilter(){ for(const d of $('log').children) d.hidden = (d.dataset.l==='debug'&&!$('f-debug').checked)||(d.dataset.l==='info'&&!$('f-info').checked) }
+async function pollLog(){
+  if(!target) return;
+  try{
+    const r=await (await fetch(q({a:'log',url:target,since:logOff}),{cache:'no-store'})).json();
+    if(r.reset){ $('log').innerHTML='' }
+    logOff=r.next;
+    const box=$('log');
+    for(const o of r.lines){ lines.push(o); box.appendChild(logLine(o)) }
+    while(box.children.length>600) box.removeChild(box.firstChild);
+    if(r.lines.length){ applyFilter(); if($('f-scroll').checked) box.scrollTop=box.scrollHeight }
+  }catch(e){}
+}
+
+// ---- static text + wiring --------------------------------------------------
+function render(){
+  document.documentElement.lang=lang;
+  $('subtitle').textContent=t('sub')+' · '+C.title;
+  $('h-node').textContent=t('node'); $('h-link').textContent=t('link'); $('h-qr').textContent=t('qr'); $('h-log').textContent=t('log');
+  $('l-streams').textContent=t('streams'); $('l-opened').textContent=t('opened'); $('l-up').textContent=t('up'); $('l-down').textContent=t('down');
+  $('copy-kick').textContent=t('cp_kick'); $('copy-cmd').textContent=t('cp_cmd');
+  $('qrempty').textContent=t('qr_empty'); $('qr-save').textContent=t('qr_save'); $('qr-copy').textContent=t('qr_copy');
+  $('l-chain').textContent=t('chain'); $('l-chainhint').textContent=t('chain_hint',{n:60});
+  $('l-scroll').textContent=t('scroll'); $('l-sens').textContent=t('sens'); $('log-copy').textContent=t('lcopy'); $('log-clear').textContent=t('lclear');
+  $('input').placeholder = t(C.carrier==='cupsonline'?'ph_cups':(C.carrier==='mailru'?'ph_mailru':'ph_any'));
+  $('foot').textContent=t('foot',{v:C.version,p:C.php})+' · '+t(coreState==='ok'?'parser_ok':(coreState==='loading'?'parser_loading':'parser_bad'));
+  if($('input').value) { parsed=classify($('input').value); renderParsed(); renderQr() }
+  renderStatus();
+}
+$('lang').onclick=()=>{lang=lang==='ru'?'en':'ru';try{localStorage.setItem('pbLang',lang)}catch(e){}render()};
+$('input').addEventListener('input',onInput);
+$('start').onclick=startNode; $('stop').onclick=stopNode;
+$('copy-kick').onclick=()=>copy(kickUrl()); $('copy-cmd').onclick=()=>copy(cmd());
+$('qr-copy').onclick=()=>copy(qrLink);
+$('qr-save').onclick=()=>{const a=document.createElement('a');a.download='openflux-link.png';a.href=$('qr').toDataURL('image/png');a.click()};
+$('log-copy').onclick=()=>copy(lines.map(o=>fmtTime(o.t)+' '+o.l+' '+o.m).join('\n'));
+$('log-clear').onclick=()=>{$('log').innerHTML='';lines=[]};
+$('f-info').onchange=$('f-debug').onchange=applyFilter;
+
+if(C.target) $('input').value = C.target;
+render();
+loadCore().then(()=>{ if($('input').value){ onInput() } });
+// first look: is a node already running here? attach to it; otherwise start one when asked to (auto)
+(async()=>{
+  if(target) await pollStatus();
+  if(target && C.auto && !st.running){ startNode() }
+  renderButtons();
+})();
+let skip=0; const idle=()=>document.hidden&&(++skip%6!==0);   // a hidden tab polls 6x slower instead of stopping
+setInterval(()=>{ if(!idle()) pollStatus() },2000);
+setInterval(()=>{ if(!idle()) pollLog() },1500);
+pollLog();
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ pollStatus(); pollLog() } });
+})();
+</script>
+</body>
+</html>

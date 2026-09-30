@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // CookieStore is a small persistent store for per-session cookie jars.
@@ -136,6 +136,7 @@ func (s *CookieStore) persistLocked() error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("cookiestore: write %s: %w", tmp, err)
 	}
+	utils.GiveToDirOwner(tmp)
 	if err := os.Rename(tmp, s.path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("cookiestore: rename %s -> %s: %w", tmp, s.path, err)

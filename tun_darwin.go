@@ -12,9 +12,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"openflux/network"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/network"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // TUNClient is a macOS utun-based L3 forwarder: no gVisor, no SOCKS5.

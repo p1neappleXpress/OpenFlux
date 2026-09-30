@@ -1,8 +1,6 @@
 package provision
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"os"
 	"regexp"
 	"testing"
@@ -64,24 +62,5 @@ func TestSudoRefusal(t *testing.T) {
 	}
 	if isSudoRefusal([]byte("sh: 1: foo: not found")) {
 		t.Fatal("unexpected refusal")
-	}
-}
-
-func TestCookieStoreFormat(t *testing.T) {
-	b64, signedIn, err := CookieStore("https://docs.yandex.ru/edit/d/x", " Session_id=a=b ; yandexuid=1;bad;\nx=y")
-	if err != nil || !signedIn {
-		t.Fatalf("%v %v", signedIn, err)
-	}
-	raw, _ := base64.StdEncoding.DecodeString(b64)
-	var store map[string]map[string]string
-	if err := json.Unmarshal(raw, &store); err != nil {
-		t.Fatal(err)
-	}
-	jar := store["https://docs.yandex.ru/edit/d/x"]
-	if jar["Session_id"] != "a=b" || jar["yandexuid"] != "1" || len(jar) != 3 {
-		t.Fatalf("jar = %v", jar)
-	}
-	if _, signedIn, _ := CookieStore("u", "yandexuid=1"); signedIn {
-		t.Fatal("no Session_id means not signed in")
 	}
 }

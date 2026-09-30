@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"openflux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
 
 // restartOn builds a fresh Session (a restarted process) on an existing

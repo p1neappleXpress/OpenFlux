@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/p1neappleXpress/OpenFlux/transport"
 	"reflect"
 	"testing"
 )
@@ -51,9 +52,17 @@ func TestPickSessionContext(t *testing.T) {
 			{Type: "yandex", Priority: 50, URL: "https://docs/doc"},
 		}, "https://docs/doc"},
 		{"cupsonline alone", "", "http://#", []transportSpec{{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"}}, "http://#"},
+		// A classic cupsonline client is given the rooms as --url; the exit
+		// that created them ran without one. Both must land on the same
+		// context (they used to differ, and nothing got through).
+		{"classic cupsonline client with rooms as --url", "", "WyIxYzE0NGQwZS1lMDQw",
+			[]transportSpec{{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"}}, "http://#"},
+		{"direct host:port is not a context", "", "http://#", []transportSpec{
+			{Type: "direct", Priority: 100, URL: "203.0.113.7:9443"},
+		}, "http://#"},
 	}
 	for _, c := range cases {
-		if got := pickSessionContext(c.explicit, c.url, c.specs); got != c.want {
+		if got, _ := transport.KDFContexts(c.explicit, c.url, contextSources(c.specs)); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
 	}

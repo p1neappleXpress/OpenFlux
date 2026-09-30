@@ -1,16 +1,40 @@
 # Authenticated negotiation v1
 
-Opt-in CLI extension to the existing encrypted packet stack, not a new cipher
-suite or a production security certification. Both peers need `--negotiate`,
-batched codec and the same encryption secret/context. Old clients require the
-unchanged default mode on the exit. No automatic downgrade is implemented.
+Not a new cipher suite or a production security certification: an
+authenticated session (the Session) on top of the existing encrypted packet
+stack. Both peers need the same encryption secret and context (see
+"Encryption context"). A Session runs whenever a peer is configured with a
+key: `--negotiate`, `--transports`, `.conf` transports, the apps' Session
+profiles, and also classic setups (`--transport=X` with a key, the apps'
+classic profiles), which keep classic compatibility (see "Classic
+compatibility").
+
+## Layering on a carrier
+
+There are two layerings, and implementations must match the one they
+speak byte for byte:
+
+    Session  IPv4 -> envelope -> batch-v2 frame of envelopes -> AES-GCM record -> carrier
+    classic  IPv4 -> AES-GCM record -> codec frame (batch-v2 or legacy) -> carrier
+
+In the Session the batch frame (zstd when it helps) is encrypted as a whole,
+so every carrier frame starts with the record header `OFX` (0x4F 0x46 0x58),
+version 1 and the direction byte. In the classic layering each IPv4 packet is
+encrypted on its own and the records are framed by the codec, so a carrier
+frame starts with 0x02 (batch-v2) or 0x00 / 0x1F (legacy per-packet, raw /
+LZ4). Receive reverses the order. Because the first byte differs, one
+carrier can carry both, and a receiver can tell which layering its peer runs.
+
+(An earlier version of this document gave the Session's order as
+envelope -> AES-GCM -> batch-v2, which is the classic order; the code has
+always encrypted the batch frame. A Session built from that description
+does not interoperate.)
 
 ## Envelope
 
-Send order: IPv4 -> negotiation envelope -> existing AES-GCM packet -> batch-v2
-framing/compression -> carrier. Receive reverses that order. The envelope is
-inside AEAD, including its type, role, identities, capabilities and sequence.
-Integers are unsigned big-endian; unknown versions/types/reserved bits fail closed.
+The envelope is inside AEAD, including its type, role, identities,
+capabilities and sequence. Integers are unsigned big-endian; unknown
+versions/types/reserved bits fail closed.
 
 | Bytes | Meaning |
 | --- | --- |
@@ -38,8 +62,10 @@ Readiness requires a valid peer hello echoing the current local challenge.
 The effective policy is the capability intersection and smaller packet limit.
 The established peer cannot change its policy through later hellos. Retries
 with an unconfirmed ready bit receive a fresh confirmation, including after the
-other side has completed Start. The client's handshake deadline is 20 seconds;
-the exit never initiates and waits for a client indefinitely.
+other side has completed Start. The client's handshake deadline is 20 seconds
+(a client with classic compatibility starts sending classic after 3 and
+keeps offering the handshake); the exit never initiates and waits for a
+client indefinitely.
 
 A hello from a different sender while established usually means the peer
 restarted, but may be old traffic replayed from a carrier (anyone with access
@@ -91,7 +117,11 @@ are hashed across carriers only when they share that priority.
 | 0x20 LinkPing, 0x21 LinkPong | both | none |
 
 An empty `transport` (older peers) means the highest-priority transport that
-carries cookies. Unknown subtypes are passed to the application and otherwise
+carries cookies. Cookie messages and AuthRequired may carry `"doc"`, the
+document URL of that transport on the sender's side: the two sides do not
+always name carriers alike, so a receiver that has no carrier of that name
+matches by `doc`, then by the type the name starts with when it has one
+carrier of that type. Unknown subtypes are passed to the application and otherwise
 ignored.
 
 ## Checks on the exit
@@ -112,12 +142,68 @@ below gVisor's ephemeral range and common OS ones; replies to those ports go to
 it, everything else to the regular client path. The proxy listens on loopback
 without authentication while it runs, like the SOCKS5 inbound.
 
+## Classic compatibility
+
+A peer configured classic with a key runs a Session with the classic
+layering next to it on its one carrier:
+
+- A client falls back: it offers the handshake and, until the exit answers
+  (it waits 3 seconds at start), sends IPv4 in the classic layering, so an
+  exit that predates Session or runs without it still works. It keeps
+  offering the handshake (every 2 seconds after the first 20, every 10 once
+  the exit answered classic) and switches to the Session when answered. A
+  single-carrier Session client (a Session profile or `--transports` with
+  one carrier) falls back the same way; `--negotiate` does not.
+- An exit configured classic serves classic clients as well as Session
+  ones, as long as no Session client was heard within the link timeout:
+  classic frames that arrive while a Session client is active are dropped
+  (a replayed capture cannot take the replies away from it).
+- An exit configured as a Session (`--negotiate`, `--transports`, `.conf`
+  transports, the node wizard, the apps' Session exits) serves Session
+  clients only; classic frames are dropped and logged with the fix.
+
+## Codec (classic layering)
+
+Both framings are decoded whichever the peer uses. A peer sends batch-v2
+once it has received a batch frame (an empty one, `02 00`, is a capability
+probe), legacy while it has received only legacy frames, and its preferred
+framing (`--codec`) before it has heard anything. The side that speaks
+first (the client) switches to the other framing after 2 seconds without
+an answer, then every second, so a peer that decodes one framing only is
+still reached. A lone 0x00 is a carrier keepalive (Volga), not a frame.
+
+## Encryption context
+
+The scrypt salt is `SHA-256("OpenFlux encrypted transport v1\0" + context)`.
+Every peer picks the context with the same rule (`transport.KDFContexts`):
+
+1. an explicit context (`--session-context`, the context an openflux://
+   link carries);
+2. `--url`, unless it is a cupsonline room list;
+3. the URL of the highest-priority carrier that names the channel
+   (not cupsonline: its exit creates the room list at start; not direct:
+   host:port differs between the sides; not oneme);
+4. `http://#`.
+
+Builds have derived it differently (the classic cupsonline client used the
+room list; panels and an older fork used the transport name), so each peer
+also knows the alternates other builds derive for its setup. A record that
+does not open under the current keys is tried under them; the exit answers
+under the context the client used, and a client that hears nothing moves to
+the next candidate after 4 seconds, then every 2. The context is a public
+salt: accepting several weakens nothing, each one still requires the secret.
+
 ## Limits and compatibility
 
 Shared-secret holders are trusted peers. The existing static key derivation is
 unchanged: no forward secrecy, automatic key rotation or protection after secret
 compromise is claimed. AEAD authenticates packets; capability assertions still
 describe configured software functionality, not a live Internet reachability test.
+
+The classic layering has no challenge binding, sequence window or
+capability negotiation, only AES-GCM with a bounded nonce replay cache.
+A client that falls back to it can be kept there by whoever drops the
+exit's handshake answers; `--negotiate` rules that out on both sides.
 
 ICMP-error support refers to errors returned from a raw exit to the client; it
 does not promise bidirectional arbitrary ICMP, IPv6, echo or redirects. There

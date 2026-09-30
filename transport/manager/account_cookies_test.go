@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"openflux/transport"
-	"openflux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
 
 // An exit signed in with its owner's Yandex account must not hand that

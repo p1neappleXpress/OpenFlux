@@ -21,9 +21,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/netbind"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 type VolgaConfig struct {
@@ -52,6 +52,11 @@ type VolgaConfig struct {
 	// MaxSessionAge rotates the WebSocket (and its authorization) even
 	// while it looks healthy; 0 disables rotation.
 	MaxSessionAge time.Duration
+
+	// WebSocket buffers. Large ones help a server; a phone's VPN process
+	// (iOS caps it at 50 MB) cannot afford them.
+	WSReadBufferSize  int
+	WSWriteBufferSize int
 }
 
 func DefaultVolgaConfig() VolgaConfig {
@@ -79,7 +84,26 @@ func DefaultVolgaConfig() VolgaConfig {
 		WSReadTimeout:      60 * time.Second,
 		KeepAliveInterval:  10 * time.Second,
 		MaxSessionAge:      30 * time.Minute,
+
+		WSReadBufferSize:  4 << 20,
+		WSWriteBufferSize: 4 << 20,
 	}
+}
+
+// SlimVolgaConfig is the memory-constrained profile for phones, above all
+// the iOS Network Extension (50 MB for the whole process): a small relay
+// worker pool and queue, smaller batches and WebSocket buffers. The wire
+// format is the same, so it talks to a node on the default profile.
+func SlimVolgaConfig() VolgaConfig {
+	c := DefaultVolgaConfig()
+	c.MaxIdleConnsPerHost = 8
+	c.MaxIdleConns = 16
+	c.WorkerCount = 4
+	c.QueueSize = 4096
+	c.BatchMaxBytes = 256 * 1024
+	c.WSReadBufferSize = 128 << 10
+	c.WSWriteBufferSize = 128 << 10
+	return c
 }
 
 const volgaUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
@@ -88,7 +112,9 @@ var reClientConfig = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*
 
 var (
 	b64BufPool = sync.Pool{
-		New: func() interface{} { return make([]byte, 0, 16*1024*1024) },
+		// base64Encode grows a buffer for a bigger batch; a 16 MiB default
+		// kept that much per pooled buffer alive for every small packet.
+		New: func() interface{} { return make([]byte, 0, 256*1024) },
 	}
 	jsonBufPool = sync.Pool{
 		New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 128*1024)) },
@@ -945,8 +971,8 @@ func (w *wsListener) connect() error {
 	dialer := websocket.Dialer{
 		NetDialContext:   netbind.DialContext,
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
-		ReadBufferSize:   4 << 20,
-		WriteBufferSize:  4 << 20,
+		ReadBufferSize:   w.config.WSReadBufferSize,
+		WriteBufferSize:  w.config.WSWriteBufferSize,
 	}
 
 	conn, _, err := dialer.Dial(wsURL, header)
@@ -1141,11 +1167,17 @@ type YandexVolgaTransport struct {
 }
 
 func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
+	return NewYandexVolgaTransportWithConfig(docURL, cfg, DefaultVolgaConfig())
+}
+
+// NewYandexVolgaTransportWithConfig is NewYandexVolgaTransport with a
+// resource profile, e.g. SlimVolgaConfig on a phone.
+func NewYandexVolgaTransportWithConfig(docURL string, cfg transport.TransportConfig, volga VolgaConfig) *YandexVolgaTransport {
 	jar, _ := cookiejar.New(nil)
 	return &YandexVolgaTransport{
 		BaseTransport: transport.NewBaseTransport(cfg),
 		docURL:        docURL,
-		config:        DefaultVolgaConfig(),
+		config:        volga,
 		stats:         &VolgaStats{},
 		cookieJar:     jar,
 		keepAliveStop: make(chan struct{}),

@@ -10,7 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport"
 )
 
 func writerLoops() int {

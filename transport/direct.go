@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/netbind"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // DirectConfig configures the DirectTransport.

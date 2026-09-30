@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"strconv"
 
-	"openflux/transport"
-	"openflux/transport/control"
-	"openflux/transport/cupsonline"
-	"openflux/transport/mailru"
-	"openflux/transport/manager"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
+	"github.com/p1neappleXpress/OpenFlux/transport/mailru"
+	"github.com/p1neappleXpress/OpenFlux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
 
 // yandexCookiesFile is --yandex-cookies-file: a Netscape cookies.txt with
@@ -31,7 +31,12 @@ func newVolgaTransport(docURL string, cfg transport.TransportConfig) (transport.
 // It is the single place that knows every transport package. main.go passes
 // it into manager.New, and manager calls it whenever the peer asks the exit
 // to bring up an additional transport at runtime.
-func transportFactory(baseCfg transport.TransportConfig) manager.Factory {
+//
+// isExit is this process's role: a cupsonline client must never create
+// rooms of its own. (It used to be built as an exit everywhere, so a
+// Session client with no or dead rooms created four new ones and waited in
+// them, where the exit never came.)
+func transportFactory(baseCfg transport.TransportConfig, isExit bool) manager.Factory {
 	return func(cfg *control.TransportConfig) (transport.Transport, error) {
 		if cfg == nil {
 			return nil, fmt.Errorf("factory: nil config")
@@ -46,7 +51,7 @@ func transportFactory(baseCfg transport.TransportConfig) manager.Factory {
 		case "mailru":
 			return mailru.NewMailruDocsTransport(cfg.URL, baseCfg), nil
 		case "cupsonline":
-			return cupsonline.NewCupsonlineTransport(cfg.URL, baseCfg, false), nil
+			return cupsonline.NewCupsonlineTransport(cfg.URL, baseCfg, !isExit), nil
 		case "oneme":
 			token, _ := cfg.Params["token"].(string)
 			uidStr, _ := cfg.Params["uid"].(string)

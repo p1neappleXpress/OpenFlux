@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport"
 )
 
 func startProxy(t *testing.T, dial func(string) (net.Conn, error)) *url.URL {

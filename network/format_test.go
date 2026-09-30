@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // udpPacket is a 29-byte IPv4/UDP packet 10.10.10.2:53000 -> 8.8.8.8:53

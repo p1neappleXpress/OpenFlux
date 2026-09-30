@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
 
 // pipe is an in-process carrier: whatever one end sends, the other receives.

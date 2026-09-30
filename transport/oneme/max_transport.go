@@ -1,8 +1,8 @@
 package oneme
 
 import (
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 type OneMeTransport struct {
@@ -48,6 +48,7 @@ func (t *OneMeTransport) Start() error {
 
 	utils.Debugf("configured dc inbound")
 	t.ch.dcInbound = func(data []byte) {
+		t.b.RecordReceive(len(data))
 		t.b.CallReceive(data)
 	}
 
@@ -64,5 +65,6 @@ func (t *OneMeTransport) IsConnected() bool {
 
 func (t *OneMeTransport) Send(data []byte) error {
 	t.ch.Send(data)
+	t.b.RecordSend(len(data))
 	return nil
 }

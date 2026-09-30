@@ -1,0 +1,89 @@
+name: Node install
+
+# deploy/node-install.sh on the distributions a VDS runs: the wizard's whole
+# path over SSH (provision.TestInstallOnVDS) in a systemd container per
+# image - plan, apply with a sudo password, the updater (update, rollback
+# from a crashing core, skip), remove, list and uninstall.
+on:
+  push:
+    branches: [main]
+    paths:
+      - deploy/**
+      - provision/**
+      - .github/workflows/node-install.yml
+  pull_request:
+    paths:
+      - deploy/**
+      - provision/**
+      - .github/workflows/node-install.yml
+  workflow_dispatch:
+
+jobs:
+  vds:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - ubuntu:22.04
+          - ubuntu:20.04
+          - debian:13
+          - debian:12
+          - rockylinux/rockylinux:9
+          - almalinux:8
+          - fedora:42
+          - archlinux:latest
+          - opensuse/leap:15.6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build the node core
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -tags exitnode \
+            -ldflags="-s -w -buildid=" -o "$RUNNER_TEMP/core" .
+          echo "CORE_SHA=$(sha256sum "$RUNNER_TEMP/core" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Start the VDS
+        run: |
+          sh deploy/test/vds-dockerfile.sh "${{ matrix.image }}" > "$RUNNER_TEMP/Dockerfile"
+          docker build -q -t vds -f "$RUNNER_TEMP/Dockerfile" "$RUNNER_TEMP"
+          docker run -d --name vds --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock vds
+          for i in $(seq 1 60); do
+            state=$(docker exec vds systemctl is-system-running 2>/dev/null || true)
+            case "$state" in running|degraded) break ;; esac
+            sleep 1
+          done
+          echo "systemd: $state"
+          docker exec vds sh -c 'systemctl --version | head -n 1; cat /etc/os-release | grep PRETTY'
+          docker exec vds sh -c 'systemctl is-active sshd 2>/dev/null || systemctl is-active ssh'
+          # The core the test expects already installed (see TestInstallOnVDS).
+          docker exec vds mkdir -p /opt/openflux-node/bin
+          docker cp "$RUNNER_TEMP/core" vds:/opt/openflux-node/bin/openflux-node-v1.0.1
+          docker exec vds sh -c 'chmod 0755 /opt/openflux-node /opt/openflux-node/bin /opt/openflux-node/bin/openflux-node-v1.0.1 && ln -sfn openflux-node-v1.0.1 /opt/openflux-node/bin/openflux'
+          cp "$RUNNER_TEMP/core" core.bin
+
+      - name: TestInstallOnVDS
+        run: |
+          go_version=$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' go.mod)
+          docker run --rm --network container:vds -v "$PWD:/src" -w /src \
+            -e OPENFLUX_TEST_SSH=127.0.0.1:22 \
+            -e OPENFLUX_TEST_ROOT_PASSWORD=rootpass \
+            -e OPENFLUX_TEST_USER=deploy:deploypass \
+            -e OPENFLUX_TEST_CORE_SHA="$CORE_SHA" \
+            -e OPENFLUX_TEST_CORE_FILE=/src/core.bin \
+            -e OPENFLUX_TEST_DOC=https://docs.yandex.ru/edit/d/AbCdEfGhIjKlMnOpQrSt \
+            "golang:$go_version" go test ./provision -run TestInstallOnVDS -count=1 -v -timeout 20m
+
+      - name: VDS logs
+        if: failure()
+        run: |
+          docker exec vds sh -c 'journalctl --no-pager -n 200 -u "openflux-node*" ; systemctl list-units --all "openflux*" --no-pager' || true
+          docker exec vds sh -c 'journalctl --no-pager -n 60 -u sshd -u ssh; ls -l /etc/pam.d' || true
+          docker exec vds sh -c 'sshd -T | grep -Ei "^(permitrootlogin|passwordauthentication|usepam|kbdinteractive|authenticationmethods)"; head -n 5 /etc/ssh/sshd_config; ls -la /etc/ssh/sshd_config.d; cut -c1-16 /etc/shadow | grep -E "^(root|deploy):"; ls -l /etc/shadow; grep -E "^Cap(Eff|Bnd)" /proc/$(pgrep -o sshd)/status; ls -l /usr/sbin/unix_chkpwd /sbin/unix_chkpwd; cat /etc/pam.d/sshd /etc/pam.d/password-auth; authselect current' || true

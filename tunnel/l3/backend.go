@@ -31,6 +31,27 @@ func SetLocalIP(value string) error {
 	return nil
 }
 
+// egressIPv4 is the --local-ip override, else the address the default route
+// leaves from.
+func egressIPv4() ([4]byte, error) {
+	localIPMu.Lock()
+	egress, ok := localIPOverride, hasLocalIPOverride
+	localIPMu.Unlock()
+	if ok {
+		return egress, nil
+	}
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return [4]byte{}, fmt.Errorf("l3: detect egress: %w", err)
+	}
+	defer conn.Close()
+	ip := conn.LocalAddr().(*net.UDPAddr).IP.To4()
+	if ip == nil {
+		return [4]byte{}, fmt.Errorf("l3: no IPv4 egress address")
+	}
+	return [4]byte(ip), nil
+}
+
 // L3Backend is the platform-specific raw IPv4 I/O.
 //
 // Implementations must deliver only packets addressed to EgressIP().

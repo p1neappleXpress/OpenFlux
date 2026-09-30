@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport"
 )
 
 func writeCookieFile(t *testing.T, contents string) string {

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"syscall"
 
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 type rawBackend struct {
@@ -23,16 +23,9 @@ type rawBackend struct {
 }
 
 func newBackend() (L3Backend, error) {
-	localIPMu.Lock()
-	egress := localIPOverride
-	hasOverride := hasLocalIPOverride
-	localIPMu.Unlock()
-	if !hasOverride {
-		var err error
-		egress, err = detectEgressIPv4()
-		if err != nil {
-			return nil, err
-		}
+	egress, err := egressIPv4()
+	if err != nil {
+		return nil, err
 	}
 
 	sendFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
@@ -188,19 +181,4 @@ func (b *rawBackend) Close() error {
 		}
 	})
 	return nil
-}
-
-func detectEgressIPv4() ([4]byte, error) {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return [4]byte{}, fmt.Errorf("l3: detect egress: %w", err)
-	}
-	defer conn.Close()
-	ip := conn.LocalAddr().(*net.UDPAddr).IP.To4()
-	if ip == nil {
-		return [4]byte{}, fmt.Errorf("l3: no IPv4 egress address")
-	}
-	var out [4]byte
-	copy(out[:], ip)
-	return out, nil
 }

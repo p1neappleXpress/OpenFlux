@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
 
 // fakeNotifierTransport implements transport.ErrorNotifier and lets the test

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"runtime"
 
-	"openflux/transport"
-	"openflux/tunnel/l3"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel/l3"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 type ExitNode interface {

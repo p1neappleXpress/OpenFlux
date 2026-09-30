@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // SocketWatcher watches the process's own outbound TCP connections and

@@ -5,9 +5,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/network"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/network"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 const clientIP = "10.10.10.2"

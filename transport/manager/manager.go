@@ -10,12 +10,14 @@ package manager
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/control"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // Factory builds a raw transport from a control.TransportConfig.
@@ -34,6 +36,7 @@ type CookieProvider interface {
 type Entry struct {
 	Name     string
 	Type     string
+	URL      string // document URL, "" when the carrier has none
 	Priority int
 	Raw      transport.Transport
 	Provider CookieProvider // nil if the transport does not carry cookies
@@ -118,6 +121,16 @@ func (m *Manager) Add(name, typ string, raw transport.Transport, priority int, p
 		})
 	}
 	return nil
+}
+
+// SetURL records the document URL of an attached transport, which cookie
+// messages carry so the peer can match carriers it names differently.
+func (m *Manager) SetURL(name, url string) {
+	m.mu.Lock()
+	if e, ok := m.entries[name]; ok {
+		e.URL = url
+	}
+	m.mu.Unlock()
 }
 
 // Remove detaches a transport from the Session and stops it.
@@ -299,19 +312,63 @@ func shareableCookies(jar map[string]string) map[string]string {
 	return out
 }
 
-// cookieTransport resolves the transport a cookie message refers to: the
-// named one, or for peers that predate named messages, the
-// highest-priority transport that carries cookies.
-func (m *Manager) cookieTransport(name string) string {
+// cookieTransport resolves the transport a cookie message refers to. The
+// two sides do not always name carriers alike (the apps name them after the
+// type, "mailru", "mailru-2"; a .conf or a panel names sections freely), so
+// after the name itself it tries the document URL the message carries,
+// then the type the name starts with when this side has one carrier of it.
+// Peers that predate named messages mean the highest-priority transport
+// that carries cookies.
+func (m *Manager) cookieTransport(name, doc string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if name != "" {
+	if name == "" {
+		for _, n := range m.order {
+			if m.entries[n].Provider != nil {
+				return n
+			}
+		}
+		return ""
+	}
+	if _, ok := m.entries[name]; ok {
 		return name
 	}
-	for _, n := range m.order {
-		if m.entries[n].Provider != nil {
-			return n
+	if doc != "" {
+		for _, n := range m.order {
+			if m.entries[n].URL == doc {
+				utils.Debugf("[MANAGER] peer's carrier %q is this side's %q (same document)", name, n)
+				return n
+			}
 		}
+	}
+	typ := name
+	if i := strings.LastIndex(name, "-"); i > 0 {
+		if _, err := strconv.Atoi(name[i+1:]); err == nil {
+			typ = name[:i]
+		}
+	}
+	var match []string
+	for _, n := range m.order {
+		if m.entries[n].Type == typ {
+			match = append(match, n)
+		}
+	}
+	if len(match) == 1 {
+		utils.Debugf("[MANAGER] peer's carrier %q is this side's %q (only %s)", name, match[0], typ)
+		return match[0]
+	}
+	if utils.Throttled("manager.name."+name, time.Minute) {
+		utils.Infof("[MANAGER] the peer refers to carrier %q, which this side cannot match (carriers: %v): the two configs name carriers differently", name, m.order)
+	}
+	return ""
+}
+
+// entryURL is the document URL of an attached transport.
+func (m *Manager) entryURL(name string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if e, ok := m.entries[name]; ok {
+		return e.URL
 	}
 	return ""
 }
@@ -324,7 +381,7 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		utils.Debugf("[MANAGER] bad cookies payload: %v", err)
 		return
 	}
-	name := m.cookieTransport(cp.Transport)
+	name := m.cookieTransport(cp.Transport, cp.Doc)
 	if name == "" {
 		return
 	}
@@ -339,7 +396,7 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 			return
 		}
 		jar = shareableCookies(jar)
-		body, _ := (&control.CookiesPayload{Transport: name, Jar: jar, Reason: "requested"}).Encode()
+		body, _ := (&control.CookiesPayload{Transport: name, Doc: m.entryURL(name), Jar: jar, Reason: "requested"}).Encode()
 		_ = m.SendControl(control.SubtypeCookiesResponse, body)
 	case control.SubtypeCookiesResponse, control.SubtypeCookiesOffer:
 		if len(cp.Jar) == 0 {
@@ -394,8 +451,12 @@ func (m *Manager) DispatchControl(sub control.Subtype, payload []byte) {
 			return
 		}
 		// The exit's side of that transport is stuck: stop routing through
-		// it here as well, the cookies that unstick it included.
-		m.session.MarkStalled(req.Transport)
+		// it here as well, the cookies that unstick it included. The report
+		// keeps the exit's name: the cookies go back under it.
+		if local := m.cookieTransport(req.Transport, req.Doc); local != "" {
+			m.session.MarkStalled(local)
+		}
+		utils.Infof("[MANAGER] the exit's carrier %q needs a check in a browser (%s): %s", req.Transport, req.Reason, req.URL)
 		m.mu.RLock()
 		cb := m.remoteAuth
 		m.mu.RUnlock()
@@ -552,7 +613,7 @@ func (m *Manager) forwardAuth(name, url, reason string) {
 	m.authSent[name] = now
 	m.mu.Unlock()
 
-	body, _ := (&control.AuthRequiredPayload{Transport: name, URL: url, Reason: reason}).Encode()
+	body, _ := (&control.AuthRequiredPayload{Transport: name, URL: url, Reason: reason, Doc: m.entryURL(name)}).Encode()
 	if err := m.SendControl(control.SubtypeAuthRequired, body); err != nil {
 		// No client yet: let the transport's next report try again.
 		utils.Debugf("[MANAGER] forward AuthRequired (%s): %v", name, err)

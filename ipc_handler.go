@@ -1,9 +1,10 @@
 package main
 
 import (
-	"openflux/transport/ipc"
-	"openflux/transport/manager"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/ipc"
+	"github.com/p1neappleXpress/OpenFlux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // coreIPCHandler is the app-facing side of the IPC bridge.
@@ -13,6 +14,9 @@ import (
 // manager calls SetCaptchaNotifier, whose callback fires into IPC.
 type coreIPCHandler struct {
 	manager *manager.Manager
+	// exchanger takes the cookies on the classic path without a Session
+	// (manager nil). Nil when that carrier keeps no cookies.
+	exchanger transport.CookieExchanger
 }
 
 func (h *coreIPCHandler) OnConnect()    { utils.Debugf("[IPC] app connected") }
@@ -26,6 +30,18 @@ func (h *coreIPCHandler) OnCommand(p *ipc.CommandPayload) {
 func (h *coreIPCHandler) OnCookies(p *ipc.CookiesOfferPayload) {
 	if p == nil || p.Transport == "" || len(p.Jar) == 0 {
 		utils.Debugf("[IPC] empty cookies offer, ignoring")
+		return
+	}
+	if h.manager == nil {
+		if h.exchanger == nil || p.Remote {
+			utils.Debugf("[IPC] cookies for %q: nothing on this path takes them", p.Transport)
+			return
+		}
+		if err := h.exchanger.ApplyCookies(p.Jar); err != nil {
+			utils.Debugf("[IPC] apply cookies for %q: %v", p.Transport, err)
+			return
+		}
+		utils.Debugf("[IPC] applied %d cookies for %q", len(p.Jar), p.Transport)
 		return
 	}
 	if p.Remote {

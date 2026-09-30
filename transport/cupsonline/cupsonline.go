@@ -20,9 +20,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/netbind"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // baseRoomURL is where the rooms live. It's a variable only so tests can aim
@@ -403,9 +403,9 @@ func createRooms(ctx context.Context, baseURL string, n int, pause time.Duration
 	if delay <= 0 {
 		delay = 150 * time.Millisecond
 	}
+	var lastErr error
 	for i := 0; i < n; i++ {
 		var a *cupsAuth
-		var lastErr error
 		for attempt := 0; attempt < 6; attempt++ {
 			a, lastErr = authorize(ctx, baseURL, nil)
 			if lastErr == nil {
@@ -423,7 +423,7 @@ func createRooms(ctx context.Context, baseURL string, n int, pause time.Duration
 			}
 			utils.Debugf("[CUPS] room %d attempt %d failed: %v (wait %v)", i+1, attempt+1, lastErr, wait)
 			if !sleepCtx(ctx, wait) {
-				return nil, errStopped
+				return nil, fmt.Errorf("%w (%v)", errStopped, lastErr)
 			}
 		}
 		if a == nil {
@@ -437,9 +437,46 @@ func createRooms(ctx context.Context, baseURL string, n int, pause time.Duration
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("could not create any room")
+		return nil, fmt.Errorf("could not create any room: %v", lastErr)
 	}
 	return out, nil
+}
+
+// CreateRoomList creates new rooms, as an exit started without a room list
+// does, and returns their packed list for --url. The "Своя нода" wizard
+// creates them from the app so the node starts with the list in its config
+// and keeps the same rooms, and the same link, across restarts.
+func CreateRoomList(ctx context.Context) (string, error) {
+	cfg := DefaultCupsonlineConfig()
+	auths, err := createRooms(ctx, baseRoomURL, cfg.NumRooms, cfg.RoomCreatePause)
+	if err != nil {
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
+			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
+		}
+		return "", err
+	}
+	ids := make([]string, len(auths))
+	for i, a := range auths {
+		ids[i] = a.roomUUID
+	}
+	return packRooms(ids), nil
+}
+
+// CreateRoom creates one room and returns its uuid: what a phpbox exit, which
+// joins exactly one room, needs.
+func CreateRoom(ctx context.Context) (string, error) {
+	cfg := DefaultCupsonlineConfig()
+	auths, err := createRooms(ctx, baseRoomURL, 1, cfg.RoomCreatePause)
+	if err != nil {
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
+			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
+		}
+		return "", err
+	}
+	if len(auths) == 0 {
+		return "", errors.New("cups.online не создал комнату")
+	}
+	return auths[0].roomUUID, nil
 }
 
 func packRooms(ids []string) string {
@@ -1076,6 +1113,12 @@ type CupsonlineTransport struct {
 	isClient  bool
 	clientErr error
 
+	// roomList is the packed list of the rooms this transport keeps
+	// channels to, as clients need it in --url; "" until Start got them.
+	roomsMu    sync.Mutex
+	roomList   string
+	onRoomList func(packed string)
+
 	// ctx ends with Stop and takes every room's goroutines down with it.
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1191,6 +1234,7 @@ func (t *CupsonlineTransport) enterRooms() ([]roomSlot, error) {
 		// retried. Dropping them left the peer's traffic in those rooms with
 		// nobody listening.
 		if joined > 0 {
+			t.setRoomList(t.roomIDs)
 			return slots, nil
 		}
 		switch {
@@ -1223,7 +1267,37 @@ func (t *CupsonlineTransport) enterRooms() ([]roomSlot, error) {
 	fmt.Printf("%s\n", packRooms(ids))
 	fmt.Printf("===========================\n")
 	fmt.Printf("Save it and pass it back as --url to reuse these rooms after a restart.\n\n")
+	t.setRoomList(ids)
 	return slots, nil
+}
+
+// RoomList is the packed list of the rooms this transport keeps channels
+// to, the --url a client needs: the rooms an exit created, or re-joined from
+// its own --url. "" until Start has entered or created them.
+func (t *CupsonlineTransport) RoomList() string {
+	t.roomsMu.Lock()
+	defer t.roomsMu.Unlock()
+	return t.roomList
+}
+
+// OnRoomList calls f with the new list whenever RoomList changes, e.g. when
+// a start that failed is retried and creates the rooms after all.
+func (t *CupsonlineTransport) OnRoomList(f func(packed string)) {
+	t.roomsMu.Lock()
+	t.onRoomList = f
+	t.roomsMu.Unlock()
+}
+
+func (t *CupsonlineTransport) setRoomList(ids []string) {
+	packed := packRooms(ids)
+	t.roomsMu.Lock()
+	changed := packed != t.roomList
+	t.roomList = packed
+	f := t.onRoomList
+	t.roomsMu.Unlock()
+	if changed && f != nil {
+		f(packed)
+	}
 }
 
 // joinListed enters all the listed rooms at once rather than one by one: on

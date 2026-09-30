@@ -113,3 +113,58 @@ func deflated(t *testing.T, raw []byte) string {
 	_ = w.Close()
 	return base64.RawURLEncoding.EncodeToString(buf.Bytes())
 }
+
+// Links reach Decode after copying, chats and other encoders; every client
+// must read them the same way.
+func TestDecodeTolerant(t *testing.T) {
+	c := Config{Name: "tt", Secret: "0123456789abcdef0123", Context: "https://cloud.mail.ru/public/AbCd/EfGh",
+		Transports: []Transport{{Type: "mailru", URL: "https://cloud.mail.ru/public/AbCd/EfGh"}}}
+	var link string
+	for {
+		l, err := Encode(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(strings.TrimPrefix(l, Prefix))%4 != 0 {
+			link = l
+			break
+		}
+		c.Name += "x"
+	}
+	body := strings.TrimPrefix(link, Prefix)
+	raw, err := base64.RawURLEncoding.DecodeString(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	variants := map[string]string{
+		"padded":       Prefix + base64.URLEncoding.EncodeToString(raw),
+		"wrapped":      link[:40] + "\n" + link[40:80] + "\r\n  " + link[80:],
+		"std alphabet": Prefix + base64.RawStdEncoding.EncodeToString(raw),
+		"nbsp":         link[:50] + " " + link[50:],
+	}
+	for name, v := range variants {
+		got, err := Decode(v)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if got.Name != c.Name {
+			t.Errorf("%s: name %q", name, got.Name)
+		}
+	}
+	if _, err := Decode(strings.ToUpper(link)); err == nil || !strings.Contains(err.Error(), "case") {
+		t.Errorf("upper-cased link: %v", err)
+	}
+}
+
+// The secret is counted in characters as Kotlin counts them, not bytes.
+func TestSecretCountedInCharacters(t *testing.T) {
+	c := Config{Secret: "ключключкл", Transports: []Transport{{Type: "mailru", URL: "https://cloud.mail.ru/public/a/b"}}}
+	if err := c.Validate(); err == nil {
+		t.Fatal("10 Cyrillic letters (20 bytes) accepted as a 16-character secret")
+	}
+	c.Secret = "ключключключключ"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("16 Cyrillic letters: %v", err)
+	}
+}

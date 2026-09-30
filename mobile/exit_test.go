@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
-	"openflux/tunnel"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
 )
 
 // The phone as an l4 exit: a CLI-style Session client reaches it over

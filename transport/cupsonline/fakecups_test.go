@@ -2,6 +2,7 @@ package cupsonline
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport"
 )
 
 // fakeCups stands in for cups.online: room pages, subscription tokens and a
@@ -838,5 +839,52 @@ func TestPickRoomSpreadsAndSkipsDown(t *testing.T) {
 	}
 	if tr.pickRoom() != nil {
 		t.Fatal("no room up: pickRoom must return nil")
+	}
+}
+
+// Rooms the wizard creates from the app are the exit's from its first start:
+// it joins them instead of making its own, and a client with the same list
+// reaches it.
+func TestCreateRoomListIsWhatTheExitJoins(t *testing.T) {
+	f := newFakeCups(t)
+	list, err := CreateRoomList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := unpackRooms(list)
+	if err != nil || len(ids) != DefaultCupsonlineConfig().NumRooms {
+		t.Fatalf("room list %q: %v %v", list, ids, err)
+	}
+	created := f.roomsCreated()
+
+	cfg := fastConfig()
+	exit := mustStart(t, list, false, cfg)
+	client := mustStart(t, list, true, cfg)
+	waitFor(t, 5*time.Second, "all channels up", func() bool {
+		return allConnected(exit) && allConnected(client)
+	})
+	if n := f.roomsCreated() - created; n != 0 {
+		t.Fatalf("the exit made %d rooms of its own", n)
+	}
+	if got := exit.RoomList(); got != list {
+		t.Fatalf("exit room list %q, want %q", got, list)
+	}
+	deliver(t, client, exit, []byte("up"), 2*time.Second)
+	deliver(t, exit, client, []byte("down"), 2*time.Second)
+}
+
+// cups.online turning an address away must reach the wizard as that, not
+// as a stopped transport.
+func TestCreateRoomListReportsRefusal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }))
+	defer srv.Close()
+	old := baseRoomURL
+	baseRoomURL = srv.URL + "/live-coding/"
+	defer func() { baseRoomURL = old }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := CreateRoomList(ctx)
+	if err == nil || !strings.Contains(err.Error(), "ограничение") {
+		t.Fatalf("got %v", err)
 	}
 }

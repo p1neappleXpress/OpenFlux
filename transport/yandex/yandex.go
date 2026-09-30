@@ -19,9 +19,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/netbind"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // ErrCaptchaRequired signals that the transport hit a SmartCaptcha challenge
@@ -66,8 +66,14 @@ type DocSession struct {
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// A write into a half-open connection (NAT dropped it, the network
+	// changed) would otherwise block until the kernel gives up, minutes.
+	_ = s.Conn.SetWriteDeadline(time.Now().Add(docWriteTimeout))
 	return s.Conn.WriteMessage(messageType, data)
 }
+
+// docWriteTimeout bounds one WebSocket write to the document.
+const docWriteTimeout = 20 * time.Second
 
 type YandexDocsTransport struct {
 	*transport.BaseTransport
@@ -192,6 +198,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				return
 			}
 			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
+			if utils.Throttled("ydocs.fetch", time.Minute) {
+				utils.Infof("[YDOCS] cannot open the document: %v; retrying", err)
+			}
 			t.scheduleReconnect(attempt)
 			return
 		}
@@ -264,6 +273,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
+				if utils.Throttled("ydocs.drop", time.Minute) {
+					utils.Infof("[YDOCS] connection to the document dropped: %v; reconnecting", err)
+				}
 				t.SetConnected(false)
 				conn.Close()
 				// If the session was healthy for a while, treat the next
@@ -348,8 +360,11 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
-				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
+				utils.Debugf("[YDOCS] Keep-alive failed, closing the connection to reconnect: %v", err)
 				t.SetConnected(false)
+				// Close it so the reader, which may sit in ReadMessage on
+				// a half-open socket forever, errors out and reconnects.
+				_ = session.Conn.Close()
 			}
 		}
 	}

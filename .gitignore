@@ -60,3 +60,5 @@ watch_stats.sh
 *.log
 openflux
 *.bak
+core.bin
+phpbox_bundle/
