@@ -79,4 +79,15 @@ sleep 11
 st=$(curl -s "$base&a=status&$C"); g2=$(echo "$st" | js "d['state']['gen']")
 check "chain: nothing respawns after a stop" $([ "$g1" = "$g2" ] && [ "$(echo "$st" | js "d['running']")" = False ] && echo 1 || echo 0) "$g1 -> $g2"
 
+# ---- a successor writes nothing: its request is closed by the generation that started it, and on hosts where
+# ignore_user_abort does not hold, the first write to a closed connection would end it (the tunnel would not renew) ----
+S="url=succ1"
+body=$(curl -s -m 6 "$base&a=run&succ=1&from=0&chain=1&cap=30&$S")
+check "successor: the response body stays empty" $([ -z "$body" ] && echo 1 || echo 0) "$body"
+st=$(curl -s "$base&a=status&$S")
+check "successor: it is running" $([ "$(echo "$st" | js "d['running']")" = True ] && echo 1 || echo 0) "$st"
+lg=$(curl -s "$base&a=log&$S&since=0")
+check "successor: what the carrier said is still in the log" $(echo "$lg" | grep -q 'idle carrier joined succ1' && echo 1 || echo 0)
+curl -s "$base&a=stop&$S" >/dev/null; sleep 2.5
+
 echo; [ $fail = 0 ] && echo "NODE TEST PASS" || echo "NODE TEST FAIL"; exit $fail

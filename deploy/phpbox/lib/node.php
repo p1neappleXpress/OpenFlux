@@ -271,11 +271,16 @@ final class PhpboxNode
             . ' (phpbox ' . self::VERSION . ', php ' . PHP_VERSION . ')');
 
         // Whatever a carrier echoes is also a log line (and still goes to the response).
-        ob_start(function (string $buf) use ($log, $gen) {
+        // The response goes nowhere useful: a successor's request was closed by the generation that started it, and
+        // a person's tab or a proxy's 504 closes the first one. On hosts where ignore_user_abort does not hold, PHP
+        // stops the script at its next write to a closed connection - which silently ended every successor right
+        // after "joined". So a successor writes nothing, and a first run only its opening lines.
+        $quietAt = time() + 3;
+        ob_start(function (string $buf) use ($log, $succ, $quietAt) {
             foreach (preg_split('/\R/', $buf) as $l) {
                 if (trim($l) !== '') { $log->write('info', trim($l)); }
             }
-            return $buf;
+            return ($succ || time() > $quietAt) ? '' : $buf;
         }, 1);
 
         $ownMine = "$dir/$key.own.$gen";           // markers for streams while a successor is coming up
@@ -325,7 +330,7 @@ final class PhpboxNode
         // Handover bookkeeping (chain mode).
         $asSucc = $succ;                                 // the previous generation may still take the same OPENs
         $asPred = false;                                 // we spawned a successor that may take them too
-        $spawned = false; $lastSpawn = 0; $frozen = false; $endWhy = '';
+        $spawned = false; $lastSpawn = 0; $spawnTries = 0; $frozen = false; $endWhy = '';
         $predState = $succ ? new PhpboxState("$dir/$key.g$from.json") : null;
         $succState = new PhpboxState("$dir/$key." . 'g' . ($gen + 1) . '.json');
         if ($asSucc) { @mkdir($ownPrev, 0700, true); }
@@ -338,7 +343,7 @@ final class PhpboxNode
         };
 
         $mux->onTick = function (Mux $m) use (&$s, $state, $started, $dir, $key, $chain, $spawnAt, $target, $cap, $sensitive, $gen,
-                                              $log, &$asSucc, &$asPred, &$spawned, &$lastSpawn, &$frozen, &$endWhy,
+                                              $log, &$asSucc, &$asPred, &$spawned, &$lastSpawn, &$spawnTries, &$frozen, &$endWhy,
                                               $predState, $succState, $ownMine) {
             $s['beat'] = time();
             $s['elapsed'] = time() - $started;
@@ -361,7 +366,7 @@ final class PhpboxNode
                     $lastSpawn = time();
                     @mkdir($ownMine, 0700, true);
                     $asPred = true;                       // from now on new streams are claimed, not assumed
-                    if ($this->spawn($target, $gen, $cap, $sensitive, $log)) {
+                    if ($this->spawn($target, $gen, $cap, $sensitive, $log, $spawnTries++)) {
                         $spawned = true;
                         $log->write('info', "started gen " . ($gen + 1) . ' to take over');
                     } else {
@@ -396,13 +401,14 @@ final class PhpboxNode
     }
 
     /** Start the next generation: a request to our own host, which the host's bot check lets through. */
-    private function spawn(string $target, int $gen, int $cap, bool $sensitive, PhpboxLog $log): bool
+    private function spawn(string $target, int $gen, int $cap, bool $sensitive, PhpboxLog $log, int $attempt = 0): bool
     {
         $hostport = (string)($_SERVER['HTTP_HOST'] ?? '');
         if ($hostport === '') { return false; }
         [$h, $p] = array_pad(explode(':', $hostport, 2), 2, null);
         $tls = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
             || ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https' || ($_SERVER['SERVER_PORT'] ?? '') === '443';
+        if ($attempt % 2 === 1) { $tls = !$tls; }          // a retry tries the other scheme (hosts that redirect http to https)
         $port = (int)($p ?: ($tls ? 443 : 80));
         $path = (string)strtok((string)($_SERVER['REQUEST_URI'] ?? '/'), '?');
         $qs = http_build_query([
@@ -411,11 +417,25 @@ final class PhpboxNode
         ]);
         $fp = @fsockopen(($tls ? 'ssl://' : '') . $h, $port, $en, $es, 10);
         if (!$fp) {
-            $log->write('debug', "self-request failed: $en $es");
+            $log->write('warn', "self-request to " . ($tls ? 'https' : 'http') . "://$h:$port failed: $en $es");
             return false;
         }
         fwrite($fp, "GET $path?$qs HTTP/1.1\r\nHost: $hostport\r\nUser-Agent: phpbox-chain\r\nAccept: text/plain\r\nConnection: close\r\n\r\n");
-        fclose($fp);                                   // do not wait: the successor outlives this socket
+        // A running successor stays silent, so no answer is what success looks like. An answer within a moment is a
+        // redirect, the host's bot check or an error page - say so instead of waiting for a generation that never comes.
+        $r = [$fp]; $w = $e = null;
+        if (@stream_select($r, $w, $e, 0, 300000)) {
+            $head = (string)@fread($fp, 1024);
+            $line = strtok($head, "\r\n");
+            $ok = preg_match('#^HTTP/\S+ 200#', (string)$line) && stripos($head, 'slowAES') === false;
+            if (!$ok) {
+                $log->write('warn', 'self-request to ' . ($tls ? 'https' : 'http') . "://$h:$port was answered: "
+                    . ($line !== false && $line !== '' ? $line : 'nothing usable') . (stripos($head, 'slowAES') !== false ? ' (the host\'s browser check)' : ''));
+                fclose($fp);
+                return false;
+            }
+        }
+        fclose($fp);                                   // the successor outlives this socket and writes nothing to it
         return true;
     }
 

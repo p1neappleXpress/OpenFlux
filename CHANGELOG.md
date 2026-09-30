@@ -79,6 +79,15 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ### Fixed
 
+- phpbox chain mode did not renew on real hosts: the successor was started by a
+  request its predecessor closed at once, the node wrote its first lines (`joined
+  ...`) into that closed connection, and on hosts where `ignore_user_abort` does not
+  hold PHP ends the script at such a write, so every successor died right after
+  joining and the tunnel needed a manual restart at each cap. A successor now writes
+  nothing to its response (a first run only its opening lines); the request that
+  starts it also reads a quick answer (a redirect, the host's browser check, an
+  error page), logs it, and a retry tries the other of http/https.
+
 - Mail.ru transport dropped data under load: the server batches several
   cursor entries into one message, and only the first was read; a message
   that merely mentioned a peer's keep-alive was dropped whole. Every entry
