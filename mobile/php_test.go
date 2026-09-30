@@ -61,3 +61,15 @@ func TestStartStreamProxyRefusesWhatItCannotRun(t *testing.T) {
 		t.Error("a refused start left the proxy running")
 	}
 }
+
+func TestStartStreamPacketRefusesWhatItCannotRun(t *testing.T) {
+	if msg := StartStreamPacket("vyandex", "https://docs.yandex.ru/x"); msg == "" {
+		t.Error("yandex is not a carrier of the PHP exit")
+	}
+	if msg := StartStreamPacket("cupsonline", ""); msg == "" {
+		t.Error("no address must be refused")
+	}
+	if IsConnected() {
+		t.Error("a refused start left the packet tunnel up")
+	}
+}

@@ -67,6 +67,15 @@ All notable changes to the OpenFlux core. Format loosely follows
 - The node's page shows the link and QR code apps scan for that node (made by
   the core as a stream-mode `openflux://` link).
 
+- Stream mode as a full tunnel (`tunnel.StreamNet`): the device's IP packets
+  (utun/Wintun, Android VpnService, an iOS packet tunnel) go into a local
+  stack that opens one mux stream per TCP connection. DNS is answered on the
+  device with fake addresses (198.18.0.0/16) and the name is opened at the exit,
+  so nothing is resolved locally; TCP on ports 80/443 only, QUIC, other UDP
+  and IPv6 are dropped and apps fall back to TCP. It is a `transport.Transport`,
+  so every packet client runs on it unchanged: `--mode=stream --inbound=tun`,
+  `mobile.StartStreamPacket`, `OpenFluxStartStreamPacketTunnel`.
+
 ### Fixed
 
 - Mail.ru transport dropped data under load: the server batches several

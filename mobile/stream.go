@@ -7,6 +7,7 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/socks5"
 	"github.com/p1neappleXpress/OpenFlux/streamproxy"
 	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
@@ -68,4 +69,31 @@ func StartStreamProxy(transportType, url, listenAddr, username, password, bypass
 	proxy.mu.Unlock()
 	appendLog(fmt.Sprintf("[SUCCESS] SOCKS5-прокси слушает %s (режим без сервера)", listenAddr))
 	return ""
+}
+
+// StartStreamPacket is Start for the stream mode: the device's IP packets (the
+// Android VpnService's tun) go through Send, and Read returns the packets for
+// it, exactly as in the classic packet mode, so the VPN plumbing is unchanged.
+// Inside, a local stack terminates each TCP connection and opens a stream to
+// the same destination at the PHP exit; DNS is answered locally with fake
+// addresses and the name is opened at the exit. TCP on ports 80 and 443 only:
+// QUIC, other UDP and IPv6 are dropped, and browsers fall back to TCP. Returns
+// "" on success or a readable error, like Start.
+func StartStreamPacket(transportType, url string) string {
+	switch transportType {
+	case "cupsonline", "mailru":
+	default:
+		return fmt.Sprintf("Режим без сервера не работает через транспорт %q: нужен cups.online или Mail.ru", transportType)
+	}
+	if strings.TrimSpace(url) == "" {
+		return "Адрес ноды не указан"
+	}
+	return startPacket(func() (transport.Transport, error) {
+		appendLog("[ANDROID] Запуск туннеля в режиме без сервера (PHP-хостинг)")
+		carrier, err := newRawTransport(transportType, strings.TrimSpace(url), nil, transport.DefaultConfig(), false)
+		if err != nil {
+			return nil, err
+		}
+		return tunnel.NewStreamNet(carrier), nil
+	})
 }

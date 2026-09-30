@@ -545,6 +545,10 @@ DEPRECATED (removed in v2)
 		if *sensitive || *sensitiveAlias {
 			utils.SetSensitive(true)
 		}
+		if *inbound == inboundTUN {
+			runStreamTUN(*transportType, globalDocUrl)
+			return
+		}
 		runStreamClient(*transportType, globalDocUrl, *socksAddr, *httpProxyAddr, *ipcSocketPath)
 		return
 	}
@@ -1073,26 +1077,42 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 // app connection out as a mux stream to the phpbox exit. No gVisor, no IP
 // packets. The proxying itself is package streamproxy, shared with the
 // mobile bridges.
-func runStreamClient(transportType, url, socksAddr, httpProxyAddr, ipcSocket string) {
+// streamCarrier builds the carrier the stream mux rides.
+func streamCarrier(transportType, url string) phpbox.Carrier {
 	cfg := transport.DefaultConfig()
-	var carrier phpbox.Carrier
 	switch transportType {
 	case "cupsonline":
-		carrier = cupsonline.NewCupsonlineTransport(url, cfg, true)
+		return cupsonline.NewCupsonlineTransport(url, cfg, true)
 	case "yandex", "":
-		carrier = yandex.NewYandexDocsTransport(url, cfg)
+		return yandex.NewYandexDocsTransport(url, cfg)
 	case "vyandex":
 		t, err := newVolgaTransport(url, cfg)
 		if err != nil {
 			log.Fatalf("--mode=stream vyandex: %v", err)
 		}
-		carrier = t
+		return t
 	case "mailru":
-		carrier = mailru.NewMailruDocsTransport(url, cfg)
-	default:
-		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
+		return mailru.NewMailruDocsTransport(url, cfg)
 	}
+	log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
+	return nil
+}
 
+// runStreamTUN is the stream mode as a full tunnel (--inbound=tun): the
+// system's traffic goes into a local stack that opens one mux stream per TCP
+// connection (tunnel.StreamNet, which is a transport, so the utun/Wintun
+// client runs on it as it does on any other).
+func runStreamTUN(transportType, url string) {
+	sn := tunnel.NewStreamNet(streamCarrier(transportType, url))
+	if err := sn.Start(); err != nil {
+		log.Fatalf("--mode=stream: %v", err)
+	}
+	log.Printf("Running as CLIENT (stream mux over %s, full tunnel)", transportType)
+	runClientTUN(sn)
+}
+
+func runStreamClient(transportType, url, socksAddr, httpProxyAddr, ipcSocket string) {
+	carrier := streamCarrier(transportType, url)
 	p, err := streamproxy.Start(streamproxy.Options{Carrier: carrier, Socks: socksAddr, HTTP: httpProxyAddr, Label: transportType})
 	if err != nil {
 		log.Fatalf("--mode=stream: %v", err)

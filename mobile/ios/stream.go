@@ -36,6 +36,19 @@ func OpenFluxStartStreamClient(transportType, url, socksAddr *C.char) (rc C.int)
 	return startOK
 }
 
+// OpenFluxStartStreamPacketTunnel starts the packet tunnel in the stream mode:
+// the Network Extension's packets go into a local stack that opens a stream at
+// the PHP exit for each TCP connection (see mobile.StartStreamPacket). Returns
+// a start code.
+//
+//export OpenFluxStartStreamPacketTunnel
+func OpenFluxStartStreamPacketTunnel(transportType, url *C.char) (rc C.int) {
+	defer recoverStart(&rc, "OpenFluxStartStreamPacketTunnel")
+	typ := normalizeType(C.GoString(transportType))
+	value := C.GoString(url)
+	return startPacketTunnel(func() string { return mobile.StartStreamPacket(typ, value) })
+}
+
 // OpenFluxPhpCall runs one step of putting the PHP exit on a web host over FTP
 // ("probe", "deploy", "check", "start", "stop", "node", "newRoom", "link",
 // "remove"): paramsJSON is phphost.Params, the answer is JSON {"ok":true,
