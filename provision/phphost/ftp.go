@@ -222,7 +222,22 @@ func probe(s *session, t FTP) (*Probe, error) {
 			p.Dir, found = "", true // the login folder is served
 		}
 		if !found {
-			return p, fail(CodeNoWebRoot, strings.Join(dirs, ","), "phphost: cannot tell which folder the site is served from", nil)
+			// Other hosts keep the site a level or two down: domains/example.com/public_html,
+			// www/example.com, sites/example.com/htdocs. One such folder is taken as the answer;
+			// several are offered, with their paths, for the user to choose.
+			deeper := findDeeper(s, dirs)
+			p.Candidates = deeper
+			if len(deeper) == 1 {
+				p.Dir, found = deeper[0], true
+			}
+		}
+		if !found {
+			cands := p.Candidates
+			if len(cands) == 0 {
+				cands = dirs
+			}
+			p.Candidates = cands
+			return p, fail(CodeNoWebRoot, strings.Join(cands, ","), "phphost: cannot tell which folder the site is served from", nil)
 		}
 	}
 	// An earlier install: keep its token.
@@ -241,6 +256,48 @@ func probe(s *session, t FTP) (*Probe, error) {
 	_ = s.c.Delete(probeFile)
 	p.Writable = true
 	return p, nil
+}
+
+// findDeeper looks one and two levels below the login folder for folders that
+// look like a site's web root: top/x where x is a usual web root name, and
+// top/x/root for a top folder that holds several sites (domains, sites, www, ...).
+func findDeeper(s *session, top []string) []string {
+	isRoot := map[string]bool{}
+	for _, n := range webRootNames {
+		isRoot[n] = true
+	}
+	var found []string
+	limit := 0
+	for _, d := range top {
+		if limit++; limit > 16 || strings.HasPrefix(d, ".") {
+			continue
+		}
+		entries, err := s.c.List(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.Type != ftp.EntryTypeFolder || e.Name == "." || e.Name == ".." {
+				continue
+			}
+			if isRoot[e.Name] {
+				found = append(found, path.Join(d, e.Name))
+				continue
+			}
+			// a site folder (example.com) holding its own web root
+			sub, err := s.c.List(path.Join(d, e.Name))
+			if err != nil {
+				continue
+			}
+			for _, x := range sub {
+				if x.Type == ftp.EntryTypeFolder && isRoot[x.Name] {
+					found = append(found, path.Join(d, e.Name, x.Name))
+				}
+			}
+		}
+	}
+	sort.Strings(found)
+	return found
 }
 
 func join(dir, name string) string {

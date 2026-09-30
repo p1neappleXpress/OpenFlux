@@ -180,3 +180,42 @@ func TestRemoveDeletesOnlyWhatWasUploaded(t *testing.T) {
 		t.Error("the user's own file was touched")
 	}
 }
+
+// Other hosts keep the site deeper than the login folder.
+func TestProbeFindsAWebRootBelowTheLoginFolder(t *testing.T) {
+	// domains/example.com/public_html: one site, taken as the answer.
+	one := newFakeFTP(t, "u", "pw", "domains", "domains/example.com", "domains/example.com/public_html", "logs")
+	p, err := ProbeHost(ctx(t), one.target())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Dir != "domains/example.com/public_html" || !p.Writable {
+		t.Errorf("probe = %+v", p)
+	}
+	// It deploys there.
+	if _, err := Deploy(ctx(t), one.target(), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := one.files["/domains/example.com/public_html/config.php"]; !ok {
+		t.Error("the node was not uploaded into the site's folder")
+	}
+
+	// Two sites: the user chooses, and the choices carry the full paths.
+	two := newFakeFTP(t, "u", "pw", "domains", "domains/a.com", "domains/a.com/public_html", "domains/b.org", "domains/b.org/public_html")
+	_, err = ProbeHost(ctx(t), two.target())
+	var e *Error
+	if !errors.As(err, &e) || e.Code != CodeNoWebRoot || e.Param != "domains/a.com/public_html,domains/b.org/public_html" {
+		t.Fatalf("two sites: %v", err)
+	}
+	chosen := two.target()
+	chosen.Dir = "domains/b.org/public_html"
+	if p, err := ProbeHost(ctx(t), chosen); err != nil || p.Dir != "domains/b.org/public_html" || !p.Writable {
+		t.Errorf("chosen: %+v %v", p, err)
+	}
+
+	// www/<site>: a usual name one level down.
+	www := newFakeFTP(t, "u", "pw", "sites", "sites/shop", "sites/shop/www")
+	if p, err := ProbeHost(ctx(t), www.target()); err != nil || p.Dir != "sites/shop/www" {
+		t.Errorf("sites/shop/www: %+v %v", p, err)
+	}
+}

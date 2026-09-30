@@ -51,7 +51,8 @@ All notable changes to the OpenFlux core. Format loosely follows
   8 MB downloads run, and a 4 MB upload takes 33 s instead of timing out.
 
 - Own node without a server: `provision/phphost` puts the PHP exit on any web
-  host over FTP and checks that it runs. `probe` finds the web folder and
+  host over FTP and checks that it runs. `probe` finds the web folder (also
+  a level or two down: `domains/<site>/public_html`, `www/<site>`) and
   whether it is writable, `deploy` uploads the bundle embedded in the core
   (`deploy/phpbox`, with the link parser as WebAssembly), keeps the token of an
   earlier install and checks file sizes, `check` asks the site (passing the
