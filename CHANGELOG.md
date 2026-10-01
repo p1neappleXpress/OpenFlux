@@ -81,6 +81,17 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ### Fixed
 
+- The hosting install no longer fails when the host cuts a transfer short.
+  InfinityFree's Pure-FTPd aborted the 2 MB link parser part way through over a
+  TLS data channel (`451 Transfer aborted`), which failed the whole install;
+  the same files went up whole in plain FTP. Each file is now sent again (up to
+  four tries, reconnecting between them); with TLS `auto`, two failures over a
+  TLS data channel go on in plain FTP, as a host with no TLS would have, and the
+  reported security becomes `none`; the link parser is optional, so a host that
+  will not take it still gets a working node. `provision/phphost` also gained a
+  `page` call (the node's control-panel address, `auto=0` so opening it only
+  looks) and checks that a chosen token is 8–64 of `A–Z a–z 0–9 - _`.
+
 - The mode-without-a-server node now survives any host's limits and keeps the
   tunnel up across generations, found on a local emulation of a free host
   (Apache + PHP-FPM, a 60 s CPU cap, the host's disabled functions, a hidden
