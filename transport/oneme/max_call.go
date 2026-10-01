@@ -431,17 +431,23 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			h.dc = nil
 			h.mu.Unlock()
 
-			resp, _ := client.invoke(78, map[string]interface{}{
+			resp, err := client.invoke(78, map[string]interface{}{
 				"conversationId": genUUID(),
 				"calleeIds":      []int64{calleeID},
 				"internalParams": fmt.Sprintf(`{"deviceId":"%s","sdkVersion":"2.8.9","clientAppKey":"CNHIJPLGDIHBABABA","platform":"WEB","protocolVersion":5,"domainId":"","capabilities":"2A03F"}`, client.deviceID),
 				"isVideo":        false,
 			})
-			var payload map[string]interface{}
-			json.Unmarshal(resp.Payload, &payload)
-			paramsStr, _ := payload["internalCallerParams"].(string)
-			var params InternalCallerParams
-			json.Unmarshal([]byte(paramsStr), &params)
+			if err != nil {
+				logError("[CALLER] Start call error: %v, retrying...", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			params, err := parseCallerParams(resp.Payload)
+			if err != nil {
+				logError("[CALLER] Parse call params error: %v, retrying...", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
 
 			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
 			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
