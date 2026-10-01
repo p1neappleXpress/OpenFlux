@@ -173,6 +173,12 @@ type Probe struct {
 
 var tokenRe = regexp.MustCompile(`define\('PHPBOX_TOKEN',\s*'([0-9A-Za-z_-]+)'\)`)
 
+var tokenShape = regexp.MustCompile(`^[0-9A-Za-z_-]{8,64}$`)
+
+// TokenOK says whether a token someone chose can guard a node: it goes into config.php between quotes and into
+// every page address, so only letters, digits, '-' and '_', and long enough not to be guessed.
+func TokenOK(token string) bool { return tokenShape.MatchString(token) }
+
 // ProbeHost logs in, finds the web root and checks it can be written to.
 func ProbeHost(ctx context.Context, t FTP) (*Probe, error) {
 	s, err := dial(ctx, t)
@@ -366,6 +372,9 @@ func (c *countingReader) Read(p []byte) (int, error) {
 func Deploy(ctx context.Context, t FTP, token string, progress func(Progress)) (*Installed, error) {
 	if progress == nil {
 		progress = func(Progress) {}
+	}
+	if token != "" && !TokenOK(token) {
+		return nil, fail(CodeBadParams, "token", "phphost: a token is 8 to 64 of A-Z a-z 0-9 - _", nil)
 	}
 	progress(Progress{Phase: "connect"})
 	s, err := dial(ctx, t)

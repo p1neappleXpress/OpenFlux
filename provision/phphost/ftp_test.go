@@ -321,3 +321,19 @@ func TestProbeFindsAWebRootBelowTheLoginFolder(t *testing.T) {
 		t.Errorf("sites/shop/www: %+v %v", p, err)
 	}
 }
+
+func TestDeployTakesAChosenTokenOnlyOfASafeShape(t *testing.T) {
+	srv := newFakeFTP(t, "u", "pw", "htdocs")
+	for _, bad := range []string{"short", "has space in it", "quote'breaks-config", strings.Repeat("a", 65)} {
+		if _, err := Deploy(ctx(t), srv.target(), bad, nil); code(err) != CodeBadParams {
+			t.Errorf("token %q was taken: %v", bad, err)
+		}
+	}
+	if len(srv.files) != 0 {
+		t.Error("files were uploaded before the token was checked")
+	}
+	in, err := Deploy(ctx(t), srv.target(), "My-own_key-2026", nil)
+	if err != nil || in.Token != "My-own_key-2026" {
+		t.Fatalf("a good chosen token: %+v, %v", in, err)
+	}
+}
