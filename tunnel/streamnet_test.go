@@ -220,3 +220,31 @@ func TestFakeDNSMapping(t *testing.T) {
 		t.Error("the oldest name survived a full ring")
 	}
 }
+
+// DialStream reaches the exit beside the device's packets: what the app uses to
+// ask the exit its own IP in VPN mode, where the app is outside its own tunnel.
+func TestStreamNetDialStreamGoesThroughTheMuxNotTheDevice(t *testing.T) {
+	ex := &fakeExit{}
+	sn := NewStreamNetDialer(ex.dial)
+	// Not started yet: nothing to dial through.
+	if _, err := sn.DialStream(context.Background(), "api.ipify.org", 443); err == nil {
+		t.Fatal("DialStream before Start should fail")
+	}
+	if err := sn.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sn.Stop() })
+	c, err := sn.DialStream(context.Background(), "api.ipify.org", 443)
+	if err != nil {
+		t.Fatalf("DialStream: %v", err)
+	}
+	defer c.Close()
+	echoOnce(t, c, "GET / through the node")
+	if got := ex.last(); got.host != "api.ipify.org" || got.port != 443 {
+		t.Fatalf("exit dialed %+v, want api.ipify.org:443", got)
+	}
+	// The device's packet counters stay at zero: this did not go through the tun.
+	if sn.packetsTx.Load() != 0 || sn.packetsRx.Load() != 0 {
+		t.Fatalf("DialStream touched the device path: tx %d rx %d", sn.packetsTx.Load(), sn.packetsRx.Load())
+	}
+}

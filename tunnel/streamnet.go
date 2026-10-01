@@ -150,6 +150,17 @@ func (n *StreamNet) Send(data []byte) error {
 // Receive registers where the packets for the device go.
 func (n *StreamNet) Receive(cb func([]byte)) { n.recv.Store(&cb) }
 
+// DialStream opens one stream through the tunnel's mux to host:port, beside the
+// device's packet path rather than through it. The app is kept outside its own
+// VPN, so it cannot reach the internet to ask the exit its public IP; this lets
+// it ask through the same node the tunnel uses. Only while the tunnel is up.
+func (n *StreamNet) DialStream(ctx context.Context, host string, port int) (net.Conn, error) {
+	if !n.started.Load() || n.dial == nil {
+		return nil, fmt.Errorf("stream tunnel not started")
+	}
+	return n.dial(ctx, host, port)
+}
+
 // IsConnected reports whether the carrier has joined (a carrier that cannot say counts as joined).
 func (n *StreamNet) IsConnected() bool {
 	if !n.started.Load() {

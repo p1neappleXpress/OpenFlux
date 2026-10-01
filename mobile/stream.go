@@ -1,8 +1,14 @@
 package mobile
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/p1neappleXpress/OpenFlux/socks5"
 	"github.com/p1neappleXpress/OpenFlux/streamproxy"
@@ -96,4 +102,48 @@ func StartStreamPacket(transportType, url string) string {
 		}
 		return tunnel.NewStreamNet(carrier), nil
 	})
+}
+
+// StreamExitIP asks the exit its own public IP through the running stream tunnel
+// (the packet/VPN mode), so the app can show it where it otherwise could not:
+// in VPN mode the app is outside its own tunnel and cannot reach the internet to
+// ask. It opens one stream beside the device's packets, fetches api.ipify.org and
+// returns the IP; "" when no stream tunnel is running, or "error: ..." on failure.
+func StreamExitIP() string {
+	client.mu.Lock()
+	t := client.transport
+	client.mu.Unlock()
+	sn, ok := t.(interface {
+		DialStream(context.Context, string, int) (net.Conn, error)
+	})
+	if !ok {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	hc := &http.Client{
+		Timeout: 25 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				host, portStr, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				port, _ := strconv.Atoi(portStr)
+				return sn.DialStream(ctx, host, port)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org", nil)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	return strings.TrimSpace(string(body))
 }
