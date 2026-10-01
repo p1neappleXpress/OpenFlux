@@ -152,10 +152,16 @@ final class CupsCarrier implements PacedCarrier
             if ($line === '{}') { $this->ws->writeText('{}'); continue; }
             // The server sends every member's cursors to everyone, ours included: skip ours and the other generations'
             // before decoding - under a download that is most of what arrives, and decoding it cost CPU the host counts.
-            if (preg_match('/"user_uuid":"([0-9a-f-]{36})"/', $line, $um)
-                && ($um[1] === ($this->auth['userUUID'] ?? '') || isset($this->ignore[$um[1]]))) {
-                if ($um[1] === ($this->auth['userUUID'] ?? '')) { $this->echoed++; }   // the server took one of ours
-                continue;
+            // A plain substring test: no assumption about how the server spaces or escapes its JSON.
+            if (str_contains($line, 'cursors_update')) {
+                $own = (string)($this->auth['userUUID'] ?? '');
+                if ($own !== '' && str_contains($line, $own)) {
+                    $this->echoed++;             // ours, shown back: the server has taken it
+                    continue;
+                }
+                foreach ($this->ignore as $u => $_) {
+                    if (str_contains($line, $u)) { continue 2; }
+                }
             }
             $obj = json_decode($line, true);
             if (!is_array($obj)) { continue; }
@@ -227,7 +233,12 @@ final class CupsCarrier implements PacedCarrier
         $data = $obj['push']['pub']['data'] ?? null;
         if (!is_array($data) || ($data['type'] ?? '') !== 'cursors_update') { return null; }
         $p = $data['payload'] ?? null;
-        if (!is_array($p) || ($p['user_uuid'] ?? '') === ($this->auth['userUUID'] ?? '') || isset($this->ignore[$p['user_uuid'] ?? ''])) { return null; }
+        if (!is_array($p)) { return null; }
+        if (($p['user_uuid'] ?? '') === ($this->auth['userUUID'] ?? '')) {
+            $this->echoed++;                     // ours, shown back: the server has taken it
+            return null;
+        }
+        if (isset($this->ignore[$p['user_uuid'] ?? ''])) { return null; }
         $cur = $p['cursors'] ?? null;
         return is_array($cur) && $cur ? $cur : null;
     }

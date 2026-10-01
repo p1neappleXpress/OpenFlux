@@ -278,14 +278,28 @@ final class PhpboxBudget
                 $c = max(5.0, round($cpu * 0.9, 1));
                 if (empty($h['cpu']) || $c < $h['cpu']) { $h['cpu'] = $c; $said = "the host ends a request after about {$cpu}s of CPU"; }
             } elseif ($cpuB <= 0 || $cpu < 0.7 * $cpuB) {                 // not the CPU we knew of: a clock did it
-                if (empty($h['wall']) || $age < $h['wall']) { $h['wall'] = max(self::MIN_WALL, $age); $said = "the host ends a request after about {$age}s"; }
+                // Believed only when it happens twice at about the same age: one sudden end can be the host
+                // restarting, and a limit learned from that would shorten every run for a week.
+                $key = ($g['gen'] ?? 0) . '@' . ($g['started'] ?? 0);
+                $deaths = array_filter($h['deaths'] ?? [], fn($d) => time() - (int)$d['at'] < self::LEARN_TTL);
+                if (!in_array($key, array_column($deaths, 'id'), true)) {
+                    foreach ($deaths as $d) {
+                        if (abs((int)$d['age'] - $age) <= 15 && (empty($h['wall']) || min($age, (int)$d['age']) < $h['wall'])) {
+                            $h['wall'] = max(self::MIN_WALL, min($age, (int)$d['age']));
+                            $said = "the host ends a request after about {$h['wall']}s";
+                        }
+                    }
+                    $deaths[] = ['id' => $key, 'age' => $age, 'at' => time()];
+                    $h['deaths'] = array_slice(array_values($deaths), -6);
+                    $said = $said ?? '';
+                }
             }
         }
         if ($said !== null) {
             $h['at'] = time();
             @file_put_contents("$dir/host.json", json_encode($h));
         }
-        return $said;
+        return $said === '' ? null : $said;             // '' = a death noted, nothing believed yet
     }
 }
 

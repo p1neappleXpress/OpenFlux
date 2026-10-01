@@ -96,6 +96,13 @@ printf '{"carrier":"mailru","gen":1,"phase":"serving","started":%d,"beat":%d,"ca
 curl -s -m 4 "$base&a=run&chain=1&cap=240&$L" >/dev/null &
 sleep 2.5
 st=$(curl -s "$base&a=status&$L")
+check "learning: one sudden end teaches nothing (a host restart looks the same)" $([ "$(echo "$st" | js "d['state']['budget']['wall']")" = 240 ] && echo 1 || echo 0) "$st"
+curl -s "$base&a=stop&$L" >/dev/null; sleep 2.5; rm -f "$sd/$key.stop"
+now=$(date +%s)
+printf '{"carrier":"mailru","gen":2,"phase":"holding","started":%d,"beat":%d,"cap":240,"elapsed":55,"cpu":0.4,"budget":{"wall":240,"cpu":0}}' $((now-120)) $((now-65)) > "$sd/$key.g2.json"
+curl -s -m 4 "$base&a=run&chain=1&cap=240&$L" >/dev/null &
+sleep 2.5
+st=$(curl -s "$base&a=status&$L")
 check "learning: the next run plans below the age it died at" $([ "$(echo "$st" | js "d['state']['budget']['wall']")" = 40 ] && echo 1 || echo 0) "$st"
 check "learning: and hands over before it" $([ "$(echo "$st" | js "d['state']['spawn_at'] < 40")" = True ] && echo 1 || echo 0) "$st"
 lg=$(curl -s "$base&a=log&$L&since=0")
