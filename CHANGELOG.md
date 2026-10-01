@@ -5,6 +5,34 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The mode-without-a-server node now survives any host's limits and keeps the
+  tunnel up across generations, found on a local emulation of a free host
+  (Apache + PHP-FPM, a 60 s CPU cap, the host's disabled functions, a hidden
+  wall-clock kill):
+  - a disabled `set_time_limit` / `ignore_user_abort` / `getenv` / `getmypid`
+    ended the node at once under PHP 8 (calling a disabled function is a fatal
+    error); every such call is now guarded, and the installer's `ping` lists
+    what the host has taken away.
+  - a generation hands over to its successor early and consistently (about two
+    thirds of the known limit, never later than 45 s) instead of reaching for a
+    longer run: on a host whose real limit we have not seen, aiming high got a
+    generation killed before it had started a successor, and the chain broke.
+    A CPU or wall limit the node has actually hit lowers the handover further.
+  - a successor takes new streams only once its carrier link has stayed up a few
+    seconds (a Mail.ru document drops the first connections right after they
+    join, and streams handed over in that moment were lost); the client re-asks
+    an unanswered OPEN and the exit answers a repeated one without dialing twice.
+  - over cups.online the node no longer slept between messages inside its loop
+    (which stalled new connections under a download) and sends only as fast as
+    the server confirms, so the server does not drop the link; two generations
+    sharing one room no longer corrupt each other's data.
+  - the status page restarts a node that ended on its own while the page is open.
+- `--mode=stream` without `--inbound` is SOCKS5 again on every OS (0.3.0 took
+  the macOS client to utun, which needs root); the Desktop app names
+  `--inbound=socks5` for a proxy profile.
+
 ## [0.3.0] - 2026-10-01
 
 ### Added
