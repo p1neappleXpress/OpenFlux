@@ -60,6 +60,12 @@ func (s *Site) endpoint(q url.Values) (string, error) {
 	return u.String(), nil
 }
 
+// PageURL is the node's control panel for a person's browser: its status, log, Start/Stop and the generation
+// serving now. auto=0: opening it only looks; it does not start a node that is not running.
+func (s *Site) PageURL(target string) (string, error) {
+	return s.endpoint(url.Values{"url": {strings.TrimSpace(target)}, "auto": {"0"}})
+}
+
 // The browser check some free hosts (InfinityFree and other iFastNet sites) put in
 // front of every page: a script decrypts a value with AES-128-CBC and sets it as the
 // cookie "__test", then reloads with ?i=1. A browser does that unseen; so can we.

@@ -46,7 +46,8 @@ func RoomURL(uuid string) string { return "https://interview.cups.online/live-co
 //	check    does the site answer as a node, can the host run it -> Status
 //	start    run the node on Target (waits until it reports)      -> NodeState
 //	stop     end the node (the whole chain)
-//	node     is the node on Target running                        -> NodeState
+//	node     is the node on Target running, which generation       -> NodeState
+//	page     the node's control panel for a browser (auto=0)        -> {"url"}
 //	newRoom  make a cups.online room for the node and clients     -> {"room","url"}
 //	link     the openflux:// link clients scan for this node      -> share.Result
 func Call(ctx context.Context, method string, raw json.RawMessage, progress func(Progress)) Result {
@@ -111,6 +112,12 @@ func Call(ctx context.Context, method string, raw json.RawMessage, progress func
 			return Failed(err)
 		}
 		return Done(ns)
+	case "page":
+		u, err := site().PageURL(p.Target)
+		if err != nil {
+			return Failed(err)
+		}
+		return Done(map[string]string{"url": u})
 	case "newRoom":
 		packed, err := NewRoom(ctx)
 		if err != nil {

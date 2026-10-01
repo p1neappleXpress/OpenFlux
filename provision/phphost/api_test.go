@@ -153,3 +153,24 @@ func TestCallStartWaitsForTheNode(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+func TestCallPageIsTheNodesPanelThatOnlyLooks(t *testing.T) {
+	for _, c := range []struct{ carrier, file, target string }{
+		{"mailru", "/mailruexit.php", "https://cloud.mail.ru/public/Vuri/d5nuZ5aQp"},
+		{"cupsonline", "/cupsexit.php", "https://interview.cups.online/live-coding/?room=0a1b2c3d-1111-2222-3333-444455556666"},
+	} {
+		raw, _ := json.Marshal(map[string]string{"url": "https://site.example.org/", "token": "KEY1", "carrier": c.carrier, "target": c.target})
+		res := Call(context.Background(), "page", raw, nil)
+		if !res.OK {
+			t.Fatalf("%s: %+v", c.carrier, res)
+		}
+		u, err := url.Parse(res.Data.(map[string]string)["url"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := u.Query()
+		if u.Host != "site.example.org" || u.Path != c.file || q.Get("k") != "KEY1" || q.Get("url") != c.target || q.Get("auto") != "0" {
+			t.Errorf("%s: page = %s", c.carrier, u)
+		}
+	}
+}
