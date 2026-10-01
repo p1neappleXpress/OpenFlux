@@ -486,7 +486,10 @@ DEPRECATED (removed in v2)
 	}
 
 	// Platform defaults. The recommended client path is utun on macOS and
-	// SOCKS5 everywhere else (see README for details).
+	// SOCKS5 everywhere else (see README for details). Stream mode keeps
+	// SOCKS5 unless the full tunnel is asked for by name: it was a proxy
+	// first, and the apps' proxy profiles do not pass --inbound.
+	inboundChosen := *inbound != ""
 	if *inbound == "" {
 		if runtime.GOOS == "darwin" {
 			*inbound = inboundTUN
@@ -545,7 +548,7 @@ DEPRECATED (removed in v2)
 		if *sensitive || *sensitiveAlias {
 			utils.SetSensitive(true)
 		}
-		if *inbound == inboundTUN {
+		if *inbound == inboundTUN && inboundChosen {
 			runStreamTUN(*transportType, globalDocUrl)
 			return
 		}

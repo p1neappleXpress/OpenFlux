@@ -18,4 +18,4 @@ final class IdleCarrier implements Carrier
 }
 
 (new PhpboxNode('mailru', 'test', fn(array $g): string => (string)($g['url'] ?? ''),
-    fn(string $t) => new IdleCarrier($t), (int)(getenv('TEST_CAP') ?: 8)))->handle();
+    fn(string $t) => new IdleCarrier($t), (int)(PhpboxUtil::env('TEST_CAP') ?: 8)))->handle();

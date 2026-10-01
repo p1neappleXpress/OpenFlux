@@ -90,4 +90,32 @@ lg=$(curl -s "$base&a=log&$S&since=0")
 check "successor: what the carrier said is still in the log" $(echo "$lg" | grep -q 'idle carrier joined succ1' && echo 1 || echo 0)
 curl -s "$base&a=stop&$S" >/dev/null; sleep 2.5
 
+# ---- a host that died early teaches the next generations (host.json): they plan below what it lived ----
+L="url=learn1"; key=$(php -r 'echo substr(sha1("mailru|learn1"), 0, 12);'); sd="$tmp/phpbox-state"; now=$(date +%s)
+printf '{"carrier":"mailru","gen":1,"phase":"serving","started":%d,"beat":%d,"cap":240,"elapsed":50,"cpu":0.4,"budget":{"wall":240,"cpu":0}}' $((now-100)) $((now-50)) > "$sd/$key.g1.json"
+curl -s -m 4 "$base&a=run&chain=1&cap=240&$L" >/dev/null &
+sleep 2.5
+st=$(curl -s "$base&a=status&$L")
+check "learning: the next run plans below the age it died at" $([ "$(echo "$st" | js "d['state']['budget']['wall']")" = 40 ] && echo 1 || echo 0) "$st"
+check "learning: and hands over before it" $([ "$(echo "$st" | js "d['state']['spawn_at'] < 40")" = True ] && echo 1 || echo 0) "$st"
+lg=$(curl -s "$base&a=log&$L&since=0")
+check "learning: the log says what was learned" $(echo "$lg" | grep -q 'learned: the host ends a request after about 50s' && echo 1 || echo 0)
+check "learning: host.json holds it" $(grep -q '"wall":50' "$sd/host.json" && echo 1 || echo 0) "$(cat "$sd/host.json" 2>/dev/null)"
+curl -s "$base&a=stop&$L" >/dev/null; sleep 2.5
+
+# ---- a host that took the optional functions away (PHP 8: calling a disabled function is a fatal error) ----
+p2=$((port+1))
+(cd "$here" && php -d disable_functions=set_time_limit,ignore_user_abort,getmypid,getenv,ini_set,putenv,sleep -S 127.0.0.1:$p2 >/dev/null 2>&1 &); sleep 1
+b2="http://127.0.0.1:$p2/dummyexit.php?k=CHANGE-ME"     # getenv is gone too: the default token is what is left
+pg=$(curl -s "$b2&a=ping")
+check "disabled: ping names what the host took away" $(echo "$pg" | grep -q '"disabled":\["ignore_user_abort","set_time_limit","getmypid","getenv","ini_set"\]' && echo 1 || echo 0) "$pg"
+curl -s -m 4 "$b2&a=run&url=dis1" >/dev/null &
+sleep 2.5
+st=$(curl -s "$b2&a=status&url=dis1")
+check "disabled: the node still runs" $([ "$(echo "$st" | js "d['running']")" = True ] && echo 1 || echo 0) "$st"
+curl -s "$b2&a=stop&url=dis1" >/dev/null; sleep 2.5
+st=$(curl -s "$b2&a=status&url=dis1")
+check "disabled: and stops" $([ "$(echo "$st" | js "d['running']")" = False ] && echo 1 || echo 0) "$st"
+pkill -f "php -d disable_functions=.* -S 127.0.0.1:$p2" 2>/dev/null
+
 echo; [ $fail = 0 ] && echo "NODE TEST PASS" || echo "NODE TEST FAIL"; exit $fail

@@ -26,10 +26,11 @@ require_once __DIR__ . '/lib/node.php';
 const RUN_CAP       = 140;
 const SEND_INTERVAL = 0.018;   // s between cursor messages (cups throttles)
 const MAX_MSG_DATA  = 3000;    // payload bytes per cursor message
+const SEND_RATE     = 72000;   // data bytes per second (the server's ceiling is ~80 KB/s per member)
 const BYTES_PER_NUMBER = 6;
 
 // ===========================================================================
-final class CupsCarrier implements Carrier
+final class CupsCarrier implements PacedCarrier
 {
     private Mux $mux;
     private WsClient $ws;
@@ -37,6 +38,8 @@ final class CupsCarrier implements Carrier
     private string $cookieFile;
     private string $recvBuf = '';
     private float $lastSend = 0.0;
+    private array $ignore = [];
+    private string $lastDisconnect = '';          // user uuid => true: other generations of this node in the same room
 
     public function __construct(private string $roomURL)
     {
@@ -46,6 +49,36 @@ final class CupsCarrier implements Carrier
 
     public function setMux(Mux $m): void { $this->mux = $m; }
     public function sockets(): array { return $this->ws->sock ? [$this->ws->sock] : []; }
+
+    public function msgCap(): int { return MAX_MSG_DATA; }
+    /** cups.online forwards about 80 KB/s of data per member (the client's calibration); faster only queues up on the
+     * server until it drops the link, cutting every stream. A little under it. */
+    public function rate(): int { return SEND_RATE; }
+
+    /** Why the room link ended, for the node's log. */
+    public function why(): string
+    {
+        return trim($this->ws->closeInfo . ($this->lastDisconnect !== '' ? '; server said ' . $this->lastDisconnect : ''));
+    }
+    public function interval(): float { return SEND_INTERVAL; }
+
+    /** One cursor message holding whole packets; the mux keeps the pace, so nothing waits here. */
+    public function sendPackets(string $packets): void
+    {
+        $this->sendCursors(self::cursorsFromBytes(pack('n', strlen($packets)) . $packets));
+    }
+
+    /** Who this exit is in the room (its user uuid): the node tells the other generations to ignore it. */
+    public function member(): string { return (string)($this->auth['userUUID'] ?? ''); }
+
+    /**
+     * Messages from these room members are not for us: other generations of this node. Reading them would put their
+     * packets into the same reassembly buffer as the client's, and a client packet cut across messages would be broken.
+     */
+    public function ignoreUsers(array $uuids): void { $this->ignore = array_fill_keys(array_filter($uuids), true); }
+
+    /** Leave the room/document (a generation that has handed over and only stays up). */
+    public function close(): void { $this->ws->close(); }
 
     public function connect(): bool
     {
@@ -110,8 +143,17 @@ final class CupsCarrier implements Carrier
         foreach (explode("\n", trim($msg)) as $line) {
             if ($line === '') { continue; }
             if ($line === '{}') { $this->ws->writeText('{}'); continue; }
+            // The server sends every member's cursors to everyone, ours included: skip ours and the other generations'
+            // before decoding - under a download that is most of what arrives, and decoding it cost CPU the host counts.
+            if (preg_match('/"user_uuid":"([0-9a-f-]{36})"/', $line, $um)
+                && ($um[1] === ($this->auth['userUUID'] ?? '') || isset($this->ignore[$um[1]]))) {
+                continue;
+            }
             $obj = json_decode($line, true);
             if (!is_array($obj)) { continue; }
+            if (isset($obj['disconnect'])) {     // Centrifuge says why before it closes
+                $this->lastDisconnect = json_encode($obj['disconnect']);
+            }
             $cursors = $this->peerCursors($obj);
             if ($cursors === null) { continue; }
             $this->recvBuf .= $this->cursorsToChunk($cursors);
@@ -130,13 +172,18 @@ final class CupsCarrier implements Carrier
     {
         foreach ($this->frameToCursorMessages($frame) as $cur) {
             $this->pace();
-            $this->ws->writeText(json_encode([
-                'rpc' => ['method' => 'shared_editor_change_cursors',
-                    'data' => ['cursors' => $cur, 'ranges' => [],
-                        'room' => $this->auth['roomUUID'], 'user' => $this->auth['userUUID']]],
-                'id' => random_int(100, 1 << 20),
-            ]));
+            $this->sendCursors($cur);
         }
+    }
+
+    private function sendCursors(array $cur): void
+    {
+        $this->ws->writeText(json_encode([
+            'rpc' => ['method' => 'shared_editor_change_cursors',
+                'data' => ['cursors' => $cur, 'ranges' => [],
+                    'room' => $this->auth['roomUUID'], 'user' => $this->auth['userUUID']]],
+            'id' => random_int(100, 1 << 20),
+        ]));
     }
 
     /** frame -> packet framing (2-byte len) -> chunk framing per message -> cursors. */
@@ -172,7 +219,7 @@ final class CupsCarrier implements Carrier
         $data = $obj['push']['pub']['data'] ?? null;
         if (!is_array($data) || ($data['type'] ?? '') !== 'cursors_update') { return null; }
         $p = $data['payload'] ?? null;
-        if (!is_array($p) || ($p['user_uuid'] ?? '') === ($this->auth['userUUID'] ?? '')) { return null; }
+        if (!is_array($p) || ($p['user_uuid'] ?? '') === ($this->auth['userUUID'] ?? '') || isset($this->ignore[$p['user_uuid'] ?? ''])) { return null; }
         $cur = $p['cursors'] ?? null;
         return is_array($cur) && $cur ? $cur : null;
     }

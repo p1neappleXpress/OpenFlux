@@ -132,23 +132,40 @@ func (m *Mux) Dial(ctx context.Context, host string, port int) (net.Conn, error)
 		return nil, fmt.Errorf("phpbox: open %s:%d: %w", host, port, err)
 	}
 
-	select {
-	case res := <-st.openRes:
-		if res != "" {
-			utils.Debugf("[STREAM] stream %d: open %s:%d refused: %s", id, host, port, res)
+	// An OPEN or its answer can be lost: a carrier that reconnects (a Mail.ru document drops new connections
+	// right after they join) loses what was in flight. Ask again until the exit answers; an exit that already
+	// has the stream answers OPEN_OK again, and a second answer here is ignored.
+	retry := time.NewTicker(openRetry)
+	defer retry.Stop()
+	for {
+		select {
+		case res := <-st.openRes:
+			if res != "" {
+				utils.Debugf("[STREAM] stream %d: open %s:%d refused: %s", id, host, port, res)
+				m.dropStream(id)
+				return nil, fmt.Errorf("phpbox: open %s:%d: %s", host, port, res)
+			}
+			utils.Debugf("[STREAM] stream %d: open %s:%d", id, host, port)
+			return st, nil
+		case <-retry.C:
+			utils.Debugf("[STREAM] stream %d: no answer to OPEN %s:%d yet; asking again", id, host, port)
+			if err := m.sendFrame(Frame{Type: FrameOpen, StreamID: id, Payload: []byte(open)}); err != nil {
+				m.dropStream(id)
+				return nil, fmt.Errorf("phpbox: open %s:%d: %w", host, port, err)
+			}
+		case <-ctx.Done():
+			utils.Debugf("[STREAM] stream %d: dial %s:%d abandoned: %v", id, host, port, ctx.Err())
 			m.dropStream(id)
-			return nil, fmt.Errorf("phpbox: open %s:%d: %s", host, port, res)
+			return nil, ctx.Err()
+		case <-m.closed:
+			return nil, ErrSessionClosed
 		}
-		utils.Debugf("[STREAM] stream %d: open %s:%d", id, host, port)
-		return st, nil
-	case <-ctx.Done():
-		utils.Debugf("[STREAM] stream %d: dial %s:%d abandoned: %v", id, host, port, ctx.Err())
-		m.dropStream(id)
-		return nil, ctx.Err()
-	case <-m.closed:
-		return nil, ErrSessionClosed
 	}
 }
+
+// openRetry is how long Dial waits for OPEN_OK before sending the OPEN again.
+// The exit dials in at most a few seconds; longer means a frame was lost.
+var openRetry = 4 * time.Second
 
 // Close ends the mux and its carrier and shuts down every open stream.
 func (m *Mux) Close() error {

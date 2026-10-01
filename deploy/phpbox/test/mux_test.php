@@ -60,7 +60,7 @@ $mux->log = function ($l, $m) use (&$logs) { $logs[] = "$l $m"; };
 $mux->resolver = fn(string $h) => $h === 'multi.test' ? ['::1', '127.0.0.1'] : [$h];
 $big = random_bytes(2 * 1024 * 1024);
 $ok = true;
-$check = function (string $name, bool $pass) use (&$ok) { printf("%-46s %s\n", $name, $pass ? 'OK' : 'FAIL'); $ok = $ok && $pass; };
+$check = function (string $name, bool $pass, string $why = "") use (&$ok) { printf("%-46s %s\n", $name, $pass ? "OK" : "FAIL  $why"); $ok = $ok && $pass; };
 $n = 0;
 $mux->onTick = function (Mux $m) use (&$n, $c, $fast, $slow, $dead, $alt, $big, $check) {
     $n++;
@@ -167,6 +167,62 @@ $upAck = $fcRun("\0fc", $fast, function ($n, $c, $mm) {
 });
 $total = 0; foreach ($upAck->out as $o) { if ($o[0] === Mux::ACK && $o[1] === 1) { $total = unpack('N', $o[2])[1]; } }
 $check('the exit acks the bytes it wrote (running total = 100000)', $total === 100000);
+// ---- a paced carrier (cups): the mux keeps the pace, messages hold whole packets, control first, streams take turns ----
+final class PacedMem implements PacedCarrier
+{
+    public array $msgs = [];                     // [time, bytes]
+    public array $frames = [];                   // [time, type, sid, payload]
+    private Mux $m;
+    public function setMux(Mux $m): void { $this->m = $m; }
+    public function connect(): bool { return true; }
+    public function sockets(): array { return []; }
+    public function onReadable($sock): void {}
+    public function sendPacket(string $f): void { throw new LogicException('a paced carrier is sent whole messages'); }
+    public function msgCap(): int { return 3000; }
+    public function interval(): float { return 0.01; }
+    public function rate(): int { return 0; }
+    public function sendPackets(string $p): void
+    {
+        $t = microtime(true);
+        $this->msgs[] = [$t, $p];
+        for ($o = 0; $o < strlen($p);) {         // must be whole packets, back to back, and nothing else
+            $ln = unpack('n', substr($p, $o, 2))[1];
+            $f = substr($p, $o + 2, $ln);
+            if (strlen($f) !== $ln || $ln < 9) { $this->frames[] = [$t, -1, 0, '']; return; }
+            $h = unpack('Ctype/Nsid/Nlen', $f);
+            $this->frames[] = [$t, $h['type'], $h['sid'], substr($f, 9)];
+            $o += 2 + $ln;
+        }
+    }
+    public function feed(int $type, int $sid, string $payload): void { $this->m->onPacket(pack('CNN', $type, $sid, strlen($payload)) . $payload); }
+}
+$echoP = $fast + 6000; $s4 = server($echoP, 0);
+$pc = new PacedMem(); $pm = new Mux($pc); $pm->resolver = fn(string $h) => [$h];
+$n = 0; $tOpen3 = 0.0;
+$pm->onTick = function (Mux $mm) use (&$n, $pc, $bulkPort, $bulk2, $echoP, &$tOpen3) {
+    $n++;
+    if ($n === 1) { $pc->feed(Mux::OPEN, 1, "127.0.0.1:$bulkPort"); $pc->feed(Mux::OPEN, 2, "127.0.0.1:$bulk2"); }
+    if ($n === 3) { $tOpen3 = microtime(true); $pc->feed(Mux::OPEN, 3, "127.0.0.1:$echoP"); $pc->feed(Mux::DATA, 3, 'ping-through-a-busy-carrier'); }
+    return $n < 6;
+};
+$pm->run(30);
+$whole = !array_filter($pc->frames, fn($f) => $f[1] === -1);
+$check('paced: every message is whole packets and fits the cap', $whole && !array_filter($pc->msgs, fn($m) => strlen($m[1]) > 3000));
+$gaps = []; for ($i = 1; $i < count($pc->msgs); $i++) { $gaps[] = $pc->msgs[$i][0] - $pc->msgs[$i - 1][0]; }
+$check('paced: never faster than the interval', $gaps && min($gaps) >= 0.0095);
+$check('paced: the carrier is kept busy (no sleeping in the loop)', count($pc->msgs) > 250);
+$ok3 = null; $echo3 = ''; $tEcho = null;
+foreach ($pc->frames as [$t, $type, $sid, $pl]) {
+    if ($sid !== 3) { continue; }
+    if ($type === Mux::OPEN_OK && $ok3 === null) { $ok3 = $t; }
+    if ($type === Mux::DATA) { $echo3 .= $pl; if ($tEcho === null && str_contains($echo3, 'ping-through')) { $tEcho = $t; } }
+}
+$check('paced: a new stream gets OPEN_OK at once while two streams saturate the carrier', $ok3 !== null && $ok3 - $tOpen3 < 0.3);
+$check('paced: and its first answer within a few messages', $tEcho !== null && $tEcho - $tOpen3 < 0.5 && $echo3 === 'ping-through-a-busy-carrier', sprintf('echo=%s after=%s ok3=%s', var_export($echo3, true), $tEcho === null ? 'never' : round($tEcho - $tOpen3, 3), $ok3 === null ? 'none' : round($ok3 - $tOpen3, 3)));
+$per = [1 => 0, 2 => 0]; foreach ($pc->frames as $f) { if ($f[1] === Mux::DATA && isset($per[$f[2]])) { $per[$f[2]] += strlen($f[3]); } }
+$check('paced: busy streams share the carrier', min($per) > 0.3 * max($per));
+proc_terminate($s4);
+
 foreach ([$sb1, $sb2] as $p) { proc_terminate($p); }
 
 foreach ([$s1, $s2, $s3] as $p) { proc_terminate($p); }

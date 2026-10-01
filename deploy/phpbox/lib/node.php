@@ -106,7 +106,7 @@ final class PhpboxState
 
     public function write(array $s): void
     {
-        $tmp = $this->file . '.' . getmypid();
+        $tmp = $this->file . '.' . PhpboxUtil::pid();
         if (@file_put_contents($tmp, json_encode($s)) !== false) {
             @rename($tmp, $this->file);
         }
@@ -139,11 +139,164 @@ final class PhpboxState
     }
 }
 
+/**
+ * How long one request may run on this host, on both clocks, so a generation hands over before the host ends it.
+ *
+ * Hosts end a PHP request in different ways: max_execution_time counts CPU time on Linux but wall time on Windows
+ * and macOS; some add a wall-clock kill outside PHP (php-fpm's request_terminate_timeout, a watchdog) or an RLIMIT_CPU.
+ * What PHP can see is used up front; what it cannot see is learned: a generation that died before its plan leaves its
+ * age and CPU behind, and the next ones plan around it (host.json in the state folder, shared by every node).
+ */
+final class PhpboxBudget
+{
+    const LEARN_TTL = 7 * 86400;   // a host's limits can change; forget what was learned after a week
+    const MIN_WALL  = 30;          // shorter than this nothing useful fits: never plan below it
+
+    public int $wall;              // seconds of wall time this generation plans to live
+    public float $cpu = 0.0;       // CPU seconds this request may use (0 = no limit known)
+    public array $why = [];        // where the numbers came from, for the log
+    public int $proven = 0;        // the longest a generation has lived here and ended on its own terms
+    private float $cpu0;
+
+    public function __construct(int $cap, string $dir)
+    {
+        $this->cpu0 = PhpboxNode::cpuSeconds();
+        $this->wall = $cap;
+        $ini = function_exists('ini_get') ? (int)ini_get('max_execution_time') : 0;   // 0 once set_time_limit(0) worked
+        if ($ini > 0) {
+            if (in_array(PHP_OS_FAMILY, ['Windows', 'Darwin'], true)) {               // there the timer is a wall clock
+                $this->capWall($ini - 5, "max_execution_time {$ini}s (wall clock on " . PHP_OS_FAMILY . ')');
+            } else {
+                $this->capCpu($ini, "max_execution_time {$ini}s (CPU)");
+            }
+        }
+        if (function_exists('posix_getrlimit')) {
+            $rl = @posix_getrlimit();
+            if (is_array($rl) && is_numeric($rl['soft cpu'] ?? null) && (int)$rl['soft cpu'] > 0) {
+                $this->capCpu((int)$rl['soft cpu'] - PhpboxNode::cpuSeconds(), "RLIMIT_CPU {$rl['soft cpu']}s");
+            }
+        }
+        $h = self::learned($dir);
+        $this->proven = (int)($h['ok'] ?? 0);
+        if (!empty($h['wall'])) { $this->capWall((int)$h['wall'] - 10, "a generation died at {$h['wall']}s"); }
+        if (!empty($h['cpu']))  { $this->capCpu((float)$h['cpu'], "a generation died after {$h['cpu']}s of CPU"); }
+    }
+
+    private function capWall(int $s, string $why): void
+    {
+        $s = max(self::MIN_WALL, $s);
+        if ($s < $this->wall) { $this->wall = $s; $this->why[] = $why; }
+    }
+
+    private function capCpu(float $s, string $why): void
+    {
+        if ($s > 0 && ($this->cpu === 0.0 || $s < $this->cpu)) { $this->cpu = round($s, 1); $this->why[] = $why; }
+    }
+
+    /** CPU seconds this request has used. */
+    public function cpuUsed(): float
+    {
+        return round(PhpboxNode::cpuSeconds() - $this->cpu0, 2);
+    }
+
+    /** Share of the CPU budget used (0 when there is none). */
+    public function cpuShare(): float
+    {
+        return $this->cpu > 0 ? $this->cpuUsed() / $this->cpu : 0.0;
+    }
+
+    /**
+     * When a generation starts its successor. On a host not yet proven for the whole run, early - and never later than
+     * the age a generation has already lived here - so a limit nobody told us about cannot end a generation before it
+     * has handed over. Each generation that ends well proves a longer life, up to the full run.
+     */
+    public function spawnAt(int $drain): int
+    {
+        $full = $this->wall - $drain;
+        return $this->provenFull() ? $full : min($full, max(40, $this->proven));
+    }
+
+    /** How long a generation that has handed over stays up (idle once its streams end) to prove a longer life. */
+    public function holdUntil(int $spawnAt): int
+    {
+        return $this->provenFull() ? 0 : min($this->wall, max($this->proven, $spawnAt) + 60);
+    }
+
+    public function provenFull(): bool
+    {
+        return $this->proven >= $this->wall - 5;
+    }
+
+    /** A generation ended on its own terms after $age seconds: requests live at least that long here. */
+    public static function prove(string $dir, int $age): void
+    {
+        $h = self::learned($dir);
+        if ($age <= (int)($h['ok'] ?? 0)) { return; }
+        $h['ok'] = $age;
+        if (!empty($h['wall']) && $age >= (int)$h['wall']) { unset($h['wall']); }   // it lived past what we feared
+        $h['at'] = time();
+        @file_put_contents("$dir/host.json", json_encode($h));
+    }
+
+    public function describe(): string
+    {
+        return "{$this->wall}s" . ($this->cpu > 0 ? ", CPU {$this->cpu}s" : '') . ($this->why ? ' (' . implode('; ', $this->why) . ')' : '')
+            . ($this->provenFull() ? '' : "; this host has kept a run alive {$this->proven}s so far, so handovers start early and grow");
+    }
+
+    // ---- learning ----------------------------------------------------------
+
+    public static function learned(string $dir): array
+    {
+        $h = json_decode((string)@file_get_contents("$dir/host.json"), true);
+        if (!is_array($h) || time() - (int)($h['at'] ?? 0) > self::LEARN_TTL) { return []; }
+        return $h;
+    }
+
+    /**
+     * Look at the generations before this one: one that ended without saying so (killed outright: its heartbeat just
+     * stops), or that PHP ended for its time limit, before the plan it started with, tells how long requests live here.
+     * Returns what was learned now, for the log.
+     */
+    public static function learn(string $dir, array $gens): ?string
+    {
+        $h = self::learned($dir);
+        $said = null;
+        foreach ($gens as $g) {
+            $phase = $g['phase'] ?? '';
+            $reason = (string)($g['reason'] ?? '');
+            $silent = time() - (int)($g['beat'] ?? 0) >= PhpboxState::STALE;          // its heartbeat just stopped
+            $died = (in_array($phase, ['connecting', 'serving', 'draining', 'holding'], true) && $silent)
+                || str_starts_with($reason, 'died: Maximum execution time') || $reason === 'process ended';
+            if (!$died) { continue; }
+            $age = (int)(($g['ended'] ?? $g['beat'] ?? 0) - ($g['started'] ?? 0));
+            $planned = (int)($g['cap'] ?? 0);
+            if ($age <= 0 || $age >= $planned - 3) { continue; }          // it lived its plan: nothing to learn
+            $cpu = (float)($g['cpu'] ?? 0);
+            $cpuB = (float)($g['budget']['cpu'] ?? 0);
+            if ($cpu > 0 && $cpu >= 0.75 * $age) {                        // busy all along: the CPU ran out
+                $c = max(5.0, round($cpu * 0.9, 1));
+                if (empty($h['cpu']) || $c < $h['cpu']) { $h['cpu'] = $c; $said = "the host ends a request after about {$cpu}s of CPU"; }
+            } elseif ($cpuB <= 0 || $cpu < 0.7 * $cpuB) {                 // not the CPU we knew of: a clock did it
+                if (empty($h['wall']) || $age < $h['wall']) { $h['wall'] = max(self::MIN_WALL, $age); $said = "the host ends a request after about {$age}s"; }
+            }
+        }
+        if ($said !== null) {
+            $h['at'] = time();
+            @file_put_contents("$dir/host.json", json_encode($h));
+        }
+        return $said;
+    }
+}
+
 final class PhpboxNode
 {
     const VERSION = '0.4';
     const CHAIN_CAP = 240;      // lifetime of one generation in chain mode (plain mode: the exit's own cap, 140)
     const MAX_DRAIN = 60;       // seconds a generation keeps serving its streams after handing over
+    // A successor takes streams only once its link has stayed up this long: a Mail.ru document closes the first
+    // connections right after they join, and streams handed over then were lost with the link.
+    const SETTLE = 8;
 
     /**
      * @param string   $carrier  'cupsonline' | 'mailru' - the transport type a link must carry to fit this exit
@@ -162,7 +315,7 @@ final class PhpboxNode
     public function handle(): void
     {
         error_reporting(E_ALL & ~E_DEPRECATED);
-        $token = getenv('PHPBOX_TOKEN') ?: (defined('PHPBOX_TOKEN') ? PHPBOX_TOKEN : 'CHANGE-ME'); // putenv is disabled on some free hosts: config.php also define()s it
+        $token = PhpboxUtil::env('PHPBOX_TOKEN') ?: (defined('PHPBOX_TOKEN') ? PHPBOX_TOKEN : 'CHANGE-ME'); // putenv is disabled on some free hosts: config.php also define()s it
         if (!hash_equals($token, (string)($_GET['k'] ?? ''))) {
             http_response_code(404);
             header('Content-Type: text/plain; charset=utf-8');
@@ -212,9 +365,8 @@ final class PhpboxNode
         header('Content-Type: text/plain; charset=utf-8');
         header('Cache-Control: no-store');
         header('X-Accel-Buffering: no');
-        @ini_set('zlib.output_compression', '0');
-        ignore_user_abort(true);      // a dropped tab or a proxy 504 must not stop the node
-        @set_time_limit(0);           // disabled on some free hosts; harmless there
+        if (function_exists('ini_set')) { @ini_set('zlib.output_compression', '0'); }
+        PhpboxUtil::keepRunning();    // a dropped tab or a proxy 504 must not stop the node (where the host lets us ask)
         while (ob_get_level() > 0) { ob_end_flush(); }
 
         $chain = !empty($_GET['chain']);
@@ -224,10 +376,13 @@ final class PhpboxNode
         if (isset($_GET['cap'])) {
             $cap = max(PhpboxUtil::testMode() ? 6 : 30, min(900, (int)$_GET['cap']));
         }
-        $drain   = min(self::MAX_DRAIN, intdiv($cap, 3));
-        $spawnAt = $cap - $drain;                  // when this generation starts its successor
-
         $gens = PhpboxState::generations($dir, $key);
+        $learnedNow = PhpboxBudget::learn($dir, $gens);   // a generation before us died early: plan around it
+        $budget  = new PhpboxBudget($cap, $dir);
+        $cap     = $budget->wall;
+        $drain   = min(self::MAX_DRAIN, intdiv($cap, 3));
+        $spawnAt = $chain ? $budget->spawnAt($drain) : $cap - $drain;   // when this generation starts its successor (or earlier: CPU)
+        $holdUntil = $chain ? $budget->holdUntil($spawnAt) : 0;
         if (!$succ) {
             $accepting = array_filter($gens, fn($g) => PhpboxState::accepting($g));
             if ($accepting) {
@@ -260,15 +415,18 @@ final class PhpboxNode
         $started = time();
         $sensitive = !empty($_GET['sensitive']);
         $s = [
-            'carrier' => $this->carrier, 'pid' => getmypid(), 'gen' => $gen, 'phase' => 'connecting',
+            'carrier' => $this->carrier, 'pid' => PhpboxUtil::pid(), 'gen' => $gen, 'phase' => 'connecting',
             'started' => $started, 'beat' => $started, 'cap' => $cap, 'elapsed' => 0,
             'chain' => $chain, 'spawn_at' => $spawnAt, 'from' => $succ ? $from : null,
             'streams' => 0, 'opened' => 0, 'failed' => 0, 'up' => 0, 'down' => 0,
             'sensitive' => $sensitive, 'php' => PHP_VERSION, 'version' => self::VERSION,
+            'cpu' => 0, 'budget' => ['wall' => $budget->wall, 'cpu' => $budget->cpu],
         ];
         $state->write($s);
         $log->write('info', "node gen $gen starting on {$this->carrier}" . ($succ ? " (successor of gen $from)" : '')
             . ' (phpbox ' . self::VERSION . ', php ' . PHP_VERSION . ')');
+        if ($learnedNow !== null) { $log->write('warn', "learned: $learnedNow; generations hand over earlier from now on"); }
+        $log->write('info', 'time budget: ' . $budget->describe());
 
         // Whatever a carrier echoes is also a log line (and still goes to the response).
         // The response goes nowhere useful: a successor's request was closed by the generation that started it, and
@@ -290,13 +448,17 @@ final class PhpboxNode
             @rmdir($d);
         };
         $ended = false;
-        $finish = function (string $why, string $lvl = 'info') use (&$s, $state, $log, &$ended, $rmOwn, $ownMine) {
+        $finish = function (string $why, string $lvl = 'info') use (&$s, $state, $log, &$ended, $rmOwn, $ownMine, $budget, $dir) {
             if ($ended) { return; }
             $ended = true;
             $s['phase'] = 'idle';
             $s['ended'] = time();
             $s['elapsed'] = time() - $s['started'];
+            $s['cpu'] = $budget->cpuUsed();
             $s['reason'] = $why;
+            if (!str_starts_with($why, 'died') && $why !== 'process ended' && !str_starts_with($why, 'could not join')) {
+                PhpboxBudget::prove($dir, (int)$s['elapsed']);   // it lived this long here and ended on its own terms
+            }
             $state->write($s);
             $rmOwn($ownMine);
             $log->write($lvl, "node gen {$s['gen']} ended: $why");
@@ -313,14 +475,17 @@ final class PhpboxNode
             return;
         }
 
-        $s['phase'] = 'serving';
+        $s['phase'] = $succ ? 'connecting' : 'serving';  // a successor serves once its link has settled (onTick)
         $s['beat'] = time();
+        if (method_exists($carrier, 'member')) { $s['member'] = $carrier->member(); }   // the others ignore what we send
         $state->write($s);
         $log->write('info', "joined; serving" . ($chain ? ", handing over to a successor at {$spawnAt}s" : '') . " up to {$cap}s"
             . ($sensitive ? ' (destinations are logged)' : ' (destinations are hidden: add &sensitive=1 to log them)'));
         echo "{$this->carrier} exit ready; serving up to {$cap}s\n";
 
         $mux = new Mux($carrier);
+        $mux->accepting = !$succ;
+        $settled = !$succ; $upSince = time(); $seenReconnects = 0;
         $mux->sensitive = $sensitive;
         if (isset($_GET['win'])) { $w = max(0, min(4194304, (int)$_GET['win'])); $mux->streamWindow = $w; $mux->totalWindow = $w * 2; }   // 0 = no flow control
         if (isset($_GET['idle'])) { $mux->idleTimeout = max(0, min(3600, (int)$_GET['idle'])); }
@@ -344,7 +509,7 @@ final class PhpboxNode
 
         $mux->onTick = function (Mux $m) use (&$s, $state, $started, $dir, $key, $chain, $spawnAt, $target, $cap, $sensitive, $gen,
                                               $log, &$asSucc, &$asPred, &$spawned, &$lastSpawn, &$spawnTries, &$frozen, &$endWhy,
-                                              $predState, $succState, $ownMine) {
+                                              $predState, $succState, $ownMine, $budget, $holdUntil, $carrier, &$settled, &$upSince, &$seenReconnects) {
             $s['beat'] = time();
             $s['elapsed'] = time() - $started;
             $s['streams'] = $m->activeStreams();
@@ -352,7 +517,30 @@ final class PhpboxNode
             $s['failed'] = $m->stats['failed'];
             $s['up'] = $m->stats['up'];
             $s['down'] = $m->stats['down'];
+            $s['cpu'] = $budget->cpuUsed();
+            if (method_exists($carrier, 'member')) { $s['member'] = $carrier->member(); }    // a reconnect joins anew
             $state->write($s);
+            if (method_exists($carrier, 'ignoreUsers') && $s['elapsed'] % 2 === 0) {
+                $others = [];                                // the other generations in this room: not our client
+                foreach (PhpboxState::generations($dir, $key) as $g => $o) {
+                    if ($g !== $gen && !empty($o['member'])) { $others[] = $o['member']; }
+                }
+                $carrier->ignoreUsers($others);
+            }
+            if (!$settled) {
+                $rc = $m->stats['reconnects'] ?? 0;
+                if ($rc !== $seenReconnects && !PhpboxUtil::testMode()) {
+                    $seenReconnects = $rc;
+                    $upSince = time();                     // the link dropped and joined again: start counting anew
+                }
+                if (time() - $upSince >= (PhpboxUtil::testMode() ? 1 : self::SETTLE)) {
+                    $settled = true;
+                    $m->accepting = true;
+                    $s['phase'] = 'serving';
+                    $state->write($s);
+                    $log->write('info', 'link steady: taking new streams');
+                }
+            }
             if (file_exists("$dir/$key.stop")) {          // left in place: every generation and any spawn sees it
                 $endWhy = 'stopped';
                 return false;
@@ -361,8 +549,13 @@ final class PhpboxNode
                 $asSucc = false;                          // the previous generation no longer takes streams: no contest
                 $log->write('debug', 'previous generation stopped taking new streams');
             }
+            if ($budget->cpuShare() >= 0.85) {              // end on our terms, not the host's: clients get CLOSE now
+                $endWhy = 'cpu';
+                return false;
+            }
             if ($chain && !$frozen) {
-                if ($s['elapsed'] >= $spawnAt && time() - $lastSpawn >= 15) {
+                $due = $s['elapsed'] >= $spawnAt || $budget->cpuShare() >= 0.55;
+                if ($due && time() - $lastSpawn >= 15) {
                     $lastSpawn = time();
                     @mkdir($ownMine, 0700, true);
                     $asPred = true;                       // from now on new streams are claimed, not assumed
@@ -386,14 +579,32 @@ final class PhpboxNode
                 }
             }
             if ($frozen && $m->activeStreams() === 0) {
-                $endWhy = 'handed';
+                $endWhy = $s['elapsed'] < $holdUntil ? 'hold' : 'handed';
                 return false;
             }
             return true;
         };
         $why = $mux->run($cap);
+        if ($endWhy === 'hold') {
+            // Out of the room (the successor serves it), but still up: this host has not yet kept a run alive this long.
+            if (method_exists($carrier, 'close')) { $carrier->close(); }
+            $s['phase'] = 'holding';
+            $state->write($s);
+            $log->write('debug', "streams done; staying up (idle) until {$holdUntil}s to prove a longer run on this host");
+            while (time() - $started < $holdUntil && !file_exists("$dir/$key.stop")) {
+                usleep(1000000);
+                $s['beat'] = time();
+                $s['elapsed'] = time() - $started;
+                $s['cpu'] = $budget->cpuUsed();
+                $state->write($s);
+            }
+            $endWhy = 'handed';
+        }
         if ($endWhy === 'stopped')     { $finish('stopped from the page'); }
         elseif ($endWhy === 'handed')  { $finish('handed over to gen ' . ($gen + 1) . ' (its streams ended)'); }
+        elseif ($endWhy === 'cpu' && $frozen) { $finish('handed over to gen ' . ($gen + 1) . "; the CPU budget ({$budget->cpu}s) cut the streams still open"); }
+        elseif ($endWhy === 'cpu' && $chain)  { $finish("chain broken: the CPU budget ({$budget->cpu}s) ran out before a successor was serving", 'error'); }
+        elseif ($endWhy === 'cpu')     { $finish("ended before the host's CPU limit ({$budget->cpu}s)"); }
         elseif ($frozen)               { $finish('handed over to gen ' . ($gen + 1) . "; {$cap}s cap cut the streams still open"); }
         elseif ($chain)                { $finish("chain broken: no successor was serving before the {$cap}s cap", 'error'); }
         else                           { $finish("reached the {$cap}s cap"); }
@@ -439,6 +650,16 @@ final class PhpboxNode
         return true;
     }
 
+    /** CPU seconds this process has used (user + system): what a host's max_execution_time counts. */
+    public static function cpuSeconds(): float
+    {
+        if (!function_exists('getrusage')) { return 0.0; }
+        $u = @getrusage();
+        if (!is_array($u)) { return 0.0; }
+        return round(($u['ru_utime.tv_sec'] ?? 0) + ($u['ru_utime.tv_usec'] ?? 0) / 1e6
+            + ($u['ru_stime.tv_sec'] ?? 0) + ($u['ru_stime.tv_usec'] ?? 0) / 1e6, 2);
+    }
+
     // ---- ping -----------------------------------------------------------
 
     /** Facts about this host for the installer: what the node needs, and whether the host has it. */
@@ -460,6 +681,10 @@ final class PhpboxNode
             'sapi'      => PHP_SAPI,
             'needs'     => $needs,
             'missing'   => array_keys(array_filter($needs, fn($ok) => !$ok)),
+            // The node runs without these, but the host has taken them away: worth knowing when it misbehaves.
+            'disabled'  => array_values(array_filter(['ignore_user_abort', 'set_time_limit', 'getrusage', 'getmypid', 'getenv', 'ini_set'],
+                fn($f) => !function_exists($f))),
+            'cpu_limit' => function_exists('ini_get') ? (int)ini_get('max_execution_time') : null,
             'state_dir' => is_dir($dir) && is_writable($dir),
             'parser'    => is_file(dirname(__DIR__) . '/assets/share.wasm.gz'),
             'time'      => time(),
@@ -474,8 +699,10 @@ final class PhpboxNode
         $alive = array_filter($gens, fn($g) => PhpboxState::alive($g));
         $accepting = array_filter($alive, fn($g) => PhpboxState::accepting($g));
         // The state shown: the generation taking streams, else one that is winding down, else the last one that ran.
-        $cur = $accepting ? $accepting[max(array_keys($accepting))]
-            : ($alive ? $alive[max(array_keys($alive))] : ($gens ? $gens[max(array_keys($gens))] : []));
+        $serving = array_filter($accepting, fn($g) => ($g['phase'] ?? '') === 'serving');
+        $cur = $serving ? $serving[max(array_keys($serving))]
+            : ($accepting ? $accepting[max(array_keys($accepting))]
+            : ($alive ? $alive[max(array_keys($alive))] : ($gens ? $gens[max(array_keys($gens))] : [])));
         if (PhpboxState::alive($cur)) {
             $cur['elapsed'] = max((int)($cur['elapsed'] ?? 0), time() - (int)$cur['started']);
         }

@@ -86,7 +86,7 @@ final class PhpboxUtil
     /** Local testing only: lifts the private-address and port guards. Never set on a real host. */
     public static function testMode(): bool
     {
-        return getenv('PHPBOX_ALLOW_PRIVATE') === '1' || (defined('PHPBOX_ALLOW_PRIVATE') && PHPBOX_ALLOW_PRIVATE === '1');
+        return self::env('PHPBOX_ALLOW_PRIVATE') === '1' || (defined('PHPBOX_ALLOW_PRIVATE') && PHPBOX_ALLOW_PRIVATE === '1');
     }
 
     /** Refuse loopback / private / reserved targets (no SSRF into the host LAN): any address that is one blocks the host. */
@@ -108,6 +108,30 @@ final class PhpboxUtil
     }
 
     /** Where run state and logs live: a writable dir that is not web-served when the host has one. */
+    /** getenv() where the host has it: a disabled function is gone in PHP 8, and calling it is a fatal error. */
+    public static function env(string $name)
+    {
+        return function_exists('getenv') ? getenv($name) : false;
+    }
+
+    /** This process's id, or a random stand-in where getmypid() is disabled. */
+    public static function pid(): int
+    {
+        static $pid = null;
+        if ($pid === null) { $pid = function_exists('getmypid') ? (int)getmypid() : random_int(100000, 999999); }
+        return $pid;
+    }
+
+    /**
+     * Ask the host to keep running when the request's connection is gone, and to lift the time limit, where those
+     * calls exist. Hosts disable them; in PHP 8 a disabled function is undefined and calling it ends the script.
+     */
+    public static function keepRunning(bool $afterClose = true): void
+    {
+        if (function_exists('ignore_user_abort')) { @ignore_user_abort($afterClose); }
+        if (function_exists('set_time_limit')) { @set_time_limit(0); }
+    }
+
     public static function stateDir(): string
     {
         $base = (is_dir('/home/tmp') && is_writable('/home/tmp')) ? '/home/tmp' : sys_get_temp_dir();

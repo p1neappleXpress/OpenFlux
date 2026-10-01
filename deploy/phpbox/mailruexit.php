@@ -49,6 +49,9 @@ final class MailruCarrier implements Carrier
     public function setMux(Mux $m): void { $this->mux = $m; }
     public function sockets(): array { return $this->ws->sock ? [$this->ws->sock] : []; }
 
+    /** Leave the room/document (a generation that has handed over and only stays up). */
+    public function close(): void { $this->ws->close(); }
+
     public function connect(): bool
     {
         $info = $this->fetchDocInfo();

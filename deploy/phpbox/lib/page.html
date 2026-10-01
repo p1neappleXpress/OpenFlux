@@ -181,7 +181,7 @@ ru:{
  streams:'потоков', opened:'открыто', up:'на сервер', down:'к вам',
  left:'осталось', of:'из', cap:'Один запуск живёт до {n} с, потом его можно перезапустить.',
  chain:'Держать туннель непрерывно', chain_hint:'До конца запуска нода сама поднимает следующее поколение: новые соединения переходят без разрыва, старые доживают до конца (не дольше {n} с).',
- chain_on:'непрерывный режим', next_in:'смена поколения через {n} с', winding:'Завершается', winding_sub:'потоков ещё: {n}', stopping:'останавливается…',
+ chain_on:'непрерывный режим', next_in:'смена поколения через {n} с', winding:'Завершается', winding_sub:'потоков ещё: {n}', stopping:'останавливается…', revive:'Нода остановилась сама — запускаю заново, пока эта страница открыта',
  gen:'запуск №', last:'Последний конец:', never:'Ещё не запускалась на этом адресе.',
  ph_cups:'Вставьте ссылку openflux://… или ссылку комнаты cups.online (или её uuid)',
  ph_mailru:'Вставьте ссылку openflux://… или публичную ссылку на документ Mail.ru',
@@ -218,7 +218,7 @@ en:{
  streams:'streams', opened:'opened', up:'to server', down:'to you',
  left:'left', of:'of', cap:'One run lives up to {n} s, then it can be started again.',
  chain:'Keep the tunnel up continuously', chain_hint:'Before a run ends the node starts the next generation itself: new connections move over without a break, old ones finish (for at most {n} s).',
- chain_on:'continuous mode', next_in:'next generation in {n} s', winding:'Winding down', winding_sub:'streams left: {n}', stopping:'stopping…',
+ chain_on:'continuous mode', next_in:'next generation in {n} s', winding:'Winding down', winding_sub:'streams left: {n}', stopping:'stopping…', revive:'The node ended by itself — starting it again while this page is open',
  gen:'run #', last:'Last ended:', never:'Never started on this address yet.',
  ph_cups:'Paste an openflux://… link or a cups.online room link (or its uuid)',
  ph_mailru:'Paste an openflux://… link or a public Mail.ru document link',
@@ -361,21 +361,32 @@ function cmd(){
   const flag = C.carrier==='cupsonline'?'cupsonline':'mailru';
   return 'openflux --role=client --mode=stream --transport='+flag+' --url "'+target+'" --socks5 127.0.0.1:1080';
 }
+// While this page is open it keeps the node up: a node that ended without Stop (a host limit, a chain that broke)
+// is started again, at most once every 20 s. Stop from here (or from anywhere: the reason says so) is respected.
+let wasRunning=false, lastRevive=0, stoppedHere=false;
 async function pollStatus(force){
   if(!target){ st={running:false,state:{}}; renderStatus(); return }
   try{
     const r=await fetch(q({a:'status',url:target}),{cache:'no-store'}); st=await r.json();
   }catch(e){ return }
   renderStatus();
+  const s=st.state||{}, wind=(st.draining||0)>0;
+  if(st.running||wind){ wasRunning=true; return }
+  const stopped=stoppedHere||/stopped/.test(s.reason||'');
+  if(wasRunning && !stopped && $('f-chain').checked && Date.now()-lastRevive>20000){
+    lastRevive=Date.now(); toast(t('revive')); startNode();
+  }
+  wasRunning=false;
 }
 async function startNode(){
   if(!target){ toast(t('need_target')); return }
+  stoppedHere=false;
   startedHere=true;
   $('start').disabled=true; $('start').textContent=t('starting');
   fetch(q({a:'run',url:target,chain:$('f-chain').checked?'1':'',sensitive:$('f-sens').checked?'1':''}),{cache:'no-store'}).catch(()=>{});   // the request IS the node; it survives us closing it
   for(let i=0;i<8;i++){ await new Promise(r=>setTimeout(r,700)); await pollStatus(); if(st.running)break }
 }
-async function stopNode(){ await fetch(q({a:'stop',url:target})).catch(()=>{}); toast(t('stop')); setTimeout(pollStatus,900) }
+async function stopNode(){ stoppedHere=true; await fetch(q({a:'stop',url:target})).catch(()=>{}); toast(t('stop')); setTimeout(pollStatus,900) }
 
 function renderButtons(){
   $('start').textContent=t('start'); $('stop').textContent=t('stop');

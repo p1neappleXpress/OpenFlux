@@ -28,8 +28,8 @@ if (is_file(__DIR__ . '/config.php')) { require_once __DIR__ . '/config.php'; } 
  *   1 OPEN "host:port"  2 DATA  3 CLOSE  4 OPEN_OK  5 OPEN_ERR reason
  */
 
-$TOKEN = getenv('PHPBOX_TOKEN') ?: (defined('PHPBOX_TOKEN') ? PHPBOX_TOKEN : 'CHANGE-ME'); // putenv is disabled on some free hosts: config.php also define()s it
-$BUS_DIR = getenv('PHPBOX_BUS') ?: (sys_get_temp_dir() . '/phpbox-bus');
+$TOKEN = (function_exists('getenv') ? getenv('PHPBOX_TOKEN') : false) ?: (defined('PHPBOX_TOKEN') ? PHPBOX_TOKEN : 'CHANGE-ME'); // putenv is disabled on some free hosts: config.php also define()s it
+$BUS_DIR = (function_exists('getenv') ? getenv('PHPBOX_BUS') : false) ?: (sys_get_temp_dir() . '/phpbox-bus');
 const RUN_CAP = 140;   // seconds a down-poll holds before returning (client reconnects)
 const DIAL_TO = 6;
 
@@ -60,8 +60,8 @@ function up_ingest(string $busUp): void
 // ---- downstream: the session. Hold sockets, pump both ways ---------------
 function down_pump(string $busUp): void
 {
-    @set_time_limit(0);
-    ignore_user_abort(false);              // client gone => end the session
+    if (function_exists('set_time_limit')) { @set_time_limit(0); }
+    if (function_exists('ignore_user_abort')) { ignore_user_abort(false); }   // client gone => end the session
     header('Content-Type: application/octet-stream');
     header('X-Accel-Buffering: no');       // ask LiteSpeed/nginx not to buffer
     header('Content-Encoding: none');
@@ -135,7 +135,7 @@ function take_frame(string &$buf): ?array
 /** Refuse loopback / private / reserved targets (no SSRF into the host LAN). */
 function is_private_host(string $host): bool
 {
-    if (getenv('PHPBOX_ALLOW_PRIVATE') === '1') { return false; } // local testing only
+    if (function_exists('getenv') && getenv('PHPBOX_ALLOW_PRIVATE') === '1') { return false; } // local testing only
     $ips = [];
     if (filter_var($host, FILTER_VALIDATE_IP)) {
         $ips[] = $host;

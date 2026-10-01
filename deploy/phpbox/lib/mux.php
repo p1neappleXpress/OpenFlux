@@ -29,6 +29,21 @@ interface Carrier
     public function sendPacket(string $frame): void; // encode + send one mux frame
 }
 
+/**
+ * A carrier whose server takes one message per interval (cups.online throttles cursor updates). The mux paces it
+ * from its own loop instead of the carrier sleeping between messages: a sleep inside the loop stalled every stream
+ * (a 64 KB frame was ~22 messages, ~0.4 s asleep), so under a download new connections timed out and acks waited.
+ * A message carries whole packets only (2-byte length + one frame each, several per message): two senders in one
+ * room - generations handing over - then never cut into each other's packets on the receiving side.
+ */
+interface PacedCarrier extends Carrier
+{
+    public function msgCap(): int;                       // bytes of packets one message holds
+    public function interval(): float;                   // seconds between messages, at least
+    public function rate(): int;                         // packet bytes per second the server forwards (0 = no limit)
+    public function sendPackets(string $packets): void;  // send one message now (no waiting)
+}
+
 final class Mux
 {
     const OPEN = 1, DATA = 2, CLOSE = 3, OPEN_OK = 4, OPEN_ERR = 5, ACK = 6;
@@ -41,6 +56,9 @@ final class Mux
     // 22 s where 16 KB frames need 41 s - the carrier's cost is per message, not per byte. Tunable with $readChunk.
     const READ_CHUNK = 65536;
     const MAX_WBUF   = 8388608;    // queued bytes per stream before it is cut
+    // Paced carriers: DATA waiting for the carrier, per stream and in all, before the mux stops reading destinations.
+    const OUT_STREAM_MAX = 49152;
+    const OUT_ALL_MAX    = 262144;
 
     /** @var null|callable(string,string):void  fn($level, $message): error|warn|info|debug */
     public $log = null;
@@ -76,9 +94,27 @@ final class Mux
     private array  $ackDirty = []; // stream_id => true: bytes written since the last ack
     private int    $inAll   = 0;   // unacknowledged DATA over all streams
 
+    // Outbox for a paced carrier: control frames (OPEN_OK, OPEN_ERR, ACK) go first; each stream's DATA and CLOSE keep
+    // their order in that stream's queue, and streams take turns, so a new connection's handshake is not stuck behind
+    // another stream's download.
+    private bool   $paced    = false;
+    private array  $ctlQ     = [];  // encoded control frames
+    private array  $bulkQ    = [];  // stream_id => list of [type, payload]
+    private array  $bulkLen  = [];  // stream_id => DATA bytes queued
+    private int    $bulkAll  = 0;
+    private int    $rrNext   = -1;  // the stream served last; the next message starts after it
+    private float  $nextSlot = 0.0;
+
     public function __construct(private Carrier $c)
     {
         $c->setMux($this);
+        $this->paced = $c instanceof PacedCarrier;
+    }
+
+    /** Frames waiting for a paced carrier (0 for an unpaced one). */
+    public function outboxBytes(): int
+    {
+        return $this->bulkAll + array_sum(array_map('strlen', $this->ctlQ));
     }
 
     public function activeStreams(): int
@@ -99,7 +135,9 @@ final class Mux
     /** The carrier's socket is gone (the server closed it, or the link broke): join again, with backoff. */
     private function reconnect(): void
     {
-        $this->say('warn', 'link to the carrier is down; reconnecting' . ($this->reconnectFails ? " (attempt " . ($this->reconnectFails + 1) . ')' : ''));
+        $why = method_exists($this->c, 'why') ? $this->c->why() : '';
+        $this->say('warn', 'link to the carrier is down' . ($why !== '' ? " ($why)" : '') . '; reconnecting'
+            . ($this->reconnectFails ? " (attempt " . ($this->reconnectFails + 1) . ')' : ''));
         $ok = false;
         try {
             $ok = $this->c->connect();
@@ -167,12 +205,17 @@ final class Mux
                     $write[] = $this->socks[$sid];
                 }
             }
+            $this->pump(microtime(true));
+            $wait = 200000;
+            if ($this->ctlQ || $this->bulkQ) {               // wake up for the next message slot
+                $wait = max(1000, min($wait, (int)(($this->nextSlot - microtime(true)) * 1e6)));
+            }
             if (!$read && !$write) {
-                usleep(100000);
+                usleep(min($wait, 100000));
                 continue;
             }
             $e = null;
-            if (@stream_select($read, $write, $e, 0, 200000) > 0) {
+            if (@stream_select($read, $write, $e, 0, $wait) > 0) {
                 foreach ($write as $s) {
                     $this->onDstWritable($s);
                 }
@@ -185,11 +228,13 @@ final class Mux
                 }
             }
             $this->flushAcks();
+            $this->pump(microtime(true));
         }
         // Tell the client which streams end with us, so it reconnects at once instead of waiting for a timeout.
         foreach (array_keys($this->socks + $this->pending) as $sid) {
             $this->sendFrame(self::CLOSE, $sid, '');
         }
+        $this->drainOutbox(5.0);
         foreach ($this->socks as $s) {
             @fclose($s);
         }
@@ -222,7 +267,95 @@ final class Mux
 
     public function sendFrame(int $type, int $sid, string $payload): void
     {
-        $this->c->sendPacket(pack('CNN', $type, $sid, strlen($payload)) . $payload);
+        if (!$this->paced) {
+            $this->c->sendPacket(pack('CNN', $type, $sid, strlen($payload)) . $payload);
+            return;
+        }
+        if ($type === self::DATA || $type === self::CLOSE) {
+            $this->bulkQ[$sid][] = [$type, $payload];
+            $this->bulkLen[$sid] = ($this->bulkLen[$sid] ?? 0) + strlen($payload);
+            $this->bulkAll += strlen($payload);
+        } else {
+            $this->ctlQ[] = pack('CNN', $type, $sid, strlen($payload)) . $payload;
+        }
+    }
+
+    /** Send the next message if its slot has come (paced carriers): one message per interval, never a sleep. */
+    private function pump(float $now): void
+    {
+        if (!$this->paced || (!$this->ctlQ && !$this->bulkQ) || $now < $this->nextSlot) {
+            return;
+        }
+        $msg = $this->buildMessage($this->c->msgCap());
+        if ($msg === '') {
+            return;
+        }
+        $this->c->sendPackets($msg);
+        $rate = $this->c->rate();
+        $this->nextSlot = max($this->nextSlot, $now) + max($this->c->interval(), $rate > 0 ? strlen($msg) / $rate : 0.0);
+    }
+
+    /** Whole packets for one message: control frames first, then the streams in turn (DATA cut to fit). */
+    private function buildMessage(int $cap): string
+    {
+        $buf = '';
+        while ($this->ctlQ && strlen($buf) + 2 + strlen($this->ctlQ[0]) <= $cap) {
+            $f = array_shift($this->ctlQ);
+            $buf .= pack('n', strlen($f)) . $f;
+        }
+        $sids = array_keys($this->bulkQ);
+        if (!$sids) {
+            return $buf;
+        }
+        sort($sids);
+        $start = 0;                                      // the first stream after the one served last
+        foreach ($sids as $i => $sid) {
+            if ($sid > $this->rrNext) { $start = $i; break; }
+        }
+        $order = array_merge(array_slice($sids, $start), array_slice($sids, 0, $start));
+        foreach ($order as $sid) {
+            while (isset($this->bulkQ[$sid])) {
+                $room = $cap - strlen($buf) - 2 - 9;
+                [$type, $payload] = $this->bulkQ[$sid][0];
+                if ($type === self::CLOSE) {
+                    if ($room < 0) { break 2; }
+                    $buf .= pack('n', 9) . pack('CNN', self::CLOSE, $sid, 0);
+                    $this->shiftBulk($sid);
+                    continue;
+                }
+                if ($room < 256 && strlen($payload) > $room) { break 2; }   // too little left to be worth a cut
+                $part = strlen($payload) > $room ? substr($payload, 0, $room) : $payload;
+                $buf .= pack('n', 9 + strlen($part)) . pack('CNN', self::DATA, $sid, strlen($part)) . $part;
+                $this->bulkLen[$sid] -= strlen($part);
+                $this->bulkAll -= strlen($part);
+                if (strlen($part) < strlen($payload)) {
+                    $this->bulkQ[$sid][0][1] = substr($payload, strlen($part));
+                    $this->rrNext = $sid;
+                    break 2;                             // the message is full
+                }
+                $this->shiftBulk($sid);
+            }
+            $this->rrNext = $sid;
+        }
+        return $buf;
+    }
+
+    private function shiftBulk(int $sid): void
+    {
+        array_shift($this->bulkQ[$sid]);
+        if (!$this->bulkQ[$sid]) {
+            unset($this->bulkQ[$sid], $this->bulkLen[$sid]);
+        }
+    }
+
+    /** At the end of a run: give what is queued a few seconds to go out. */
+    private function drainOutbox(float $limit): void
+    {
+        $until = microtime(true) + $limit;
+        while (($this->ctlQ || $this->bulkQ) && microtime(true) < $until) {
+            $this->pump(microtime(true));
+            usleep(max(1000, (int)(($this->nextSlot - microtime(true)) * 1e6)));
+        }
     }
 
     private function label(string $host, int $port): string
@@ -233,6 +366,15 @@ final class Mux
     private function applyMux(int $type, int $sid, string $payload): void
     {
         if ($type === self::OPEN) {
+            // The same OPEN again: the client did not hear our answer (lost while a carrier reconnected) and asks
+            // again. Ids are never reused by a client, so this is that stream: answer again, do not dial twice.
+            if (isset($this->socks[$sid])) {
+                $this->sendFrame(self::OPEN_OK, $sid, isset($this->fc[$sid]) ? 'fc' : '');
+                return;
+            }
+            if (isset($this->pending[$sid])) {
+                return;                                // still dialing: the answer is on its way
+            }
             if (!$this->accepting) {
                 $this->say('debug', "stream $sid left to the newer generation");
                 return;
@@ -246,9 +388,6 @@ final class Mux
             $port  = (int)$port;
             $wantFc = $this->streamWindow > 0 && in_array('fc', explode(',', $caps), true);
             $label = $this->label($host, $port);
-            if (isset($this->socks[$sid]) || isset($this->pending[$sid])) {
-                $this->closeStream($sid, false);     // the client reuses an id: the old one is gone
-            }
             if (!in_array($port, [80, 443], true) && !PhpboxUtil::testMode()) {
                 $this->say('debug', "stream $sid refused $label: port");
                 $this->stats['failed']++;
@@ -417,6 +556,9 @@ final class Mux
     /** True while a stream has a window of unacknowledged DATA out (or all streams together do): stop reading it. */
     private function blocked(int $sid, float $now): bool
     {
+        if ($this->paced && (($this->bulkLen[$sid] ?? 0) >= self::OUT_STREAM_MAX || $this->bulkAll >= self::OUT_ALL_MAX)) {
+            return true;                               // the carrier is behind: let it catch up before reading more
+        }
         if (!isset($this->fc[$sid])) {
             return false;
         }
@@ -503,6 +645,10 @@ final class Mux
             unset($this->fc[$sid], $this->ackDirty[$sid]);
         }
         unset($this->socks[$sid], $this->pending[$sid], $this->wbuf[$sid], $this->act[$sid]);
+        if (!$notify && isset($this->bulkQ[$sid])) {     // the client is done with it: what we still hold is for no one
+            $this->bulkAll -= $this->bulkLen[$sid] ?? 0;
+            unset($this->bulkQ[$sid], $this->bulkLen[$sid]);
+        }
         if ($notify) {
             $this->sendFrame(self::CLOSE, $sid, '');
         }

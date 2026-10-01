@@ -13,6 +13,7 @@ final class WsClient
     /** connect performs the upgrade to wsURL (ws:// or wss://). */
     public function connect(string $wsURL, string $origin, string $cookieHeader): bool
     {
+        $this->closeInfo = '';
         $p = parse_url($wsURL);
         $secure = ($p['scheme'] ?? 'wss') === 'wss';
         $host = $p['host'];
@@ -167,7 +168,8 @@ final class WsClient
             $this->rx = substr($this->rx, $off + $len);
             $opcode = $b0 & 0x0f;
             $fin = ($b0 & 0x80) !== 0;
-            if ($opcode === 0x8) {                       // close
+            if ($opcode === 0x8) {                       // close: keep the server's code and reason for the log
+                $this->closeInfo = strlen($data) >= 2 ? 'close ' . unpack('n', $data)[1] . (strlen($data) > 2 ? ' ' . substr($data, 2) : '') : 'close (no code)';
                 $this->markClosed();
                 return;
             }
@@ -189,8 +191,12 @@ final class WsClient
         }
     }
 
+    /** Why the link ended, as far as the server said: a close frame's code and reason, or how the socket ended. */
+    public string $closeInfo = '';
+
     private function markClosed(): void
     {
+        if ($this->closeInfo === '') { $this->closeInfo = 'socket ended without a close frame'; }
         $this->closed = true;
         $this->close();
     }
