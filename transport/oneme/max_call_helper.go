@@ -26,6 +26,25 @@ func decodeCallDetails(vcp string) (string, error) {
 	return string(decompressed[:n]), nil
 }
 
+func parseCallerParams(raw json.RawMessage) (InternalCallerParams, error) {
+	var params InternalCallerParams
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return params, fmt.Errorf("decode start-call payload: %w", err)
+	}
+	paramsStr, _ := payload["internalCallerParams"].(string)
+	if paramsStr == "" {
+		return params, fmt.Errorf("start-call response has no internalCallerParams")
+	}
+	if err := json.Unmarshal([]byte(paramsStr), &params); err != nil {
+		return params, fmt.Errorf("decode internalCallerParams: %w", err)
+	}
+	if params.Endpoint == "" {
+		return params, fmt.Errorf("start-call response has empty endpoint")
+	}
+	return params, nil
+}
+
 func craftEndpoint(convID, jsonConfig string) string {
 	var config WebRTCConfig
 	json.Unmarshal([]byte(jsonConfig), &config)
