@@ -65,7 +65,7 @@ final class Mux
     // member, the sender too: our own message coming back is the server saying it took it. Past a few unconfirmed,
     // the server is behind - and what it has queued for us (the client's OPENs, its pings) waits behind our echoes:
     // it ended the link with "no pong" under a download. Sending only as fast as it confirms keeps that queue short.
-    const OUT_WINDOW     = 6;
+    const OUT_WINDOW     = 12;   // ~0.5 s of the server's work at its ~72 KB/s: enough to keep it busy
     const OUT_CONFIRM_TO = 3.0;    // seconds without a confirmation before the window is assumed lost (a reconnect)
 
     /** @var null|callable(string,string):void  fn($level, $message): error|warn|info|debug */
@@ -86,6 +86,14 @@ final class Mux
     /** seconds a stream may carry no data either way before the exit closes it (its CLOSE can be lost on the way); 0 = never */
     public int $idleTimeout = 300;
     public bool $accepting = true;
+    /**
+     * Bytes per second read from destinations, over all streams (0 = no limit). A generation sets it while its successor
+     * is in the room: the document server sends every member's messages to every member, the successor gets ours too,
+     * and at full speed its queue at the server grew by seconds - the client's OPENs to it waited behind our download.
+     */
+    public int $readRate = 0;
+    private float $rateSec = 0.0;
+    private int $rateUsed = 0;
     /** @var null|callable(int):bool  fn($sid): during a handover both generations see the same OPEN; true = this one owns it */
     public $claim = null;
 
@@ -566,6 +574,7 @@ final class Mux
             return;
         }
         $this->stats['down'] += strlen($d);
+        $this->rateUsed += strlen($d);
         $this->act[$sid] = microtime(true);
         if (isset($this->fc[$sid])) {
             $this->fc[$sid]['sent'] = ($this->fc[$sid]['sent'] + strlen($d)) & self::MASK;
@@ -579,6 +588,10 @@ final class Mux
     {
         if ($this->paced && (($this->bulkLen[$sid] ?? 0) >= self::OUT_STREAM_MAX || $this->bulkAll >= self::OUT_ALL_MAX)) {
             return true;                               // the carrier is behind: let it catch up before reading more
+        }
+        if ($this->readRate > 0) {
+            if ($now - $this->rateSec >= 1.0) { $this->rateSec = $now; $this->rateUsed = 0; }
+            if ($this->rateUsed >= $this->readRate) { return true; }
         }
         if (!isset($this->fc[$sid])) {
             return false;

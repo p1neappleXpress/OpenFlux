@@ -152,10 +152,14 @@ final class PhpboxBudget
     const LEARN_TTL = 7 * 86400;   // a host's limits can change; forget what was learned after a week
     const MIN_WALL  = 30;          // shorter than this nothing useful fits: never plan below it
 
-    public int $wall;              // seconds of wall time this generation plans to live
+    const SAFE_HANDOVER = 45;      // a generation hands over this early even on a host that looks generous: a free host's
+                                   // real limit is unknown until one generation dies by it, and that death must happen
+                                   // AFTER a successor was started, or the chain cannot carry the lesson forward. So the
+                                   // first generations always hand over well under any plausible limit; deaths only lower it.
+
+    public int $wall;              // seconds of wall time a limit (known or default) would end this request at
     public float $cpu = 0.0;       // CPU seconds this request may use (0 = no limit known)
     public array $why = [];        // where the numbers came from, for the log
-    public int $proven = 0;        // the longest a generation has lived here and ended on its own terms
     private float $cpu0;
 
     public function __construct(int $cap, string $dir)
@@ -177,7 +181,6 @@ final class PhpboxBudget
             }
         }
         $h = self::learned($dir);
-        $this->proven = (int)($h['ok'] ?? 0);
         if (!empty($h['wall'])) { $this->capWall((int)$h['wall'] - 10, "a generation died at {$h['wall']}s"); }
         if (!empty($h['cpu']))  { $this->capCpu((float)$h['cpu'], "a generation died after {$h['cpu']}s of CPU"); }
     }
@@ -206,42 +209,20 @@ final class PhpboxBudget
     }
 
     /**
-     * When a generation starts its successor. On a host not yet proven for the whole run, early - and never later than
-     * the age a generation has already lived here - so a limit nobody told us about cannot end a generation before it
-     * has handed over. Each generation that ends well proves a longer life, up to the full run.
+     * When a generation starts its successor: early and fixed, so that even on a host whose limit we have never seen a
+     * generation hands over long before that limit and starts the next one. Lowered only when a known limit is close.
+     * Not grown toward the limit: a generation that handed over at this point never observed the host would allow more,
+     * so there is nothing to safely grow from, and reaching for a longer run is exactly what broke the chain.
      */
-    public function spawnAt(int $drain): int
+    public function spawnAt(): int
     {
-        $full = $this->wall - $drain;
-        return $this->provenFull() ? $full : min($full, max(40, $this->proven));
-    }
-
-    /** How long a generation that has handed over stays up (idle once its streams end) to prove a longer life. */
-    public function holdUntil(int $spawnAt): int
-    {
-        return $this->provenFull() ? 0 : min($this->wall, max($this->proven, $spawnAt) + 60);
-    }
-
-    public function provenFull(): bool
-    {
-        return $this->proven >= $this->wall - 5;
-    }
-
-    /** A generation ended on its own terms after $age seconds: requests live at least that long here. */
-    public static function prove(string $dir, int $age): void
-    {
-        $h = self::learned($dir);
-        if ($age <= (int)($h['ok'] ?? 0)) { return; }
-        $h['ok'] = $age;
-        if (!empty($h['wall']) && $age >= (int)$h['wall']) { unset($h['wall']); }   // it lived past what we feared
-        $h['at'] = time();
-        @file_put_contents("$dir/host.json", json_encode($h));
+        return max(4, min(self::SAFE_HANDOVER, (int)($this->wall * 0.65)));   // ~2/3 of the limit, never later than SAFE_HANDOVER
     }
 
     public function describe(): string
     {
-        return "{$this->wall}s" . ($this->cpu > 0 ? ", CPU {$this->cpu}s" : '') . ($this->why ? ' (' . implode('; ', $this->why) . ')' : '')
-            . ($this->provenFull() ? '' : "; this host has kept a run alive {$this->proven}s so far, so handovers start early and grow");
+        return "hand over at {$this->spawnAt()}s; limit " . ($this->cpu > 0 ? "CPU {$this->cpu}s" : "{$this->wall}s wall")
+            . ($this->why ? ' (' . implode('; ', $this->why) . ')' : '');
     }
 
     // ---- learning ----------------------------------------------------------
@@ -311,6 +292,7 @@ final class PhpboxNode
     // A successor takes streams only once its link has stayed up this long: a Mail.ru document closes the first
     // connections right after they join, and streams handed over then were lost with the link.
     const SETTLE = 8;
+    const OVERLAP_RATE = 131072;  // bytes/s a generation sends while its successor shares the room
 
     /**
      * @param string   $carrier  'cupsonline' | 'mailru' - the transport type a link must carry to fit this exit
@@ -394,9 +376,7 @@ final class PhpboxNode
         $learnedNow = PhpboxBudget::learn($dir, $gens);   // a generation before us died early: plan around it
         $budget  = new PhpboxBudget($cap, $dir);
         $cap     = $budget->wall;
-        $drain   = min(self::MAX_DRAIN, intdiv($cap, 3));
-        $spawnAt = $chain ? $budget->spawnAt($drain) : $cap - $drain;   // when this generation starts its successor (or earlier: CPU)
-        $holdUntil = $chain ? $budget->holdUntil($spawnAt) : 0;
+        $spawnAt = $chain ? $budget->spawnAt() : $cap - min(self::MAX_DRAIN, intdiv($cap, 3));   // when this generation starts its successor (or earlier: CPU)
         if (!$succ) {
             $accepting = array_filter($gens, fn($g) => PhpboxState::accepting($g));
             if ($accepting) {
@@ -462,7 +442,7 @@ final class PhpboxNode
             @rmdir($d);
         };
         $ended = false;
-        $finish = function (string $why, string $lvl = 'info') use (&$s, $state, $log, &$ended, $rmOwn, $ownMine, $budget, $dir) {
+        $finish = function (string $why, string $lvl = 'info') use (&$s, $state, $log, &$ended, $rmOwn, $ownMine, $budget) {
             if ($ended) { return; }
             $ended = true;
             $s['phase'] = 'idle';
@@ -470,9 +450,6 @@ final class PhpboxNode
             $s['elapsed'] = time() - $s['started'];
             $s['cpu'] = $budget->cpuUsed();
             $s['reason'] = $why;
-            if (!str_starts_with($why, 'died') && $why !== 'process ended' && !str_starts_with($why, 'could not join')) {
-                PhpboxBudget::prove($dir, (int)$s['elapsed']);   // it lived this long here and ended on its own terms
-            }
             $state->write($s);
             $rmOwn($ownMine);
             $log->write($lvl, "node gen {$s['gen']} ended: $why");
@@ -523,7 +500,7 @@ final class PhpboxNode
 
         $mux->onTick = function (Mux $m) use (&$s, $state, $started, $dir, $key, $chain, $spawnAt, $target, $cap, $sensitive, $gen,
                                               $log, &$asSucc, &$asPred, &$spawned, &$lastSpawn, &$spawnTries, &$frozen, &$endWhy,
-                                              $predState, $succState, $ownMine, $budget, $holdUntil, $carrier, &$settled, &$upSince, &$seenReconnects) {
+                                              $predState, $succState, $ownMine, $budget, $carrier, &$settled, &$upSince, &$seenReconnects) {
             $s['beat'] = time();
             $s['elapsed'] = time() - $started;
             $s['streams'] = $m->activeStreams();
@@ -592,28 +569,15 @@ final class PhpboxNode
                     }
                 }
             }
+            // While a successor is in the room, go easy on it: it receives everything we send (see Mux::$readRate).
+            $m->readRate = ($spawned || $frozen) ? self::OVERLAP_RATE : 0;
             if ($frozen && $m->activeStreams() === 0) {
-                $endWhy = $s['elapsed'] < $holdUntil ? 'hold' : 'handed';
+                $endWhy = 'handed';
                 return false;
             }
             return true;
         };
         $why = $mux->run($cap);
-        if ($endWhy === 'hold') {
-            // Out of the room (the successor serves it), but still up: this host has not yet kept a run alive this long.
-            if (method_exists($carrier, 'close')) { $carrier->close(); }
-            $s['phase'] = 'holding';
-            $state->write($s);
-            $log->write('debug', "streams done; staying up (idle) until {$holdUntil}s to prove a longer run on this host");
-            while (time() - $started < $holdUntil && !file_exists("$dir/$key.stop")) {
-                usleep(1000000);
-                $s['beat'] = time();
-                $s['elapsed'] = time() - $started;
-                $s['cpu'] = $budget->cpuUsed();
-                $state->write($s);
-            }
-            $endWhy = 'handed';
-        }
         if ($endWhy === 'stopped')     { $finish('stopped from the page'); }
         elseif ($endWhy === 'handed')  { $finish('handed over to gen ' . ($gen + 1) . ' (its streams ended)'); }
         elseif ($endWhy === 'cpu' && $frozen) { $finish('handed over to gen ' . ($gen + 1) . "; the CPU budget ({$budget->cpu}s) cut the streams still open"); }
