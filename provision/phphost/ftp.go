@@ -80,8 +80,11 @@ func dial(ctx context.Context, t FTP) (*session, error) {
 		sec  string
 	}
 	host := strings.TrimSpace(t.Host)
-	verified := &tls.Config{ServerName: host}
-	lax := &tls.Config{ServerName: host, InsecureSkipVerify: true}
+	// A session cache lets data connections resume the control connection's TLS session: servers
+	// that insist on it refuse a data connection that starts a new one.
+	cache := tls.NewLRUClientSessionCache(16)
+	verified := &tls.Config{ServerName: host, ClientSessionCache: cache}
+	lax := &tls.Config{ServerName: host, InsecureSkipVerify: true, ClientSessionCache: cache}
 	base := []ftp.DialOption{ftp.DialWithContext(ctx), ftp.DialWithTimeout(20 * time.Second)}
 	var attempts []attempt
 	switch t.TLS {
@@ -309,12 +312,14 @@ func join(dir, name string) string {
 
 // Progress is reported while Deploy uploads.
 type Progress struct {
-	Phase      string `json:"phase"` // "connect" | "probe" | "upload" | "done"
+	Phase      string `json:"phase"` // "connect" | "probe" | "upload" | "retry" | "skipped" | "done"
 	File       string `json:"file,omitempty"`
 	N          int    `json:"n"`          // files finished
 	Of         int    `json:"of"`         // files in all
 	BytesDone  int64  `json:"bytes_done"` // over all files
 	BytesTotal int64  `json:"bytes_total"`
+	// Retry, skipped: what went wrong and what is tried next, for the app's log.
+	Note string `json:"note,omitempty"`
 }
 
 // Installed is what Deploy answers.
@@ -325,7 +330,21 @@ type Installed struct {
 	Bytes    int64  `json:"bytes"`
 	Security string `json:"security"`
 	Reused   bool   `json:"token_reused"` // the node was installed before; its token was kept
+	// Skipped: optional files the host would not take (the page's link parser); the node runs without them.
+	Skipped []string `json:"skipped,omitempty"`
 }
+
+const (
+	uploadTries     = 4 // times one file is sent before the install gives up on it
+	tlsTriesOnFile  = 2 // failed sends over a TLS data channel before "auto" goes on in plain FTP
+	optionalFileWhy = "the page's link parser: the node runs without it, the page reads no links"
+)
+
+// retryPause is the wait before a file is sent again (a var: tests shorten it).
+var retryPause = 2 * time.Second
+
+// optional are files a node runs without: a host that will not take them gets the rest.
+var optional = map[string]bool{"assets/share.wasm.gz": true}
 
 type countingReader struct {
 	r    io.Reader
@@ -383,27 +402,86 @@ func Deploy(ctx context.Context, t FTP, token string, progress func(Progress)) (
 		_ = s.c.MakeDir(join(p.Dir, d)) // exists already on a reinstall
 	}
 	var done int64
+	var skipped []string
+	security := s.security
 	for i, f := range files {
-		if ctx.Err() != nil {
-			return nil, fail(CodeUpload, f.Path, "phphost: cancelled", ctx.Err())
-		}
 		start := done
-		cr := &countingReader{r: bytes.NewReader(f.Data), done: &done}
-		cr.tick = func() {
-			progress(Progress{Phase: "upload", File: f.Path, N: i, Of: len(files), BytesDone: done, BytesTotal: total})
-		}
-		if err := s.c.Stor(join(p.Dir, f.Path), cr); err != nil {
-			return nil, fail(CodeUpload, f.Path, "phphost: upload failed", err)
+		for try := 1; ; try++ {
+			if ctx.Err() != nil {
+				return nil, fail(CodeUpload, f.Path, "phphost: cancelled", ctx.Err())
+			}
+			done = start
+			err := s.put(join(p.Dir, f.Path), f.Data, func() {
+				progress(Progress{Phase: "upload", File: f.Path, N: i, Of: len(files), BytesDone: done, BytesTotal: total})
+			}, &done)
+			if err == nil {
+				break
+			}
+			// Free hosts drop transfers (InfinityFree's Pure-FTPd: "451 Transfer aborted" part way through a 2 MB file over
+			// a TLS data channel, while curl in plain FTP sent it whole). Connect again and send the file again; after
+			// two failures over TLS, "auto" goes on in plain FTP, as it would have if the host had no TLS at all.
+			if try >= uploadTries {
+				if optional[f.Path] {
+					skipped = append(skipped, f.Path)
+					done = start + int64(len(f.Data))
+					progress(Progress{Phase: "skipped", File: f.Path, N: i + 1, Of: len(files), BytesDone: done, BytesTotal: total,
+						Note: fmt.Sprintf("%s: %v (%s)", f.Path, err, optionalFileWhy)})
+					break
+				}
+				return nil, fail(CodeUpload, f.Path, "phphost: upload failed", err)
+			}
+			mode := redialMode(t.TLS, s.security, try)
+			note := fmt.Sprintf("%s: %v; try %d of %d", f.Path, err, try+1, uploadTries)
+			if mode == "none" && s.security != SecurityNone {
+				note += ", now in plain FTP"
+			}
+			progress(Progress{Phase: "retry", File: f.Path, N: i, Of: len(files), BytesDone: start, BytesTotal: total, Note: note})
+			s.close()
+			select {
+			case <-ctx.Done():
+				return nil, fail(CodeUpload, f.Path, "phphost: cancelled", ctx.Err())
+			case <-time.After(retryPause):
+			}
+			again := t
+			again.TLS = mode
+			if s, err = dial(ctx, again); err != nil {
+				return nil, err
+			}
+			defer s.close()
+			if s.security == SecurityNone {
+				security = SecurityNone // the password has crossed in the clear: say so
+			}
 		}
 		done = start + int64(len(f.Data))
 		progress(Progress{Phase: "upload", File: f.Path, N: i + 1, Of: len(files), BytesDone: done, BytesTotal: total})
-		// A truncated upload is the usual silent failure on shared hosting: check the size where the server can say.
-		if sz, err := s.c.FileSize(join(p.Dir, f.Path)); err == nil && sz != int64(len(f.Data)) {
-			return nil, fail(CodeUpload, f.Path, fmt.Sprintf("phphost: %s arrived as %d bytes, sent %d", f.Path, sz, len(f.Data)), nil)
-		}
 	}
 	progress(Progress{Phase: "done", N: len(files), Of: len(files), BytesDone: total, BytesTotal: total})
-	return &Installed{Dir: p.Dir, Token: token, Files: len(files), Bytes: total, Security: s.security, Reused: reused}, nil
+	return &Installed{Dir: p.Dir, Token: token, Files: len(files) - len(skipped), Bytes: total, Security: security, Reused: reused, Skipped: skipped}, nil
+}
+
+// put sends one file whole, then checks its size where the server can say: a truncated upload is the usual
+// silent failure on shared hosting.
+func (s *session) put(remote string, data []byte, tick func(), done *int64) error {
+	cr := &countingReader{r: bytes.NewReader(data), done: done, tick: tick}
+	if err := s.c.Stor(remote, cr); err != nil {
+		return err
+	}
+	if sz, err := s.c.FileSize(remote); err == nil && sz != int64(len(data)) {
+		return fmt.Errorf("arrived as %d bytes, sent %d", sz, len(data))
+	}
+	return nil
+}
+
+// redialMode is the TLS mode to connect with again after a file failed on its try'th send: the same as before,
+// except that "auto" leaves a TLS data channel that failed tlsTriesOnFile times for plain FTP.
+func redialMode(asked, got string, try int) string {
+	if asked == "" || asked == "auto" {
+		if got == SecurityNone || try >= tlsTriesOnFile {
+			return "none"
+		}
+		return "auto"
+	}
+	return asked
 }
 
 // configPHP is config.php: the token as a constant (putenv is disabled on most

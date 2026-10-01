@@ -24,6 +24,8 @@ type fakeFTP struct {
 	dirs     map[string]bool   // "/htdocs"
 	readOnly bool              // STOR answers 550
 	truncate bool              // STOR keeps only half the bytes
+	abort    map[string]int    // path -> STORs left to cut short with "451 Transfer aborted" (as InfinityFree's Pure-FTPd did)
+	stors    map[string]int    // path -> STORs begun
 }
 
 func newFakeFTP(t *testing.T, user, pass string, dirs ...string) *fakeFTP {
@@ -31,7 +33,8 @@ func newFakeFTP(t *testing.T, user, pass string, dirs ...string) *fakeFTP {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeFTP{ln: ln, user: user, pass: pass, files: map[string][]byte{}, dirs: map[string]bool{"/": true}}
+	f := &fakeFTP{ln: ln, user: user, pass: pass, files: map[string][]byte{}, dirs: map[string]bool{"/": true},
+		abort: map[string]int{}, stors: map[string]int{}}
 	for _, d := range dirs {
 		f.dirs["/"+strings.Trim(d, "/")] = true
 	}
@@ -164,6 +167,23 @@ func (f *fakeFTP) session(c net.Conn) {
 			}
 			say("150 send it")
 			conn, _ := pasv.Accept()
+			f.mu.Lock()
+			f.stors[p]++
+			cut := f.abort[p] > 0
+			if cut {
+				f.abort[p]--
+			}
+			f.mu.Unlock()
+			if cut { // take a little, keep it, and hang up on the rest
+				part := make([]byte, 1024)
+				n, _ := io.ReadFull(conn, part)
+				conn.Close()
+				f.mu.Lock()
+				f.files[p] = part[:n]
+				f.mu.Unlock()
+				say(`451 Transfer aborted\n0.458 seconds (measured here), 1.40 Mbytes per second`)
+				continue
+			}
 			b, _ := io.ReadAll(conn)
 			conn.Close()
 			f.mu.Lock()

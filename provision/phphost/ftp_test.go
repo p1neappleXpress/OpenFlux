@@ -153,11 +153,113 @@ func TestDeployUploadsTheBundleAndKeepsTheTokenOnReinstall(t *testing.T) {
 }
 
 func TestDeployCatchesATruncatedUpload(t *testing.T) {
+	quickRetries(t)
 	srv := newFakeFTP(t, "u", "pw", "htdocs")
 	srv.truncate = true
 	_, err := Deploy(ctx(t), srv.target(), "", nil)
 	if code(err) != CodeUpload {
 		t.Fatalf("a half-stored file went unnoticed: %v", err)
+	}
+}
+
+func quickRetries(t *testing.T) {
+	old := retryPause
+	retryPause = time.Millisecond
+	t.Cleanup(func() { retryPause = old })
+}
+
+// InfinityFree's Pure-FTPd cut the 2 MB parser short ("451 Transfer aborted") and the whole install failed on it.
+func TestDeploySendsADroppedFileAgain(t *testing.T) {
+	quickRetries(t)
+	srv := newFakeFTP(t, "u", "pw", "htdocs")
+	srv.abort["/htdocs/lib/mux.php"] = 2
+	var retries []Progress
+	in, err := Deploy(ctx(t), srv.target(), "", func(p Progress) {
+		if p.Phase == "retry" {
+			retries = append(retries, p)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range bundle.Files() {
+		if got := srv.files["/htdocs/"+f.Path]; string(got) != string(f.Data) {
+			t.Errorf("%s was not uploaded intact (%d bytes there)", f.Path, len(got))
+		}
+	}
+	if len(retries) != 2 || retries[0].File != "lib/mux.php" || !strings.Contains(retries[0].Note, "Transfer aborted") {
+		t.Errorf("retries = %+v", retries)
+	}
+	if srv.stors["/htdocs/lib/mux.php"] != 3 || len(in.Skipped) != 0 {
+		t.Errorf("mux.php sent %d times, skipped %v", srv.stors["/htdocs/lib/mux.php"], in.Skipped)
+	}
+}
+
+func TestDeployGivesUpOnAFileTheHostKeepsRefusing(t *testing.T) {
+	quickRetries(t)
+	srv := newFakeFTP(t, "u", "pw", "htdocs")
+	srv.abort["/htdocs/lib/mux.php"] = 100
+	_, err := Deploy(ctx(t), srv.target(), "", nil)
+	var e *Error
+	if !errors.As(err, &e) || e.Code != CodeUpload || e.Param != "lib/mux.php" {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "451") {
+		t.Errorf("the host's own words are lost: %v", err)
+	}
+	if n := srv.stors["/htdocs/lib/mux.php"]; n != uploadTries {
+		t.Errorf("mux.php sent %d times, want %d", n, uploadTries)
+	}
+}
+
+// The parser only serves the page in a browser: a host that will not take it still gets a working node.
+func TestDeployGoesOnWithoutTheOptionalParser(t *testing.T) {
+	quickRetries(t)
+	srv := newFakeFTP(t, "u", "pw", "htdocs")
+	srv.abort["/htdocs/assets/share.wasm.gz"] = 100
+	var skipped []Progress
+	in, err := Deploy(ctx(t), srv.target(), "", func(p Progress) {
+		if p.Phase == "skipped" {
+			skipped = append(skipped, p)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(in.Skipped) != 1 || in.Skipped[0] != "assets/share.wasm.gz" || len(skipped) != 1 {
+		t.Fatalf("skipped = %v / %+v", in.Skipped, skipped)
+	}
+	for _, f := range bundle.Files() {
+		if f.Path == "assets/share.wasm.gz" {
+			continue
+		}
+		if got := srv.files["/htdocs/"+f.Path]; string(got) != string(f.Data) {
+			t.Errorf("%s was not uploaded intact", f.Path)
+		}
+	}
+	if !strings.Contains(string(srv.files["/htdocs/config.php"]), in.Token) {
+		t.Error("config.php missing: the node would not run")
+	}
+}
+
+func TestOnlyAutoLeavesTLSForPlainFTP(t *testing.T) {
+	cases := []struct {
+		asked, got string
+		try        int
+		want       string
+	}{
+		{"auto", SecurityTLS, 1, "auto"},           // one drop: TLS again
+		{"auto", SecurityTLSUnverified, 2, "none"}, // two over TLS: plain, as curl
+		{"", SecurityTLS, 2, "none"},
+		{"auto", SecurityNone, 1, "none"},
+		{"explicit", SecurityTLS, 3, "explicit"}, // the user asked for TLS: never weaker
+		{"implicit", SecurityTLS, 3, "implicit"},
+		{"none", SecurityNone, 1, "none"},
+	}
+	for _, c := range cases {
+		if got := redialMode(c.asked, c.got, c.try); got != c.want {
+			t.Errorf("redialMode(%q, %q, %d) = %q, want %q", c.asked, c.got, c.try, got, c.want)
+		}
 	}
 }
 
