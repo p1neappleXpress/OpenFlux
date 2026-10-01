@@ -80,7 +80,16 @@ jobs:
           # The release shows its CHANGELOG.md section, then what the assets are.
           awk -v v="${tag#v}" 'index($0, "## [")==1 { if (f) exit; f = (index($0, "## [" v "]") == 1); next } f' CHANGELOG.md > notes.md
           printf '\n%s\n' "Кросс-платформенная сборка CLI (клиент/выходная нода): \`openflux-<os>-<arch>[.exe]\`. Контрольные суммы — в \`SHA256SUMS.txt\`. Для установки выходной ноды по SSH из приложения используется отдельный релиз \`node-v*\` (см. deploy/node-install.sh)." >> notes.md
-          gh release create "$tag" dist/* \
-            --title "OpenFlux $tag" \
-            --generate-notes \
-            --notes-file notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # The tag was moved to rebuild an existing release: replace its
+            # assets and refresh the notes instead of failing on create.
+            generated=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$tag" --jq .body)
+            printf '\n%s\n' "$generated" >> notes.md
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --title "OpenFlux $tag" --notes-file notes.md
+          else
+            gh release create "$tag" dist/* \
+              --title "OpenFlux $tag" \
+              --generate-notes \
+              --notes-file notes.md
+          fi

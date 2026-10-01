@@ -41,6 +41,8 @@ interface PacedCarrier extends Carrier
     public function msgCap(): int;                       // bytes of packets one message holds
     public function interval(): float;                   // seconds between messages, at least
     public function rate(): int;                         // packet bytes per second the server forwards (0 = no limit)
+    public function unconfirmed(): int;                  // messages sent that the server has not shown back yet
+    public function confirmAll(): void;                  // forget them (they will not be shown back)
     public function sendPackets(string $packets): void;  // send one message now (no waiting)
 }
 
@@ -59,6 +61,12 @@ final class Mux
     // Paced carriers: DATA waiting for the carrier, per stream and in all, before the mux stops reading destinations.
     const OUT_STREAM_MAX = 49152;
     const OUT_ALL_MAX    = 262144;
+    // Messages a paced carrier may have at the server unconfirmed. cups.online sends every member's cursors to every
+    // member, the sender too: our own message coming back is the server saying it took it. Past a few unconfirmed,
+    // the server is behind - and what it has queued for us (the client's OPENs, its pings) waits behind our echoes:
+    // it ended the link with "no pong" under a download. Sending only as fast as it confirms keeps that queue short.
+    const OUT_WINDOW     = 6;
+    const OUT_CONFIRM_TO = 3.0;    // seconds without a confirmation before the window is assumed lost (a reconnect)
 
     /** @var null|callable(string,string):void  fn($level, $message): error|warn|info|debug */
     public $log = null;
@@ -104,6 +112,8 @@ final class Mux
     private int    $bulkAll  = 0;
     private int    $rrNext   = -1;  // the stream served last; the next message starts after it
     private float  $nextSlot = 0.0;
+    private int    $lastUnconfirmed = 0;
+    private float  $confirmSeen = 0.0;
 
     public function __construct(private Carrier $c)
     {
@@ -181,7 +191,8 @@ final class Mux
                     $dDown = $this->stats['down'] - $lastStats['down'];
                     if ($dUp || $dDown || $this->activeStreams()) {
                         $this->say('debug', sprintf('traffic %ds: %d streams, up %s, down %s',
-                            (int)($now - $lastStatsAt), $this->activeStreams(), self::human($dUp), self::human($dDown)));
+                            (int)($now - $lastStatsAt), $this->activeStreams(), self::human($dUp), self::human($dDown))
+                            . ($this->paced ? sprintf(', waiting to send %s, unconfirmed %d', self::human($this->outboxBytes()), $this->c->unconfirmed()) : ''));
                     }
                     $lastStats = $this->stats;
                     $lastStatsAt = $now;
@@ -285,6 +296,16 @@ final class Mux
     {
         if (!$this->paced || (!$this->ctlQ && !$this->bulkQ) || $now < $this->nextSlot) {
             return;
+        }
+        $u = $this->c->unconfirmed();
+        if ($u < $this->lastUnconfirmed || $u === 0) { $this->confirmSeen = $now; }   // the server is taking them
+        $this->lastUnconfirmed = $u;
+        if ($u >= self::OUT_WINDOW) {
+            if ($now - $this->confirmSeen < self::OUT_CONFIRM_TO) {
+                return;                                  // wait for the server to catch up
+            }
+            $this->c->confirmAll();                      // none came back for long: they are not coming (a reconnect)
+            $this->confirmSeen = $now;
         }
         $msg = $this->buildMessage($this->c->msgCap());
         if ($msg === '') {

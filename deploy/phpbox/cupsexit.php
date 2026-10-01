@@ -39,7 +39,9 @@ final class CupsCarrier implements PacedCarrier
     private string $recvBuf = '';
     private float $lastSend = 0.0;
     private array $ignore = [];
-    private string $lastDisconnect = '';          // user uuid => true: other generations of this node in the same room
+    private string $lastDisconnect = '';
+    private int $sent = 0;               // cursor messages sent ...
+    private int $echoed = 0;             // ... and seen back from the server (it sends ours to us too)          // user uuid => true: other generations of this node in the same room
 
     public function __construct(private string $roomURL)
     {
@@ -66,7 +68,11 @@ final class CupsCarrier implements PacedCarrier
     public function sendPackets(string $packets): void
     {
         $this->sendCursors(self::cursorsFromBytes(pack('n', strlen($packets)) . $packets));
+        $this->sent++;
     }
+
+    public function unconfirmed(): int { return max(0, $this->sent - $this->echoed); }
+    public function confirmAll(): void { $this->echoed = $this->sent; }
 
     /** Who this exit is in the room (its user uuid): the node tells the other generations to ignore it. */
     public function member(): string { return (string)($this->auth['userUUID'] ?? ''); }
@@ -82,6 +88,7 @@ final class CupsCarrier implements PacedCarrier
 
     public function connect(): bool
     {
+        $this->sent = $this->echoed = 0;     // a new link: nothing of ours is pending at the server
         [$html, $code] = PhpboxUtil::http($this->roomURL, $this->cookieFile, 'GET', null,
             ['Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language: ru-RU,ru;q=0.9']);
         if ($code !== 200) { echo "GET room status $code\n"; return false; }
@@ -147,6 +154,7 @@ final class CupsCarrier implements PacedCarrier
             // before decoding - under a download that is most of what arrives, and decoding it cost CPU the host counts.
             if (preg_match('/"user_uuid":"([0-9a-f-]{36})"/', $line, $um)
                 && ($um[1] === ($this->auth['userUUID'] ?? '') || isset($this->ignore[$um[1]]))) {
+                if ($um[1] === ($this->auth['userUUID'] ?? '')) { $this->echoed++; }   // the server took one of ours
                 continue;
             }
             $obj = json_decode($line, true);

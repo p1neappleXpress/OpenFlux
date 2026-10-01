@@ -181,6 +181,8 @@ final class PacedMem implements PacedCarrier
     public function msgCap(): int { return 3000; }
     public function interval(): float { return 0.01; }
     public function rate(): int { return 0; }
+    public function unconfirmed(): int { return 0; }
+    public function confirmAll(): void {}
     public function sendPackets(string $p): void
     {
         $t = microtime(true);
