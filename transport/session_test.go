@@ -82,6 +82,18 @@ func sessionPair(t *testing.T) (*Session, *Session, *negotiationWire, *negotiati
 	return ca, cb, a, b
 }
 
+func TestSessionStatsIncludesBatchPressure(t *testing.T) {
+	s, _, _, _ := sessionPair(t)
+	link := s.links["primary"]
+	link.batched.queueWaits.Add(3)
+	link.batched.sendErrors.Add(2)
+	stats := s.Stats()
+	if stats.QueueWaits != 3 || stats.SendRetries != 2 {
+		t.Fatalf("pressure counters = %d waits, %d retries; want 3 and 2",
+			stats.QueueWaits, stats.SendRetries)
+	}
+}
+
 func testIPv4(size int, proto byte) []byte {
 	p := make([]byte, size)
 	p[0] = 0x45
