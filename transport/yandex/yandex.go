@@ -42,17 +42,122 @@ var (
 	clientConfigRe  = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 )
 
+// ---------- saveChanges: шаблоны и сборка ----------
+//
+// В дампе веб-клиента каждое поле фиксировано; вариативны только:
+//
+//   - UserId / UserShortId  — id участника (из editor_config.user.id);
+//   - cursorOps             — позиции/состояние каретки (по одному на сдвиг);
+//   - appVersion            — версия клиента (в оп-метаданных, зашита в base64).
+//
+// Формат самих оп — закрытый бинарник редактора. Мы не пытаемся его
+// изобрести заново: воспроизводим ровно тот же префикс-entity и
+// base64-полезную нагрузку, что и оригинал, а меняем лишь то, что реально
+// можно менять, не порождая «мусорных» операций.
+//
+// modelMetaOp — служебный оп модели: заголовок сессии + версия клиента.
+// Он не зависит от пользователя, но привязан к версии editor’а. Менять его
+// содержимое нельзя без смены формата; вынесен отдельной константой, чтобы
+// при апдейте редактора его можно было заменить одной строкой.
+const (
+	modelMetaOp  = "76;AgAAADEA//8BAJ+fl7jkAwIALQEAAAMAAAAAAAAAAAAAAAAAAAAAAAAA9v///xoAAAAyADAAMgA2AC4AMgAuADEALgAyADIANgA4AA=="
+	entityCursor = "35" // id потока курсора (совпадает с оригиналом)
+	cursorStream = "14" // id курсор-потока в CursorInfo
+)
+
+// cursorOp собирает один курсор-оп: "<entity>;<base64>". Base64-нагрузка —
+// та же форма, что в дампе (4-байтовый заголовок длины строки, затем строка
+// userShortID в UTF-16LE, затем фиксированные поля и байт seq), но с
+// настоящим userShortID и меняющимся счётчиком seq, поэтому каждое
+// сообщение отличается и выглядит живой активностью.
+func cursorOp(userShortID string, seq int) string {
+	payload := make([]byte, 0, 32)
+	payload = append(payload, 0x06, 0x00, 0x00, 0x00) // длина строки = 6 (UTF-16 units)
+	for _, r := range userShortID {
+		payload = append(payload, byte(r), 0x00)
+	}
+	payload = append(payload,
+		0x01, 0x00, 0x1c, 0x00, // позиция/флаг курсора
+		0x01, 0x00, 0x00, 0x00,
+		byte(seq), 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	)
+	return entityCursor + ";" + base64.StdEncoding.EncodeToString(payload)
+}
+
+// cursorInfo строит CursorInfo-строку: "<stream>;<base64>". В base64 лежит
+// 6-байтовая строка userShortID (UTF-16LE) и 4 байта позиции; формат ровно
+// такой же, как в дампе, но id и позиция — настоящие.
+func cursorInfo(userShortID string, seq int) string {
+	payload := make([]byte, 0, 16)
+	payload = append(payload, 0x06, 0x00, 0x00, 0x00)
+	for _, r := range userShortID {
+		payload = append(payload, byte(r), 0x00)
+	}
+	payload = append(payload, 0x03, 0x00, 0x00, 0x00, byte(seq), 0x00)
+	return cursorStream + ";" + base64.StdEncoding.EncodeToString(payload)
+}
+
+// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию и
+// номер итерации: актуальные UserId/UserShortId и слегка меняющиеся позиции
+// курсора. Оригинальные entity-префиксы и модель-оп сохранены побайтово;
+// меняется только то, что действительно зависит от участника.
+func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []byte {
+	userID := session.Info.EditorUserID
+	if userID == "" {
+		userID = session.UserID // fallback: псевдо-id, если jwt не дал реального
+	}
+	short := userID
+	if len(short) > 10 {
+		short = short[:10]
+	}
+
+	changes := []string{
+		modelMetaOp,
+		cursorOp(short, seq),
+		cursorOp(short, seq+1),
+		cursorOp(short, seq+2),
+	}
+	changesJSON, _ := json.Marshal(changes) // ["...","..."]
+
+	excelInfo := map[string]string{
+		"UserId":      userID,
+		"UserShortId": short,
+		"CursorInfo":  cursorInfo(short, seq),
+	}
+	excelJSON, _ := json.Marshal(excelInfo)
+
+	msg := map[string]interface{}{
+		"type":                "saveChanges",
+		"changes":             string(changesJSON),
+		"startSaveChanges":    true,
+		"endSaveChanges":      true,
+		"isCoAuthoring":       true,
+		"isExcel":             session.Info.IsExcel,
+		"deleteIndex":         nil,
+		"excelAdditionalInfo": string(excelJSON),
+		"unlock":              false,
+		"releaseLocks":        true,
+	}
+	body, _ := json.Marshal([]interface{}{"message", msg})
+	return append([]byte("42"), body...)
+}
+
 type YandexDocsInfo struct {
-	CookieStr   string
-	Token       string
-	DocID       string
-	CallbackURL string
-	UserID      string
-	Origin      string
-	Host        string
-	WsURL       string
-	Permissions map[string]interface{}
-	OpenCmd     map[string]interface{}
+	CookieStr    string
+	Token        string
+	DocID        string
+	CallbackURL  string
+	UserID       string
+	EditorUserID string // editor_config.user.id: настоящий id участника в документе
+	IsExcel      bool   // editor_config.document.fileType ∈ {xlsx,xls,xlsm,csv}
+	Origin       string
+	Host         string
+	WsURL        string
+	Permissions  map[string]interface{}
+	OpenCmd      map[string]interface{}
 }
 
 type DocSession struct {
@@ -116,6 +221,7 @@ func (t *YandexDocsTransport) Start() error {
 
 	t.baseUserID = randUserID()
 	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
+	utils.SafeGo("yandex.editorActivity", t.editorActivityLoop)
 	t.connectToDoc(0)
 
 	return nil
@@ -366,6 +472,46 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 				// a half-open socket forever, errors out and reconnects.
 				_ = session.Conn.Close()
 			}
+		}
+	}
+}
+
+// editorActivityLoop периодически отправляет в документ saveChanges-сообщение,
+// собранное под текущую сессию (см. buildSaveChanges): актуальные
+// UserId/UserShortId и слегка меняющиеся позиции курсора. Задержка между
+// отправками — случайная в диапазоне [0.5 с, 5 с], чтобы поток выглядел как
+// правки живого человека: ровный по сути, но не метрономом. Сообщение уходит
+// через ту же сессию, что writerLoop и keepAliveLoop, и так же терпит
+// переподключение — если сессии сейчас нет, итерация просто пропускается.
+func (t *YandexDocsTransport) editorActivityLoop() {
+	const (
+		minDelay = 500 * time.Millisecond
+		maxDelay = 5 * time.Second
+	)
+	seq := 0
+	for t.IsRunning() {
+		span := int64(maxDelay - minDelay)
+		delay := minDelay + time.Duration(rand.Int63n(span+1))
+
+		select {
+		case <-time.After(delay):
+		case <-t.Done():
+			return
+		}
+
+		t.Mu.RLock()
+		session := t.session
+		t.Mu.RUnlock()
+		if session == nil || session.Conn == nil {
+			continue // mid-reconnect: nothing to write into
+		}
+
+		seq++
+		msg := t.buildSaveChanges(session, seq)
+		if err := session.safeWrite(websocket.TextMessage, msg); err != nil {
+			utils.Debugf("[YDOCS] saveChanges write error: %v", err)
+			// Держим цикл: следующая итерация попробует снова, а
+			// переподключение (keepAliveLoop / reader) поднимет новый conn.
 		}
 	}
 }
@@ -731,14 +877,28 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		perms = make(map[string]interface{})
 	}
 
+	// editor_config.user.id — настоящий id участника в документе: под него
+	// сервер подписывает presence/курсоры, и именно его нужно нести в
+	// saveChanges (иначе auth-сессия и saveChanges разойдутся).
+	editorUserID := ""
+	if userObj, ok := editorConfigRaw["user"].(map[string]interface{}); ok {
+		if s, ok := userObj["id"].(string); ok {
+			editorUserID = s
+		}
+	}
+	fileType, _ := document["fileType"].(string)
+	isExcel := isExcelFile(fileType)
+
 	return YandexDocsInfo{
-		CookieStr:   strings.Join(cookies, "; "),
-		Token:       token,
-		DocID:       docKey,
-		Origin:      balancerURL,
-		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docKey),
-		Permissions: perms,
+		CookieStr:    strings.Join(cookies, "; "),
+		Token:        token,
+		DocID:        docKey,
+		Origin:       balancerURL,
+		Host:         host,
+		EditorUserID: editorUserID,
+		IsExcel:      isExcel,
+		WsURL:        fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docKey),
+		Permissions:  perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
 			"id":     docKey,
@@ -749,6 +909,16 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 			"lcid":   25,
 		},
 	}, nil
+}
+
+// isExcelFile — таблица ли это, по fileType из editor_config.document.
+// От этого зависит поле isExcel в saveChanges.
+func isExcelFile(fileType string) bool {
+	switch strings.ToLower(strings.TrimPrefix(fileType, ".")) {
+	case "xlsx", "xls", "xlsm", "csv":
+		return true
+	}
+	return false
 }
 
 func randUserID() string {
