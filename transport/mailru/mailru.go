@@ -33,6 +33,17 @@ const mailruUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWe
 
 var cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
 
+// saveChangesMessageTemplate — шаблон saveChanges-сообщения в формате
+// веб-клиента Mail.ru: две подстановки %s — UserId и UserShortId в
+// excelAdditionalInfo. Остальные поля (op-ы в changes, анкоры, версия)
+// оставлены ровно такими, какими их шлёт живой редактор; это шаблон, а не
+// «правильная» структура — формат оп закрытый, и мы только подставляем свои
+// значения участника.
+//
+// Поля isCoAuthoring/releaseLocks = false — особенность именно mail.ru
+// (у yandex.docs там true/true).
+const saveChangesMessageTemplate = `42["message",{"type":"saveChanges","changes":"[\"76;AgAAADEA//8BAOwbfF7pEAAALQEAAAMAAAAAAAAAAAAAAAAAAAAAAAAA9v///xoAAAAyADAAMgA2AC4AMgAuADEALgAyADIANgA4AA==\",\"35;BgAAADYAMgA3AAEAHAABAAAAAAAAAAEAAABhAAAAAAMAAAA=\",\"35;BgAAADYAMgA3AAEAHAABAAAAAQAAAAEAAABzAAAAAAMAAAA=\",\"35;BgAAADYAMgA3AAEAHAABAAAAAgAAAAEAAABkAAAAAAMAAAA=\"]","startSaveChanges":true,"endSaveChanges":true,"isCoAuthoring":false,"isExcel":false,"deleteIndex":null,"excelAdditionalInfo":"{\"UserId\":\"%s\",\"UserShortId\":\"%s\",\"CursorInfo\":\"14;BgAAADYAMgA3AAMAAAA=\"}","unlock":false,"releaseLocks":false}]`
+
 type MailruDocsInfo struct {
 	Token        string
 	DocKey       string
@@ -114,6 +125,7 @@ func (t *MailruDocsTransport) Start() error {
 
 	t.baseUserID = randUserID()
 	utils.SafeGo("mailru.keepAlive", t.keepAliveLoop)
+	utils.SafeGo("mailru.editorActivity", t.editorActivityLoop)
 	t.connectToDoc(0)
 
 	return nil
@@ -221,13 +233,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			utils.SafeGo("mailru.writer", t.writerLoop)
 		}
 
-		// Auth - fired immediately, same as the Yandex.Docs transport. No
-		// need to wait for the server's own "0{"/"40" handshake frames
-		// first: Mail.ru's coauthoring server buffers and processes these
-		// once its own session state catches up, and waiting for explicit
-		// acks here only stretches the outage window on every reconnect
-		// (Mail.ru can delay a fresh joiner's auth confirmation by up to
-		// ~30s while it reconciles with the other participant).
+		// Auth - fired immediately, same as the Yandex.Docs transport.
 		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
 		session.safeWrite(websocket.TextMessage, []byte(auth1))
 
@@ -295,8 +301,6 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 }
 
 func (t *MailruDocsTransport) writerLoop() {
-	// The write queue is created once and preserved across reconnects, so we
-	// capture it and block on it instead of polling with a sleep.
 	var queue chan []byte
 	for t.IsRunning() && queue == nil {
 		t.Mu.Lock()
@@ -326,7 +330,6 @@ func (t *MailruDocsTransport) writerLoop() {
 		session := t.session
 		t.Mu.RUnlock()
 		if session == nil || session.Conn == nil {
-			// Mid-reconnect: hold the packet and retry rather than drop it.
 			time.Sleep(15 * time.Millisecond)
 			continue
 		}
@@ -336,7 +339,7 @@ func (t *MailruDocsTransport) writerLoop() {
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[M-DOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
-			continue // keep pending; the reconnect will bring up a new conn
+			continue
 		}
 		pending = nil
 	}
@@ -357,18 +360,69 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[M-DOCS] Keep-alive failed, closing the connection to reconnect: %v", err)
 				t.SetConnected(false)
-				// Close it so the reader, which may sit in ReadMessage on
-				// a half-open socket forever, errors out and reconnects.
 				_ = session.Conn.Close()
 			}
 		}
 	}
 }
 
+// editorActivityLoop периодически отправляет в документ saveChanges-сообщение
+// в формате веб-клиента Mail.ru: значения UserId/UserShortId подставляются
+// из текущей сессии, остальное — фиксированный шаблон (см.
+// saveChangesMessageTemplate). Задержка между отправками — случайная в
+// диапазоне [0.5 с, 5 с], чтобы поток выглядел как правки живого человека:
+// ровный по сути, но не метрономом. Сообщение уходит через ту же сессию, что
+// writerLoop и keepAliveLoop, и так же терпит переподключение — если сессии
+// сейчас нет, итерация просто пропускается.
+func (t *MailruDocsTransport) editorActivityLoop() {
+	const (
+		minDelay = 500 * time.Millisecond
+		maxDelay = 5 * time.Second
+	)
+	for t.IsRunning() {
+		span := int64(maxDelay - minDelay)
+		delay := minDelay + time.Duration(rand.Int63n(span+1))
+
+		select {
+		case <-time.After(delay):
+		case <-t.Done():
+			return
+		}
+
+		t.Mu.RLock()
+		session := t.session
+		t.Mu.RUnlock()
+		if session == nil || session.Conn == nil {
+			continue
+		}
+
+		msg := buildSaveChanges(session)
+		if err := session.safeWrite(websocket.TextMessage, msg); err != nil {
+			utils.Debugf("[M-DOCS] saveChanges write error: %v", err)
+		}
+	}
+}
+
+// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию:
+// UserId — настоящий id участника (info.EditorUserID, при отсутствии —
+// сгенерированный session.UserID), UserShortId — производная от UserId
+// (в веб-клиенте Mail.ru это UserId без последнего символа). Остальное — из
+// шаблона.
+func buildSaveChanges(session *DocSession) []byte {
+	userID := session.Info.EditorUserID
+	if userID == "" {
+		userID = session.UserID
+	}
+	short := userID
+	if len(short) > 1 {
+		short = short[:len(short)-1]
+	}
+	return []byte(fmt.Sprintf(saveChangesMessageTemplate, userID, short))
+}
+
 func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
-	// Socket.IO ping - respond with pong
 	if text == "2" {
 		if session != nil && session.Conn != nil {
 			session.safeWrite(websocket.TextMessage, []byte("3"))
@@ -385,8 +439,6 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 
 	if strings.Contains(text, "cursor") {
-		// One server message may carry several cursor entries (the server batches them
-		// under load), a peer's keep-alive among them: deliver every payload, in order.
 		for _, base64Str := range cursorPayloads(text) {
 			decoded, err := base64.StdEncoding.DecodeString(base64Str)
 			if err != nil {
@@ -400,9 +452,7 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 }
 
 // cursorPayloads returns the base64 payload of every cursor entry in a server
-// message, in order, without the keep-alive entries. Taking only the first
-// entry (as before) lost data whenever the server batched entries, and
-// dropped a whole batch when a peer's keep-alive came first.
+// message, in order, without the keep-alive entries.
 func cursorPayloads(text string) []string {
 	var out []string
 	for _, m := range cursorPayloadRe.FindAllStringSubmatch(text, -1) {
@@ -443,7 +493,6 @@ func reconnectBackoff(n int) time.Duration {
 	if d > 15*time.Second {
 		d = 15 * time.Second
 	}
-	// add up to +50% jitter
 	d += time.Duration(rand.Int63n(int64(d/2) + 1))
 	return d
 }
@@ -509,9 +558,6 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	fileType, _ := document["fileType"].(string)
 	docURL, _ := document["url"].(string)
 	docTitle, _ := document["title"].(string)
-	// document.permissions is an object of booleans (comment/edit/download/…),
-	// not a number - sending it as anything else makes the editor server
-	// reject the auth message with "access deny".
 	permissions, _ := document["permissions"].(map[string]interface{})
 	if permissions == nil {
 		permissions = make(map[string]interface{})
