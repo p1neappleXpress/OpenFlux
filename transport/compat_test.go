@@ -219,9 +219,14 @@ func TestContextFallback(t *testing.T) {
 		a, b := asyncPair()
 		cl := oldClassic(t, a, CodecBatched, "rooms", false)
 		ex := newClassic(t, b, CodecBatched, ContextPlaceholder, []string{"rooms"}, true)
-		d := roundTrip(t, cl, ex, 5*time.Second)
-		if d > 2*time.Second {
-			t.Fatalf("exit took %v to answer under the client's context", d)
+		d := roundTrip(t, cl, ex, 10*time.Second)
+		// The exit must answer without waiting for a context rotation
+		// (contextFirstRotate); how long the on-demand scrypt of the alternate
+		// context takes depends on the machine (about 3 s under -race on a
+		// shared CI runner), so the bound is the rotation period, not a
+		// stopwatch on this machine.
+		if d > contextFirstRotate {
+			t.Fatalf("exit took %v to answer under the client's context (rotation period %v)", d, contextFirstRotate)
 		}
 	})
 	t.Run("Session over mismatched contexts", func(t *testing.T) {
