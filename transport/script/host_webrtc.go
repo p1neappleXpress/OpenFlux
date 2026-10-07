@@ -116,6 +116,30 @@ func newPeerConnectionJS(vm *goja.Runtime, t *ScriptTransport, call goja.Functio
 		return newDataChannelJS(vm, t, dc)
 	})
 
+	// addTransceiver(kind, {direction}) puts an RTP m-line into the next offer. A data-channel-only
+	// offer is refused by servers that expect a conference client (MTS-Link's SFU wants an audio
+	// line); "recvonly" asks for nothing to be sent, so no media ever flows from here.
+	obj.Set("addTransceiver", func(call goja.FunctionCall) goja.Value {
+		kind := webrtc.NewRTPCodecType(call.Argument(0).String())
+		if kind == 0 {
+			panic(vm.NewTypeError(`addTransceiver(kind, init): kind must be "audio" or "video"`))
+		}
+		init := webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv}
+		if o, ok := call.Argument(1).(*goja.Object); ok {
+			if v := o.Get("direction"); v != nil && !goja.IsUndefined(v) {
+				d := webrtc.NewRTPTransceiverDirection(v.String())
+				if d == 0 {
+					panic(vm.NewTypeError(`addTransceiver(kind, init): direction must be "sendrecv", "sendonly", "recvonly" or "inactive"`))
+				}
+				init.Direction = d
+			}
+		}
+		if _, err := pc.AddTransceiverFromKind(kind, init); err != nil {
+			panic(vm.NewGoError(err))
+		}
+		return goja.Undefined()
+	})
+
 	obj.Set("createOffer", func(call goja.FunctionCall) goja.Value {
 		promise, resolve, reject := vm.NewPromise()
 		desc, err := pc.CreateOffer(nil)
@@ -238,12 +262,15 @@ func newDataChannelJS(vm *goja.Runtime, t *ScriptTransport, dc *webrtc.DataChann
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		data := msg.Data
+		isString := msg.IsString
 		t.loop.RunOnLoop(func(vm *goja.Runtime) {
 			fn, ok := goja.AssertFunction(obj.Get("onmessage"))
 			if !ok {
 				return
 			}
-			_, _ = fn(obj, vm.ToValue(vm.NewArrayBuffer(data)))
+			// Always an ArrayBuffer; the second argument says whether the peer sent it as text, for
+			// a channel that carries signaling (strings) next to the tunnel's packets (binary).
+			_, _ = fn(obj, vm.ToValue(vm.NewArrayBuffer(data)), vm.ToValue(isString))
 		})
 	})
 

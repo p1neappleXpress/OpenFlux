@@ -5,6 +5,13 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Script transports: WebRTC with an RTP line and typed data-channel messages.** `pc.addTransceiver(kind,
+  {direction})` adds an audio or video m-line to the next offer (a conference SFU such as MTS-Link's wants
+  a `recvonly` audio line next to the data channel), and a data channel's `onmessage(bytes, isString)` now
+  tells text from binary, so a transport can keep the signaling strings apart from the tunnel's packets.
+
 ## [0.4.1] - 2026-10-07
 
 Hotfix for 0.4.0, found testing the release between a Windows client and a Linux L3 exit.
