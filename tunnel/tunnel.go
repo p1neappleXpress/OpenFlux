@@ -371,6 +371,7 @@ func (t *TCPTunnel) Close() {
 func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	var lastRetrans, lastQueueWaits, lastSendRetries uint64
 
 	for {
 		select {
@@ -378,14 +379,22 @@ func (t *TCPTunnel) printStats() {
 			return
 		case <-ticker.C:
 			stats := t.gvisorStack.Stats()
-			utils.Debugf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d",
+			carrier := t.transport.Stats()
+			retrans := stats.TCP.Retransmits.Value()
+			message := fmt.Sprintf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d queue_waits=%d send_retries=%d",
 				time.Since(t.startTime).Round(time.Second),
 				t.exitMode.String(),
 				t.packetCount.Load(),
 				stats.TCP.CurrentConnected.Value(),
 				stats.TCP.CurrentEstablished.Value(),
-				stats.TCP.Retransmits.Value(),
+				retrans, carrier.QueueWaits, carrier.SendRetries,
 			)
+			if retrans > lastRetrans || carrier.QueueWaits > lastQueueWaits || carrier.SendRetries > lastSendRetries {
+				utils.Infof("%s", message)
+			} else {
+				utils.Debugf("%s", message)
+			}
+			lastRetrans, lastQueueWaits, lastSendRetries = retrans, carrier.QueueWaits, carrier.SendRetries
 		}
 	}
 }
