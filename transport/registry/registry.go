@@ -10,6 +10,7 @@ package registry
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -118,7 +119,11 @@ func newTelemost(url string, params map[string]interface{}, o Options) transport
 		return ""
 	}
 	n, auto := 3, true
-	if st := str("stripes"); st != "" && st != "auto" {
+	st := str("stripes")
+	if e := os.Getenv("TELEMOST_STRIPES"); e != "" { // debugging override
+		st = e
+	}
+	if st != "" && st != "auto" {
 		if v, err := strconv.Atoi(st); err == nil && v >= 1 {
 			n, auto = v, false
 		}

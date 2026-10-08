@@ -40,15 +40,22 @@ import (
 // accepted into the one being assembled, splicing two frames' bytes together
 // into tunnel data that looks intact but silently isn't.
 const (
-	fragMagic     = 0xF1
-	fragHeaderLen = 8
-	// Increased from 1200 to 1400 to better utilise the path MTU.
-	// RTP over UDP has ~1500 byte MTU; VP8 descriptor+header ~20 bytes,
-	// leaving ~1400 for our wire frame. This directly raises the tunnel
-	// ceiling from ~36 KB/s to ~42 KB/s at 30 fps.
-	maxVP8Payload        = 1400
-	maxFragmentBytes     = maxVP8Payload
+	fragMagic            = 0xF1
+	fragHeaderLen        = 8
 	maxFragmentsPerFrame = 255
+)
+
+// maxVP8Payload is the largest wire-frame piece one RTP packet carries.
+//
+// 1312 puts the whole RTP payload (VP8 descriptor + fake keyframe header + our
+// piece) at 1332 bytes, the size proven to cross the SFU in both directions.
+// At the old 1400 (1420-byte payloads) a Real run through a server delivered
+// ~90% of the packets uphill but only ~40% downhill to a phone: the SFU adds
+// header extensions and SRTP overhead, and a packet near the 1500-byte path
+// MTU is dropped or fragmented on the way. TELEMOST_FRAG_BYTES overrides.
+var (
+	maxVP8Payload    = envIntDefault("TELEMOST_FRAG_BYTES", 1312)
+	maxFragmentBytes = maxVP8Payload
 )
 
 // fragFrameSeq hands out the frameSeq byte for FragmentFrame. It only needs

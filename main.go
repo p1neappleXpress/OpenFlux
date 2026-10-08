@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -404,6 +405,25 @@ DEPRECATED (removed in v2)
 
 	os.Args = expandShortFlags(os.Args)
 	flag.Parse()
+
+	// OPENFLUX_DNS overrides DNS resolution to a specific nameserver (e.g.
+	// "8.8.8.8:53"). Needed for the CLI on Android, where a static (CGO-off)
+	// binary has no usable /etc/resolv.conf and Go falls back to [::1]:53.
+	if dns := os.Getenv("OPENFLUX_DNS"); dns != "" {
+		if !strings.Contains(dns, ":") {
+			dns += ":53"
+		}
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 5 * time.Second}
+				if network == "tcp" || network == "tcp4" || network == "tcp6" {
+					return d.DialContext(ctx, "tcp", dns)
+				}
+				return d.DialContext(ctx, "udp", dns)
+			},
+		}
+	}
 
 	// isExit is the session/encryption-directionality role: which side of a
 	// negotiated or encrypted pair this process plays. bench-sink is the
