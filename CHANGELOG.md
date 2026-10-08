@@ -5,6 +5,26 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Telemost transport (`-t telemost`, type `telemost`).** The tunnel rides a Yandex Telemost conference as
+  fake video relayed by its SFU; joining needs only the conference link. One Telemost stream tops out near
+  16 Mbit/s (the SFU caps each subscriber), so the carrier is a group of lanes - participants of the same
+  conference, each publishing a camera and watching one peer lane - striped with a reorder buffer so the
+  tunnel (and the TCP inside it) sees an ordered stream. It starts with 3 lanes and adds one whenever they
+  stay saturated, until the link's ceiling; lanes are never removed. On a phone's Wi-Fi it measured
+  ~9 MB/s between two ends. Both ends need this build. Experimental: built for speed testing, not yet
+  in the apps' transport list.
+
+- **Script transports: WebRTC with an RTP line and typed data-channel messages.** `pc.addTransceiver(kind,
+  {direction})` adds an audio or video m-line to the next offer (a conference SFU such as MTS-Link's wants
+  a `recvonly` audio line next to the data channel), and a data channel's `onmessage(bytes, isString)` now
+  tells text from binary, so a transport can keep the signaling strings apart from the tunnel's packets.
+
+### Changed
+
+- The tunnel's netstack uses CUBIC instead of Reno (`OPENFLUX_TCP_CC=reno` restores the old behavior).
+
 ## [0.4.2] - 2026-10-07
 
 Hotfix for 0.4.1: Mail.ru Docs.

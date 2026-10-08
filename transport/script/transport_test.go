@@ -628,6 +628,149 @@ func TestScriptTransportWebRTCDataChannel(t *testing.T) {
 	}
 }
 
+// webrtcMediaCallerScript is webrtcCallerScript with a recvonly audio m-line (what an SFU that expects a
+// conference client wants next to the data channel) and one text and one binary message.
+const webrtcMediaCallerScript = `
+var pendingCandidates = [];
+var haveRemoteDesc = false;
+var pc = null;
+var Transport = {
+  info: function () { return { name: "webrtc-media-caller", version: "1.0.0" }; },
+  open: function (cfg) {
+    pc = webrtc.newPeerConnection({});
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.onicecandidate = function (c) { if (c) raise("ice", c); };
+    pc.onconnectionstatechange = function (s) { if (s === "connected") setState("connected"); };
+    var dc = pc.createDataChannel("test", { ordered: true });
+    dc.onopen = function () { dc.send("signal-text"); dc.send(new Uint8Array([1, 2, 3]).buffer); };
+    pc.createOffer().then(function (sdp) {
+      return pc.setLocalDescription("offer", sdp).then(function () { raise("sdp", { type: "offer", sdp: sdp }); });
+    });
+  },
+  write: function (bytes) {},
+  close: function () { if (pc) pc.close(); },
+  onEvent: function (kind, payload) {
+    if (kind === "remoteSDP") {
+      pc.setRemoteDescription(payload.type, payload.sdp).then(function () {
+        haveRemoteDesc = true;
+        pendingCandidates.forEach(function (c) { pc.addIceCandidate(c); });
+        pendingCandidates = [];
+      });
+    } else if (kind === "remoteICE") {
+      if (haveRemoteDesc) pc.addIceCandidate(payload); else pendingCandidates.push(payload);
+    }
+  },
+};
+`
+
+// webrtcMediaCalleeScript reports every data channel message with the flag the host passes along, so the test sees
+// which one arrived as text and which as bytes.
+const webrtcMediaCalleeScript = `
+var pendingCandidates = [];
+var haveRemoteDesc = false;
+var pc = null;
+var Transport = {
+  info: function () { return { name: "webrtc-media-callee", version: "1.0.0" }; },
+  open: function (cfg) {
+    pc = webrtc.newPeerConnection({});
+    pc.onicecandidate = function (c) { if (c) raise("ice", c); };
+    pc.ondatachannel = function (dc) {
+      setState("connected");
+      dc.onmessage = function (bytes, isString) { raise("got", { n: bytes.byteLength, text: isString === true }); };
+    };
+  },
+  write: function (bytes) {},
+  close: function () { if (pc) pc.close(); },
+  onEvent: function (kind, payload) {
+    if (kind === "remoteSDP") {
+      pc.setRemoteDescription(payload.type, payload.sdp).then(function () {
+        haveRemoteDesc = true;
+        pendingCandidates.forEach(function (c) { pc.addIceCandidate(c); });
+        pendingCandidates = [];
+        return pc.createAnswer();
+      }).then(function (sdp) {
+        if (!sdp) return;
+        return pc.setLocalDescription("answer", sdp).then(function () { raise("sdp", { type: "answer", sdp: sdp }); });
+      });
+    } else if (kind === "remoteICE") {
+      if (haveRemoteDesc) pc.addIceCandidate(payload); else pendingCandidates.push(payload);
+    }
+  },
+};
+`
+
+func TestScriptTransportWebRTCTransceiverAndMessageKind(t *testing.T) {
+	callerPath, callerPub := mustSignedScript(t, webrtcMediaCallerScript)
+	calleePath, calleePub := mustSignedScript(t, webrtcMediaCalleeScript)
+	caller, err := New("webrtc-media-caller", callerPath, callerPub, "", nil, transport.DefaultConfig())
+	if err != nil {
+		t.Fatalf("New(caller): %v", err)
+	}
+	callee, err := New("webrtc-media-callee", calleePath, calleePub, "", nil, transport.DefaultConfig())
+	if err != nil {
+		t.Fatalf("New(callee): %v", err)
+	}
+
+	offer := make(chan string, 1)
+	got := make(chan map[string]interface{}, 4)
+	caller.SetEventHandler(func(kind string, payload map[string]interface{}) {
+		switch kind {
+		case "sdp":
+			select {
+			case offer <- payload["sdp"].(string):
+			default:
+			}
+			_ = callee.Deliver("remoteSDP", payload)
+		case "ice":
+			_ = callee.Deliver("remoteICE", payload)
+		}
+	})
+	callee.SetEventHandler(func(kind string, payload map[string]interface{}) {
+		switch kind {
+		case "sdp":
+			_ = caller.Deliver("remoteSDP", payload)
+		case "ice":
+			_ = caller.Deliver("remoteICE", payload)
+		case "got":
+			got <- payload
+		}
+	})
+	if err := callee.Start(); err != nil {
+		t.Fatalf("callee.Start: %v", err)
+	}
+	defer callee.Stop()
+	if err := caller.Start(); err != nil {
+		t.Fatalf("caller.Start: %v", err)
+	}
+	defer caller.Stop()
+
+	select {
+	case sdp := <-offer:
+		if !strings.Contains(sdp, "m=audio") || !strings.Contains(sdp, "a=recvonly") {
+			t.Fatalf("the offer has no recvonly audio line:\n%s", sdp)
+		}
+		if !strings.Contains(sdp, "m=application") {
+			t.Fatalf("the offer lost its data channel line:\n%s", sdp)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no offer")
+	}
+
+	kinds := map[bool]int{}
+	deadline := time.After(10 * time.Second)
+	for len(kinds) < 2 {
+		select {
+		case m := <-got:
+			kinds[m["text"] == true]++
+		case <-deadline:
+			t.Fatalf("messages seen by kind (true = text): %v", kinds)
+		}
+	}
+	if kinds[true] != 1 || kinds[false] != 1 {
+		t.Fatalf("want one text and one binary message, got %v", kinds)
+	}
+}
+
 // scopeCookiesScript mirrors yandex.js/vyandex.js's actual manifest shape:
 // cookieDomain is ALREADY the apex ("https://yandex.ru/"), not a subdomain -
 // scopeCookiesToParentDomain must still end up cross-subdomain-usable.
