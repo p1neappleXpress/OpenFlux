@@ -53,9 +53,50 @@ type StripedTransport struct {
 	watched map[string]bool
 	watchAt time.Time
 
+	// ARQ: the SFU drops 10-30% of the RTP it relays, and a tunnel carrying TCP
+	// cannot live with that. The sender keeps recent frames; the receiver asks
+	// for the seqs missing behind a hole and holds later frames until they
+	// come back (or the deadline passes).
+	txMu                         sync.Mutex
+	txRing                       [txRingSize]txEntry
+	nackSent, rtxSent, rtxMissed atomic.Uint64
+	lastSendNs                   atomic.Int64
+
+	asm                         []byte // frame being reassembled (delivery goroutine only)
+	fecTx                       fecTx
+	fecRx                       fecRx
+	fecParitySent, fecRecovered atomic.Uint64
+
 	stopOnce sync.Once
 	done     chan struct{}
 }
+
+const txRingSize = 16384
+
+type txEntry struct {
+	seq uint32
+	buf []byte
+	ok  bool
+}
+
+// arqEnabled: STRIPE_ARQ=0 turns retransmission off (holes are skipped after
+// the short adaptive gap timeout instead).
+var arqEnabled = os.Getenv("STRIPE_ARQ") != "0"
+
+// arqDeadline is how long a hole may hold later frames back waiting for a
+// retransmission before it is declared lost. STRIPE_ARQ_MS overrides.
+var arqDeadline = func() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv("STRIPE_ARQ_MS")); err == nil && n > 0 {
+		return time.Duration(n) * time.Millisecond
+	}
+	return 800 * time.Millisecond
+}()
+
+const (
+	nackDelay   = 60 * time.Millisecond  // a hole this old (lane skew excluded) is asked for
+	nackRepeat  = 300 * time.Millisecond // ask again for the same seq after this
+	nackPerPass = 200
+)
 
 // LossReporter is implemented by lanes that know their recent uplink loss
 // fraction (0..1); autoscale uses it to find the link's ceiling.
@@ -71,6 +112,14 @@ type QueueDepther interface {
 }
 
 const stripeMagic = 0xA7
+
+// stripeNackMagic marks a retransmission request: [magic][n u8][seq u32 * n].
+const stripeNackMagic = 0xA9
+
+// stripeTailMagic marks a high-water mark: [magic][last seq u32], sent while
+// traffic flows so the receiver can ask for frames lost at the very end of a
+// burst, which no later frame would reveal.
+const stripeTailMagic = 0xAA
 const stripeHeader = 5
 
 // stripeCtlMagic marks a control frame: JSON {"watch":[lane ids]} - the lanes
@@ -116,7 +165,7 @@ func NewStripedTransport(lanes []Transport) *StripedTransport {
 func NewStripedTransportAuto(lanes []Transport, src LaneSource, maxLanes int, autoscale bool) *StripedTransport {
 	s := &StripedTransport{lanes: lanes, readyAt: make([]time.Time, len(lanes)), src: src,
 		maxLanes: maxLanes, scale: autoscale, done: make(chan struct{})}
-	s.ro = newReorderBuffer(s.deliver)
+	s.ro = newReorderBuffer(s.deliverPiece)
 	if src != nil {
 		src.SetGrowHook(func() { go s.addLane("peer lane appeared") })
 	}
@@ -177,6 +226,12 @@ func (s *StripedTransport) Start() error {
 		return fmt.Errorf("striped: no lane started: %w", firstErr)
 	}
 	go s.ro.run(s.done)
+	if arqEnabled {
+		go s.nackLoop()
+	}
+	if fecEnabled {
+		go s.fecLoop()
+	}
 	go s.statsLoop()
 	if _, ok := s.src.(WatchSource); ok {
 		go s.watchLoop()
@@ -214,15 +269,97 @@ func (s *StripedTransport) Send(data []byte) error {
 		s.dropped.Add(1)
 		return nil
 	}
-	buf := make([]byte, stripeHeader+len(data))
-	buf[0] = stripeMagic
-	binary.BigEndian.PutUint32(buf[1:5], s.seq.Add(1))
-	copy(buf[stripeHeader:], data)
 	s.accepted.Add(uint64(len(data)))
+	// A frame that does not fit one RTP packet is cut into pieces here, each
+	// with its own seq, so FEC and retransmission protect every piece alone:
+	// losing any one fragment of a multi-fragment lane frame would lose the
+	// whole frame, and its odds fall off geometrically with the fragment count.
+	var err error
+	for off := 0; ; off += stripePieceBytes {
+		end := off + stripePieceBytes
+		flag := byte(0)
+		if off > 0 {
+			flag |= pieceCont
+		}
+		if end < len(data) {
+			flag |= pieceMore
+		} else {
+			end = len(data)
+		}
+		if e := s.sendPiece(lane, flag, data[off:end]); e != nil {
+			err = e
+		}
+		if end >= len(data) {
+			break
+		}
+		if l, _ := s.pickLane(); l != nil {
+			lane = l
+		}
+	}
+	return err
+}
+
+// Piece flags: the first byte of every stripe payload.
+const (
+	pieceCont = 1 // continues the previous piece
+	pieceMore = 2 // another piece follows
+)
+
+// stripePieceBytes is the most payload a piece carries: the lane's fragment
+// (maxVP8Payload minus its 8-byte header) minus the stripe header and flag.
+var stripePieceBytes = func() int {
+	lane := envIntOr("TELEMOST_FRAG_BYTES", 1312) - 8 // what one lane fragment carries
+	n := lane - fecDataHeader - 1
+	if fecEnabled {
+		// A parity frame (header + k seqs and lengths + a shard as long as the
+		// longest piece) must fit one fragment too.
+		if m := lane - (8 + 6*fecK) - 1; m < n {
+			n = m
+		}
+	}
+	if v := envIntOr("STRIPE_PIECE_BYTES", 0); v > 0 {
+		n = v
+	}
+	return n
+}()
+
+func (s *StripedTransport) sendPiece(lane Transport, flag byte, piece []byte) error {
+	var buf []byte
+	var closed *fecOpenGroup
+	if fecEnabled {
+		sq := s.seq.Add(1)
+		buf = make([]byte, fecDataHeader+1+len(piece))
+		buf[0] = stripeFecDataMagic
+		binary.BigEndian.PutUint32(buf[1:5], sq)
+		buf[fecDataHeader] = flag
+		copy(buf[fecDataHeader+1:], piece)
+		var gid uint32
+		var idx int
+		gid, idx, closed = s.fecAdd(sq, buf[fecDataHeader:])
+		binary.BigEndian.PutUint32(buf[5:9], gid)
+		buf[9] = byte(idx)
+	} else {
+		buf = make([]byte, stripeHeader+1+len(piece))
+		buf[0] = stripeMagic
+		binary.BigEndian.PutUint32(buf[1:5], s.seq.Add(1))
+		buf[stripeHeader] = flag
+		copy(buf[stripeHeader+1:], piece)
+	}
+	s.lastSendNs.Store(time.Now().UnixNano())
+	if arqEnabled {
+		sq := binary.BigEndian.Uint32(buf[1:5])
+		s.txMu.Lock()
+		s.txRing[sq%txRingSize] = txEntry{seq: sq, buf: buf, ok: true}
+		s.txMu.Unlock()
+	}
 	if i := s.laneIndex(lane); i >= 0 && i < 64 {
 		s.laneSent[i].Add(1)
 	}
-	return lane.Send(buf)
+	err := lane.Send(buf)
+	if closed != nil {
+		s.fecEmit(closed)
+	}
+	return err
 }
 
 // pickLane returns the connected lane with the shortest send queue; ties (and
@@ -273,6 +410,35 @@ func (s *StripedTransport) Receive(cb func([]byte)) {
 	s.cbMu.Unlock()
 }
 
+// deliverPiece runs on the reorder buffer's single delivery goroutine: it puts
+// the pieces of a frame back together. gap says frames were skipped just
+// before this one, which voids a half-assembled frame.
+func (s *StripedTransport) deliverPiece(b []byte, gap bool) {
+	if len(b) == 0 {
+		return
+	}
+	flag, p := b[0], b[1:]
+	if gap {
+		s.asm = nil
+	}
+	if flag&pieceCont == 0 {
+		if flag&pieceMore == 0 {
+			s.deliver(p)
+			return
+		}
+		s.asm = append(make([]byte, 0, 4*len(p)), p...)
+		return
+	}
+	if s.asm == nil {
+		return // the start of this frame was lost
+	}
+	s.asm = append(s.asm, p...)
+	if flag&pieceMore == 0 {
+		s.deliver(s.asm)
+		s.asm = nil
+	}
+}
+
 func (s *StripedTransport) deliver(b []byte) {
 	s.cbMu.RLock()
 	cb := s.cb
@@ -283,6 +449,28 @@ func (s *StripedTransport) deliver(b []byte) {
 }
 
 func (s *StripedTransport) onLane(lane int, b []byte) {
+	if len(b) > fecDataHeader && b[0] == stripeFecDataMagic {
+		seq := binary.BigEndian.Uint32(b[1:5])
+		payload := b[fecDataHeader:]
+		s.ro.push(seq, payload)
+		s.fecOnData(binary.BigEndian.Uint32(b[5:9]), int(b[9]), seq, payload)
+		if lane >= 0 && lane < 64 {
+			s.laneRecv[lane].Add(1)
+		}
+		return
+	}
+	if len(b) > 8 && b[0] == stripeFecParityMagic {
+		s.fecOnParity(b)
+		return
+	}
+	if len(b) > 2 && b[0] == stripeNackMagic {
+		s.handleNack(b)
+		return
+	}
+	if len(b) == 5 && b[0] == stripeTailMagic {
+		s.ro.noteTail(binary.BigEndian.Uint32(b[1:5]))
+		return
+	}
 	if len(b) > 1 && b[0] == stripeCtlMagic {
 		var m struct {
 			Watch []string `json:"watch"`
@@ -411,8 +599,8 @@ func (s *StripedTransport) statsLoop() {
 			per = append(per, fmt.Sprintf("%d:%s s%d/r%d", i, id, s.laneSent[i].Load(), s.laneRecv[i].Load()))
 		}
 		utils.Infof("[STRIPE] per-lane %s", strings.Join(per, " "))
-		utils.Infof("[STRIPE] farWatches=%d lanes up=%d/%d delivered=%d skipped=%d late=%d buffered=%d gapTimeout=%s sendDropped=%d uplinkLoss=%.1f%% cap=%.0fKB/s",
-			nw, up, len(lanes), d, sk, late, buffered, to, s.dropped.Load(), loss*100, s.getCap()/1000)
+		utils.Infof("[STRIPE] farWatches=%d lanes up=%d/%d delivered=%d skipped=%d late=%d buffered=%d gapTimeout=%s sendDropped=%d nack=%d rtx=%d rtxMiss=%d fecPar=%d fecRec=%d uplinkLoss=%.1f%% cap=%.0fKB/s",
+			nw, up, len(lanes), d, sk, late, buffered, to, s.dropped.Load(), s.nackSent.Load(), s.rtxSent.Load(), s.rtxMissed.Load(), s.fecParitySent.Load(), s.fecRecovered.Load(), loss*100, s.getCap()/1000)
 	}
 }
 
@@ -609,6 +797,71 @@ func (s *StripedTransport) autoscaleLoop() {
 	}
 }
 
+// handleNack resends the frames the far end asked for.
+func (s *StripedTransport) handleNack(b []byte) {
+	n := int(b[1])
+	if len(b) < 2+4*n {
+		return
+	}
+	for i := 0; i < n; i++ {
+		sq := binary.BigEndian.Uint32(b[2+4*i:])
+		s.txMu.Lock()
+		e := s.txRing[sq%txRingSize]
+		s.txMu.Unlock()
+		if !e.ok || e.seq != sq {
+			s.rtxMissed.Add(1)
+			continue
+		}
+		lane, _ := s.pickLane()
+		if lane == nil {
+			return
+		}
+		if lane.Send(e.buf) == nil {
+			s.rtxSent.Add(1)
+		}
+	}
+}
+
+// nackLoop asks the sender for the frames missing behind old holes.
+func (s *StripedTransport) nackLoop() {
+	t := time.NewTicker(25 * time.Millisecond)
+	defer t.Stop()
+	var lastTail time.Time
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+		}
+		if now := time.Now(); now.Sub(lastTail) >= 200*time.Millisecond &&
+			now.UnixNano()-s.lastSendNs.Load() < int64(3*time.Second) {
+			lastTail = now
+			msg := []byte{stripeTailMagic, 0, 0, 0, 0}
+			binary.BigEndian.PutUint32(msg[1:], s.seq.Load())
+			if lane, _ := s.pickLane(); lane != nil {
+				_ = lane.Send(msg)
+			}
+		}
+		miss := s.ro.holes(time.Now(), nackDelay, nackRepeat, nackPerPass)
+		for len(miss) > 0 {
+			n := len(miss)
+			if n > 200 {
+				n = 200
+			}
+			msg := make([]byte, 2+4*n)
+			msg[0], msg[1] = stripeNackMagic, byte(n)
+			for i := 0; i < n; i++ {
+				binary.BigEndian.PutUint32(msg[2+4*i:], miss[i])
+			}
+			miss = miss[n:]
+			if lane, _ := s.pickLane(); lane != nil {
+				_ = lane.Send(msg)
+				s.nackSent.Add(1)
+			}
+		}
+	}
+}
+
 // reorderBuffer delivers frames in seq order. Frames sit in a ring indexed by
 // seq; a hole is given up as lost once the frame right after it has waited
 // longer than the gap timeout, so a run of holes behind stale frames clears in
@@ -620,7 +873,11 @@ type reorderBuffer struct {
 	ring    [reorderWindow]reorderSlot
 	count   int
 	est     time.Duration // smoothed upper estimate of how long holes take to fill
-	out     chan []byte
+	out     chan reorderOut
+	gapNext bool
+	nacked  map[uint32]time.Time
+	tailSeq uint32
+	tailAt  time.Time
 
 	delivered, skipped, late uint64
 }
@@ -638,11 +895,17 @@ const (
 	reorderMaxTimeout = 400 * time.Millisecond
 )
 
-func newReorderBuffer(deliver func([]byte)) *reorderBuffer {
-	r := &reorderBuffer{est: 40 * time.Millisecond, out: make(chan []byte, 8192)}
+// reorderOut is one in-order frame; gap says seqs were skipped just before it.
+type reorderOut struct {
+	b   []byte
+	gap bool
+}
+
+func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
+	r := &reorderBuffer{est: 40 * time.Millisecond, out: make(chan reorderOut, 8192), nacked: map[uint32]time.Time{}}
 	go func() {
-		for b := range r.out {
-			deliver(b)
+		for o := range r.out {
+			deliver(o.b, o.gap)
 		}
 	}()
 	return r
@@ -651,6 +914,9 @@ func newReorderBuffer(deliver func([]byte)) *reorderBuffer {
 func seqBefore(a, b uint32) bool { return int32(a-b) < 0 }
 
 func (r *reorderBuffer) timeout() time.Duration {
+	if arqEnabled {
+		return arqDeadline
+	}
 	to := 2*r.est + 10*time.Millisecond
 	if to < reorderMinTimeout {
 		to = reorderMinTimeout
@@ -706,9 +972,11 @@ func (r *reorderBuffer) drainLocked() {
 		b := sl.data
 		*sl = reorderSlot{}
 		r.count--
+		delete(r.nacked, r.next)
 		r.next++
 		r.delivered++
-		r.out <- b
+		r.out <- reorderOut{b: b, gap: r.gapNext}
+		r.gapNext = false
 	}
 }
 
@@ -726,6 +994,10 @@ func (r *reorderBuffer) lowestLocked(limit uint32) uint32 {
 func (r *reorderBuffer) skipToLocked(s uint32) {
 	if seqBefore(r.next, s) {
 		r.skipped += uint64(s - r.next)
+		r.gapNext = true
+		for x := r.next; x != s; x++ {
+			delete(r.nacked, x)
+		}
 		r.next = s
 	}
 	r.drainLocked()
@@ -751,6 +1023,60 @@ func (r *reorderBuffer) run(done chan struct{}) {
 		}
 		r.mu.Unlock()
 	}
+}
+
+// holes lists up to max seqs that are missing behind a buffered frame that has
+// waited at least minAge, skipping seqs already asked for within repeat.
+// noteTail records the sender's high-water mark.
+func (r *reorderBuffer) noteTail(seq uint32) {
+	r.mu.Lock()
+	if r.started && (r.tailAt.IsZero() || !seqBefore(seq, r.tailSeq)) {
+		r.tailSeq, r.tailAt = seq, time.Now()
+	}
+	r.mu.Unlock()
+}
+
+func (r *reorderBuffer) holes(now time.Time, minAge, repeat time.Duration, max int) []uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tail := !r.tailAt.IsZero() && !seqBefore(r.tailSeq, r.next)
+	if r.count == 0 && !tail {
+		return nil
+	}
+	hi := r.next
+	for s := r.next; s-r.next < reorderWindow && s-r.next < 4096; s++ {
+		if sl := &r.ring[s%reorderWindow]; sl.ok && sl.seq == s {
+			hi = s
+		}
+	}
+	var out []uint32
+	var above time.Time // arrival of the nearest buffered frame above s
+	top := hi
+	if tail && seqBefore(hi, r.tailSeq) && r.tailSeq-r.next < 4096 {
+		top, above = r.tailSeq, r.tailAt // seqs up to the mark are missing, nothing buffered above them
+	}
+	for s := top; ; s-- {
+		sl := &r.ring[s%reorderWindow]
+		if sl.ok && sl.seq == s {
+			above = sl.at
+		} else if !above.IsZero() && now.Sub(above) >= minAge {
+			if t, ok := r.nacked[s]; !ok || now.Sub(t) >= repeat {
+				r.nacked[s] = now
+				out = append(out, s)
+			}
+		}
+		if s == r.next {
+			break
+		}
+	}
+	if len(out) > max {
+		out = out[len(out)-max:] // keep the oldest (lowest) ones
+	}
+	// reverse to ascending order
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 func (r *reorderBuffer) snapshot() (delivered, skipped, late uint64, buffered int, to time.Duration) {
