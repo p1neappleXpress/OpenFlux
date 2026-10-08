@@ -87,6 +87,13 @@ func encodeBatch(pkts [][]byte) []byte {
 	return append(out, framed...)
 }
 
+// EncodeBatchFrame serializes packets into a wire-v2 frame for transports that
+// carry the frame themselves instead of delegating to BatchedTransport - the
+// Telemost SFU path wraps each frame in a VP8 keyframe rather than passing it
+// up the transport stack. Such a transport must produce byte for byte what
+// BatchedTransport would have produced, or the receiving side rejects it.
+func EncodeBatchFrame(pkts [][]byte) []byte { return encodeBatch(pkts) }
+
 // decodeBatch reverses encodeBatch, returning the original packets.
 // Only wire-v2 frames are accepted; anything else is rejected.
 func decodeBatch(data []byte) ([][]byte, error) {

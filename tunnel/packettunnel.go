@@ -52,7 +52,7 @@ type UDPDialer interface {
 func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcpProtocol(), udp.NewProtocol},
 	})
 
 	SetTCPBuffers(s)

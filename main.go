@@ -217,7 +217,7 @@ func main() {
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru)")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru, telemost)")
 	mode := flag.String("mode", "", "Exit-node mode: l3 (default; Linux as root, or Windows as Administrator with WinDivert) or l4 (works everywhere)")
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
@@ -304,6 +304,7 @@ TRANSPORT  (single-transport mode)
   -t, --transport=vyandex      Yandex.Volga over HTTP relay + WS.
   -t, --transport=oneme        MAX (VK) over WebRTC.
   -t, --transport=cupsonline   Cups.online interview rooms.
+  -t, --transport=telemost     Yandex Telemost conference (--url <link>), striped over several participants.
   -t, --transport=mailru       Mail.ru Docs over WebSocket.
   -t, --transport=direct       Plain TCP to a self-hosted exit.
   -t, --transport=script       A signed JS (goja) transport. Session only
@@ -911,7 +912,7 @@ DEPRECATED (removed in v2)
 		// Session needs one), or a bench role.
 		// The types the classic path serves; the registry builds them.
 		switch *transportType {
-		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "mailru":
+		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "mailru", "telemost":
 		default:
 			log.Fatalf("Unknown transport type: %s", *transportType)
 		}
@@ -1021,6 +1022,20 @@ DEPRECATED (removed in v2)
 				pp.Capabilities&transport.CapabilityICMPErrors != 0,
 				pp.MaxPacketSize)
 		}
+	}
+
+	// A Telemost participant that vanishes without closing its socket lingers
+	// on the SFU as a ghost for ~50 s; stop cleanly on a signal so the lanes
+	// leave the room and a quick restart finds it empty.
+	if hasTelemost(specs) {
+		sigCh := make(chan os.Signal, 1)
+		notifySignals(sigCh)
+		go func() {
+			<-sigCh
+			log.Printf("Signal received, leaving Telemost room cleanly...")
+			_ = trans.Stop()
+			os.Exit(0)
+		}()
 	}
 
 	switch *role {
@@ -1286,4 +1301,14 @@ func runClientTUN(trans transport.Transport) {
 	tc.RestoreDefault()
 	log.Printf("Shutdown complete")
 	os.Exit(0)
+}
+
+// hasTelemost reports whether any configured transport is a Telemost one.
+func hasTelemost(specs []transportSpec) bool {
+	for _, sp := range specs {
+		if sp.Type == "telemost" {
+			return true
+		}
+	}
+	return false
 }

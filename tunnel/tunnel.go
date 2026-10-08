@@ -99,7 +99,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	utils.Debugf("[TUNNEL] Net stack init...")
 	t.gvisorStack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcpProtocol(), udp.NewProtocol},
 	})
 
 	SetTCPBuffers(t.gvisorStack)
