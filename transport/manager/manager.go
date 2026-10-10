@@ -456,7 +456,7 @@ func (m *Manager) DispatchControl(sub control.Subtype, payload []byte) {
 		if local := m.cookieTransport(req.Transport, req.Doc); local != "" {
 			m.session.MarkStalled(local)
 		}
-		utils.Infof("[MANAGER] the exit's carrier %q needs a check in a browser (%s): %s", req.Transport, req.Reason, req.URL)
+		utils.Infof("[MANAGER] the exit's carrier %q needs a check in a browser (%s): %s", req.Transport, req.Reason, redactedAuthURL(req.URL))
 		m.mu.RLock()
 		cb := m.remoteAuth
 		m.mu.RUnlock()

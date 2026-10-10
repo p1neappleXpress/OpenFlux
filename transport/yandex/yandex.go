@@ -310,7 +310,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 					reason = "login"
 				}
 				if t.errNotifier != nil {
-					t.errNotifier(err, "yandex", t.url, "", reason)
+					t.errNotifier(err, "yandex", authRequiredURL(err, t.url), "", reason)
 				}
 				t.scheduleReconnectNoCaptcha(attempt)
 				return
@@ -774,7 +774,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		}
 
 		utils.Debugf("[YDOCS]   status=%d location=%s",
-			resp.StatusCode, shortStr(resp.Header.Get("Location"), 120))
+			resp.StatusCode, safeVolgaURL(resp.Header.Get("Location")))
 
 		// 200 — дошли до документа
 		if resp.StatusCode == 200 {
@@ -796,7 +796,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 			// cookies out of band.
 			if strings.Contains(loc, "showcaptcha") && !strings.Contains(loc, "showcaptchafast") {
 				utils.Debugf("[YDOCS] SmartCaptcha detected, external solver required")
-				return YandexDocsInfo{}, ErrCaptchaRequired
+				return YandexDocsInfo{}, authRedirectError(ErrCaptchaRequired, currentURL, loc)
 			}
 
 			// First-tier captcha (PoW, showcaptchafast). Solve and retry
@@ -813,7 +813,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 			// Login page: not a captcha, not recoverable in-band.
 			if strings.Contains(loc, "passport.yandex") {
-				return YandexDocsInfo{}, ErrLoginRequired
+				return YandexDocsInfo{}, authRedirectError(ErrLoginRequired, currentURL, loc)
 			}
 
 			// Обычный редирект — идём по нему.
