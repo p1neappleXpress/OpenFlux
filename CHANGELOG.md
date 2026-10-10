@@ -5,6 +5,32 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-11
+
+Hotfix for 0.4.2: the Yandex and Mail.ru carriers, both reported by node operators.
+
+### Fixed
+
+- **Yandex: the carrier relays tunnel packets again.** The outgoing cursor message declared a fixed
+  length of `18` before the base64 payload, but Yandex Disk does not relay a cursor whose declared
+  length does not match the packet behind it, so every tunnel packet was silently dropped and the
+  Session handshake timed out; a working Direct fallback could hide the failure. The prefix is now the
+  real binary packet length (`len(pending)`) on every send. Found with a decisive A/B wire experiment
+  (length `18` → 0/3 delivered, correct length → 3/3) by
+  [@Gamazzz](https://github.com/p1neappleXpress/OpenFlux/issues/165) — thank you.
+  [#165](https://github.com/p1neappleXpress/OpenFlux/issues/165)
+- **Mail.ru Docs: the carrier comes up on public links again.** Mail.ru's nginx answered `409 Conflict`
+  to the WebSocket upgrade, so the transport looped on reconnects and never connected. Two causes:
+  `gorilla/websocket` only sends `Sec-WebSocket-Extensions: permessage-deflate` when compression is
+  enabled, and the old Chrome/137 `User-Agent` is rejected on some edge nodes. Compression is now
+  enabled and a current Firefox `User-Agent` is used for both the API and the WebSocket. Measured with
+  the real service: before, 8× `409` in 75 s and 0 connections; after, the WebSocket connects, Engine.IO
+  and Socket.IO come up, auth succeeds, and a packet passes between two peers. Reported by
+  [@pirsasha](https://github.com/p1neappleXpress/OpenFlux/issues/163) ([#163](https://github.com/p1neappleXpress/OpenFlux/issues/163))
+  and [@Shiller70](https://github.com/p1neappleXpress/OpenFlux/issues/164) ([#164](https://github.com/p1neappleXpress/OpenFlux/issues/164)) — thank you.
+
+Exit nodes that carry Yandex or Mail.ru need `node-v1.2.3`.
+
 ## [0.4.2] - 2026-10-07
 
 Hotfix for 0.4.1: Mail.ru Docs.
