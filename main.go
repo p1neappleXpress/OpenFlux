@@ -764,6 +764,13 @@ DEPRECATED (removed in v2)
 		}
 	}
 
+	// Telemost's media runs over WebRTC's own UDP sockets, which neither the
+	// macOS bypass routes (TCP only) nor the Windows interface binding cover:
+	// under the full tunnel they would loop into the tunnel they carry.
+	if *role == roleClient && *inbound == inboundTUN && hasTelemost(specs) {
+		log.Fatalf("Telemost does not work under --inbound=tun yet: use --inbound=socks5 (the apps' proxy mode)")
+	}
+
 	// Validate --codec with the multi-transport path. Session always uses
 	// BatchedTransport, so --codec=legacy is only valid in single-transport
 	// non-negotiated mode.

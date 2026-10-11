@@ -15,7 +15,9 @@ All notable changes to the OpenFlux core. Format loosely follows
   conference on each end, each publishing a camera and watching one lane of the other end, with the tunnel
   striped over them. The profile parameter `stripes` sets another count, or `auto` (start at 3 and add lanes
   while they stay saturated). Share links (`--share`) carry it. Both ends need this version, and one
-  conference serves one client and one exit. Experimental.
+  conference serves one client and one exit. Clients run it through their proxies or the Android VPN; the
+  desktop full tunnel (`--inbound=tun`) refuses it for now, since its media would loop into the tunnel.
+  Experimental.
 - **A reliable link under the tunnel for striped carriers.** The SFU loses 10-80% of a lane's packets, and
   the tunnel's TCP read every loss and every slow repair as congestion and lived in timeouts. The stripe now
   delivers in order and repairs what the SFU drops: lanes take packets on their own send clock (ack first, then
