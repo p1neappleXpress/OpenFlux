@@ -3,7 +3,7 @@
 
 final class PhpboxUtil
 {
-    const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0';
 
     /** One HTTP request with a shared cookie jar file. Returns [body, status]. */
     public static function http(string $url, string $cookieFile, string $method, ?string $body, array $headers): array
@@ -15,6 +15,7 @@ final class PhpboxUtil
             CURLOPT_COOKIEJAR      => $cookieFile,
             CURLOPT_COOKIEFILE     => $cookieFile,
             CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
             CURLOPT_TIMEOUT        => 30,
             CURLOPT_HTTPHEADER     => $headers,
         ]);
@@ -41,6 +42,7 @@ final class PhpboxUtil
             CURLOPT_COOKIEJAR      => $cookieFile,
             CURLOPT_COOKIEFILE     => $cookieFile,
             CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
             CURLOPT_TIMEOUT        => 30,
             CURLOPT_HTTPHEADER     => $headers,
             CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$loc) {
