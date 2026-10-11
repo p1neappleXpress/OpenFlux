@@ -452,7 +452,12 @@ func (t *YandexDocsTransport) writerLoop() {
 		}
 
 		payload := base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+		// The cursor's numeric prefix must equal the actual binary packet
+		// length (before Base64), not a fixed constant: Yandex Disk does not
+		// relay cursor messages whose declared length does not match, so the
+		// hardcoded "18" silently dropped every packet and the VPN handshake
+		// timed out. Reported with an A/B wire test by @Gamazzz (issue #165).
+		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"%d;%s"}]`, len(pending), payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[YDOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)

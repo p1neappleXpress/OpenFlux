@@ -5,17 +5,28 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-11
+
 ### Added
 
-- **Telemost transport (`-t telemost`, type `telemost`).** The tunnel rides a Yandex Telemost conference as
-  fake video relayed by its SFU; joining needs only the conference link. One Telemost stream tops out near
-  16 Mbit/s (the SFU caps each subscriber), so the carrier is a group of lanes - participants of the same
-  conference, each publishing a camera and watching one peer lane - striped with a reorder buffer so the
-  tunnel (and the TCP inside it) sees an ordered stream. It starts with 3 lanes and adds one whenever they
-  stay saturated, until the link's ceiling; lanes are never removed. On a phone's Wi-Fi it measured
-  ~9 MB/s between two ends. Both ends need this build. Experimental: built for speed testing, not yet
-  in the apps' transport list.
-
+- **Telemost transport (type `telemost`, `-t telemost`).** The tunnel rides a Yandex Telemost conference as
+  video relayed by its SFU; the conference link is all a profile needs. One Telemost stream carries at most
+  about 16 Mbit/s (the SFU caps each subscriber), so the carrier runs **five lanes**: five participants of the
+  conference on each end, each publishing a camera and watching one lane of the other end, with the tunnel
+  striped over them. The profile parameter `stripes` sets another count, or `auto` (start at 3 and add lanes
+  while they stay saturated). Share links (`--share`) carry it. Both ends need this version, and one
+  conference serves one client and one exit. Experimental.
+- **A reliable link under the tunnel for striped carriers.** The SFU loses 10-80% of a lane's packets, and
+  the tunnel's TCP read every loss and every slow repair as congestion and lived in timeouts. The stripe now
+  delivers in order and repairs what the SFU drops: lanes take packets on their own send clock (ack first, then
+  resends, then new data), the receiver acks every 10 ms, a packet is resent - on another lane - as soon as
+  a later packet of the same lane arrives, one send queue under CoDel gives TCP a clean congestion signal,
+  idle room in a tick carries early copies of overdue packets, and a lane whose packets stop arriving only
+  gets probes. Telemost publishes each tick's packets spread over the tick: back to back they lost 50-80%
+  on the way from a server, spread 0-10%. Measured with an HTTPS download through the tunnel, exit on a
+  server and client on a phone: **from 24 KB/s to about 1.5 MB/s** on average (3.4 MB/s at peak), with
+  0.014% TCP retransmissions and no timeouts; the raw carrier delivers 1.7 MB/s on the same path. The first
+  seconds of every transfer are still slow: the SFU raises a stream's allowance only gradually.
 - **Script transports: WebRTC with an RTP line and typed data-channel messages.** `pc.addTransceiver(kind,
   {direction})` adds an audio or video m-line to the next offer (a conference SFU such as MTS-Link's wants
   a `recvonly` audio line next to the data channel), and a data channel's `onmessage(bytes, isString)` now
@@ -23,7 +34,38 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ### Changed
 
-- The tunnel's netstack uses CUBIC instead of Reno (`OPENFLUX_TCP_CC=reno` restores the old behavior).
+- The tunnel's TCP (gVisor) uses CUBIC instead of Reno (`OPENFLUX_TCP_CC=reno` restores Reno), a 3-second
+  floor for its retransmission timeout (`OPENFLUX_TCP_MIN_RTO_MS`) and duplicate-ACK loss detection instead
+  of RACK and tail loss probes (`OPENFLUX_TCP_RACK=1` restores them). Carriers deliver in order but now and
+  then late, and a timeout that fired on late data used to cost a connection its whole window.
+
+Exit nodes that carry Telemost need `node-v1.3.0`.
+
+## [0.4.3] - 2026-10-11
+
+Hotfix for 0.4.2: the Yandex and Mail.ru carriers, both reported by node operators.
+
+### Fixed
+
+- **Yandex: the carrier relays tunnel packets again.** The outgoing cursor message declared a fixed
+  length of `18` before the base64 payload, but Yandex Disk does not relay a cursor whose declared
+  length does not match the packet behind it, so every tunnel packet was silently dropped and the
+  Session handshake timed out; a working Direct fallback could hide the failure. The prefix is now the
+  real binary packet length (`len(pending)`) on every send. Found with a decisive A/B wire experiment
+  (length `18` → 0/3 delivered, correct length → 3/3) by
+  [@Gamazzz](https://github.com/p1neappleXpress/OpenFlux/issues/165) — thank you.
+  [#165](https://github.com/p1neappleXpress/OpenFlux/issues/165)
+- **Mail.ru Docs: the carrier comes up on public links again.** Mail.ru's nginx answered `409 Conflict`
+  to the WebSocket upgrade, so the transport looped on reconnects and never connected. Two causes:
+  `gorilla/websocket` only sends `Sec-WebSocket-Extensions: permessage-deflate` when compression is
+  enabled, and the old Chrome/137 `User-Agent` is rejected on some edge nodes. Compression is now
+  enabled and a current Firefox `User-Agent` is used for both the API and the WebSocket. Measured with
+  the real service: before, 8× `409` in 75 s and 0 connections; after, the WebSocket connects, Engine.IO
+  and Socket.IO come up, auth succeeds, and a packet passes between two peers. Reported by
+  [@pirsasha](https://github.com/p1neappleXpress/OpenFlux/issues/163) ([#163](https://github.com/p1neappleXpress/OpenFlux/issues/163))
+  and [@Shiller70](https://github.com/p1neappleXpress/OpenFlux/issues/164) ([#164](https://github.com/p1neappleXpress/OpenFlux/issues/164)) — thank you.
+
+Exit nodes that carry Yandex or Mail.ru need `node-v1.2.3`.
 
 ## [0.4.2] - 2026-10-07
 
