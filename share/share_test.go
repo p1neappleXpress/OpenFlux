@@ -48,6 +48,22 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// A Telemost exit without a key shares its conference as a classic link.
+func TestTelemostLink(t *testing.T) {
+	c := Config{Name: "Телемост", Transports: []Transport{{Type: "telemost", URL: "https://telemost.yandex.ru/j/88936358186517"}}}
+	link, err := Encode(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Negotiate || got.Secret != "" || len(got.Transports) != 1 || got.Transports[0] != c.Transports[0] {
+		t.Fatalf("round trip changed the config: %+v", got)
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"no transports":             func(c *Config) { c.Transports = nil },

@@ -123,7 +123,7 @@ type Config struct {
 // own.
 var knownTypes = map[string]bool{
 	"yandex": true, "vyandex": true, "boards": true, "mailru": true,
-	"cupsonline": true, "direct": true,
+	"cupsonline": true, "direct": true, "telemost": true,
 }
 
 // Validate reports whether c describes something a client can connect with.

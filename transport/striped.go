@@ -278,6 +278,12 @@ func (s *StripedTransport) wakePumps() {
 	s.pumpMu.Unlock()
 }
 
+// LaneCount reports how many lanes the stripe runs now.
+func (s *StripedTransport) LaneCount() int {
+	lanes, _ := s.snapshotLanes()
+	return len(lanes)
+}
+
 func (s *StripedTransport) snapshotLanes() ([]Transport, []time.Time) {
 	s.lanesMu.RLock()
 	defer s.lanesMu.RUnlock()
