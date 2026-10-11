@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
+	mrand "math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -14,16 +16,32 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
-// StripedTransport spreads frames over several child transports (lanes) and
-// puts them back in order on the receiving side.
+// StripedTransport spreads frames over several child transports (lanes), puts
+// them back in order on the receiving side and resends what the carrier
+// loses, so the tunnel above it sees one ordered, lossless link.
 //
-// Every frame gets a 5-byte header [stripeMagic][seq u32]. Send hands the frame
-// to the connected lane with the shortest queue, so a slower lane simply gets
-// fewer frames. The receiver keeps a reorder buffer and delivers strictly in
-// seq order, so the tunnel above (and the TCP connections inside it) never see
-// the lanes' different delays as reordering. A hole that stays open longer
-// than the adaptive gap timeout is declared lost and skipped - TCP then sees
-// an ordinary loss and retransmits, instead of a stalled stream.
+// The Telemost SFU drops 10-30% of what it relays, in bursts. TCP inside the
+// tunnel cannot live with that: each loss it sees cuts its window, and a lost
+// retransmission costs it a timeout. So the stripe is a reliable link layer:
+//
+//   - Frames are cut into pieces that fit one lane packet, each with its own
+//     seq. Lanes pull pieces on their own send clock (FramePuller): the ack
+//     first, then retransmissions, then new data. A piece is stamped with the
+//     lane and that lane's transmission count at the moment it really leaves.
+//   - The receiver delivers strictly in seq order and, every ackInterval while
+//     data flows, acks: the lowest seq it still misses, the highest it has
+//     and the missing runs in between. Acks are cumulative, so a lost ack
+//     costs only the wait for the next one.
+//   - The sender declares a piece lost as soon as a piece that left after it
+//     on the same lane is acked (a lane is FIFO), or once it is older than the
+//     link's retransmission timeout, and resends it ahead of new data, on
+//     another lane if there is one. Tick room the data leaves unused carries
+//     early second copies of overdue pieces; a lane whose packets stop
+//     arriving altogether only gets a probe now and then.
+//   - New data waits in one queue shared by all lanes, managed by CoDel: when
+//     the lanes cannot keep up, a frame is dropped at the head now and then -
+//     the congestion signal TCP expects - instead of a deep queue that only
+//     adds latency.
 type StripedTransport struct {
 	lanesMu  sync.RWMutex
 	lanes    []Transport
@@ -31,72 +49,44 @@ type StripedTransport struct {
 	src      LaneSource
 	maxLanes int
 	scale    bool
-	started  bool
 	accepted atomic.Uint64
 
 	capMu   sync.Mutex
 	capBps  float64 // 0 = no cap
 	tokens  float64
 	tokenAt time.Time
-	seq     atomic.Uint32
 	dropped atomic.Uint64
-	rr      atomic.Uint32
 
 	cbMu sync.RWMutex
 	cb   func([]byte)
 
 	ro *reorderBuffer
 
-	laneSent, laneRecv [64]atomic.Uint64
+	laneSent, laneRecv [maxStripeLanes]atomic.Uint64
 
 	watchMu sync.Mutex
 	watched map[string]bool
 	watchAt time.Time
 
-	// ARQ: the SFU drops 10-30% of the RTP it relays, and a tunnel carrying TCP
-	// cannot live with that. The sender keeps recent frames; the receiver asks
-	// for the seqs missing behind a hole and holds later frames until they
-	// come back (or the deadline passes).
-	txMu                         sync.Mutex
-	txRing                       [txRingSize]txEntry
-	nackSent, rtxSent, rtxMissed atomic.Uint64
-	lastSendNs                   atomic.Int64
+	snd sender
+	asm []byte // frame being reassembled (delivery goroutine only)
 
-	asm                         []byte // frame being reassembled (delivery goroutine only)
-	fecTx                       fecTx
-	fecRx                       fecRx
-	fecParitySent, fecRecovered atomic.Uint64
+	ackSent, ackRecv atomic.Uint64
+
+	pumpMu sync.Mutex
+	pumps  []chan struct{} // wake-ups of the lanes that cannot pull
 
 	stopOnce sync.Once
 	done     chan struct{}
 }
 
-const txRingSize = 16384
+const maxStripeLanes = 64
 
-type txEntry struct {
-	seq uint32
-	buf []byte
-	ok  bool
+// FramePuller is a lane whose send clock takes frames from a source on every
+// tick (up to max of them) instead of draining a queue filled by Send.
+type FramePuller interface {
+	SetFrameSource(src func(max int) [][]byte)
 }
-
-// arqEnabled: STRIPE_ARQ=0 turns retransmission off (holes are skipped after
-// the short adaptive gap timeout instead).
-var arqEnabled = os.Getenv("STRIPE_ARQ") != "0"
-
-// arqDeadline is how long a hole may hold later frames back waiting for a
-// retransmission before it is declared lost. STRIPE_ARQ_MS overrides.
-var arqDeadline = func() time.Duration {
-	if n, err := strconv.Atoi(os.Getenv("STRIPE_ARQ_MS")); err == nil && n > 0 {
-		return time.Duration(n) * time.Millisecond
-	}
-	return 800 * time.Millisecond
-}()
-
-const (
-	nackDelay   = 60 * time.Millisecond  // a hole this old (lane skew excluded) is asked for
-	nackRepeat  = 300 * time.Millisecond // ask again for the same seq after this
-	nackPerPass = 200
-)
 
 // LossReporter is implemented by lanes that know their recent uplink loss
 // fraction (0..1); autoscale uses it to find the link's ceiling.
@@ -105,27 +95,80 @@ type LossReporter interface {
 	UplinkReceived() uint64 // cumulative packets the far end acknowledged
 }
 
-// QueueDepther is implemented by lanes that can report how much they still
-// have buffered for sending; StripedTransport prefers the emptiest lane.
-type QueueDepther interface {
-	QueueDepth() int
+// Wire formats. The first byte tells them apart from each other and from the
+// lanes' own filler, which carries no stripe header at all.
+//
+//	data  [0xA7][seq u32][low u32][flag u8][piece]
+//	ctl   [0xA8][JSON {"watch":[lane ids]}]
+//	ack   [0xAE][cum u32][hi u32][n u8][(start u32, count u16) * n]
+//
+// low is the lowest seq the sender still waits to hear about: a receiver that
+// starts listening mid-stream begins there, not at whatever arrives first. An
+// ack says: every seq below cum has arrived (or was given up on), and of
+// cum..hi everything has arrived except the n missing runs.
+const (
+	stripeMagic    = 0xA7
+	stripeCtlMagic = 0xA8
+	stripeAckMagic = 0xAE
+	stripeHeader   = 9
+	ackHeader      = 10
+	ackMaxRuns     = 100
+)
+
+// Piece flags: the first byte of every data payload.
+const (
+	pieceCont = 1 // continues the previous piece
+	pieceMore = 2 // another piece follows
+)
+
+func envIntOr(name string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
+	}
+	return def
 }
 
-const stripeMagic = 0xA7
+func envMs(name string, def int) time.Duration {
+	return time.Duration(envIntOr(name, def)) * time.Millisecond
+}
 
-// stripeNackMagic marks a retransmission request: [magic][n u8][seq u32 * n].
-const stripeNackMagic = 0xA9
+var (
+	// stripePieceBytes is the most a piece carries: one lane fragment
+	// (TELEMOST_FRAG_BYTES minus its 8-byte header) minus the stripe header
+	// and flag, so every piece is exactly one lane packet.
+	stripePieceBytes = envIntOr("STRIPE_PIECE_BYTES", envIntOr("TELEMOST_FRAG_BYTES", 1312)-8-stripeHeader-1)
 
-// stripeTailMagic marks a high-water mark: [magic][last seq u32], sent while
-// traffic flows so the receiver can ask for frames lost at the very end of a
-// burst, which no later frame would reveal.
-const stripeTailMagic = 0xAA
-const stripeHeader = 5
+	// ackInterval is how often the receiver acks while data flows.
+	ackInterval = envMs("STRIPE_ACK_MS", 10)
 
-// stripeCtlMagic marks a control frame: JSON {"watch":[lane ids]} - the lanes
-// the sender of the frame is subscribed to. The far side then sends only on
-// those, so no frame goes to a lane nobody is watching.
-const stripeCtlMagic = 0xA8
+	// holeDeadline is how long a hole may hold later frames back before it is
+	// given up on. Retransmission normally fills it in one or two round trips,
+	// but the SFU now and then stops forwarding every lane for a few seconds
+	// (it renegotiates the subscriptions when someone joins or leaves); the
+	// tunnel's TCP waits that out (see tcpMinRTO) and loses nothing.
+	holeDeadline = envMs("STRIPE_HOLE_MS", 5000)
+
+	// CoDel on the shared send queue: when the oldest frame has waited longer
+	// than codelTarget for a whole codelInterval, drop at the head, faster
+	// while it lasts. The interval is about the tunnel's TCP round trip.
+	codelTarget   = envMs("STRIPE_CODEL_TARGET_MS", 30)
+	codelInterval = envMs("STRIPE_CODEL_INTERVAL_MS", 250)
+
+	// sendQueueLimit bounds the send queue (bytes) whatever CoDel decides.
+	sendQueueLimit = envIntOr("STRIPE_QUEUE_BYTES", 4<<20)
+)
+
+// laneReorderSlack: a piece counts as lost once a piece that left more than
+// this many transmissions after it on the same lane has been acked. A lane is
+// FIFO end to end (one RTP stream), so any later piece will do.
+const laneReorderSlack = 0
+
+// LaneSource creates additional lanes on demand and may ask for one itself
+// (e.g. a receiver that sees a new peer lane nobody is watching yet).
+type LaneSource interface {
+	NewLane() Transport
+	SetGrowHook(func())
+}
 
 // WatchSource reports the far-side lane IDs this node is subscribed to.
 type WatchSource interface {
@@ -137,34 +180,22 @@ type LaneIDer interface {
 	LaneID() string
 }
 
-// stripeMaxDepth is the lane queue depth (fragments) above which Send drops
-// instead of queueing more latency. STRIPE_MAX_DEPTH overrides.
-var stripeMaxDepth = func() int {
-	if n, err := strconv.Atoi(os.Getenv("STRIPE_MAX_DEPTH")); err == nil && n > 0 {
-		return n
-	}
-	return 256
-}()
-
-// LaneSource creates additional lanes on demand and may ask for one itself
-// (e.g. a receiver that sees a new peer lane nobody is watching yet).
-type LaneSource interface {
-	NewLane() Transport
-	SetGrowHook(func())
-}
-
 // NewStripedTransport bonds lanes into one transport. Both ends must stripe.
 func NewStripedTransport(lanes []Transport) *StripedTransport {
 	return NewStripedTransportAuto(lanes, nil, len(lanes), false)
 }
 
 // NewStripedTransportAuto is NewStripedTransport plus growth: src supplies new
-// lanes up to maxLanes; with autoscale the sender adds a lane whenever all
+// lanes up to maxLanes; with autoscale the sender adds a lane whenever the
 // lanes stay backed up and stops once a new lane no longer adds throughput.
 // Lanes are never removed.
 func NewStripedTransportAuto(lanes []Transport, src LaneSource, maxLanes int, autoscale bool) *StripedTransport {
+	if maxLanes > maxStripeLanes {
+		maxLanes = maxStripeLanes
+	}
 	s := &StripedTransport{lanes: lanes, readyAt: make([]time.Time, len(lanes)), src: src,
 		maxLanes: maxLanes, scale: autoscale, done: make(chan struct{})}
+	s.snd.init()
 	s.ro = newReorderBuffer(s.deliverPiece)
 	if src != nil {
 		src.SetGrowHook(func() { go s.addLane("peer lane appeared") })
@@ -191,11 +222,60 @@ func (s *StripedTransport) addLane(why string) {
 	s.readyAt = append(s.readyAt, time.Now().Add(laneWarmup))
 	n := len(s.lanes)
 	s.lanesMu.Unlock()
-	l.Receive(func(b []byte) { s.onLane(idx, b) })
+	s.attach(idx, l)
 	utils.Infof("[STRIPE] +lane %d (%s), now %d lanes", idx, why, n)
 	if err := l.Start(); err != nil {
 		utils.Infof("[STRIPE] lane %d start: %v", idx, err)
 	}
+}
+
+// attach wires lane idx: its receive side, and its send side - a pull source
+// when the lane has a send clock of its own, a pump goroutine otherwise.
+func (s *StripedTransport) attach(idx int, l Transport) {
+	l.Receive(func(b []byte) { s.onLane(idx, b) })
+	if p, ok := l.(FramePuller); ok {
+		p.SetFrameSource(func(max int) [][]byte { return s.pull(idx, max) })
+		return
+	}
+	wake := make(chan struct{}, 1)
+	s.pumpMu.Lock()
+	s.pumps = append(s.pumps, wake)
+	s.pumpMu.Unlock()
+	go s.pump(idx, l, wake)
+}
+
+// pump feeds a lane that has no send clock: whatever is ready goes out at once.
+func (s *StripedTransport) pump(idx int, l Transport, wake chan struct{}) {
+	t := time.NewTicker(5 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-wake:
+		case <-t.C:
+		}
+		for {
+			frames := s.pull(idx, 64)
+			for _, f := range frames {
+				_ = l.Send(f)
+			}
+			if len(frames) < 64 {
+				break
+			}
+		}
+	}
+}
+
+func (s *StripedTransport) wakePumps() {
+	s.pumpMu.Lock()
+	for _, w := range s.pumps {
+		select {
+		case w <- struct{}{}:
+		default:
+		}
+	}
+	s.pumpMu.Unlock()
 }
 
 func (s *StripedTransport) snapshotLanes() ([]Transport, []time.Time) {
@@ -207,8 +287,7 @@ func (s *StripedTransport) snapshotLanes() ([]Transport, []time.Time) {
 func (s *StripedTransport) Start() error {
 	lanes, _ := s.snapshotLanes()
 	for i, l := range lanes {
-		lane := i
-		l.Receive(func(b []byte) { s.onLane(lane, b) })
+		s.attach(i, l)
 	}
 	var firstErr error
 	started := 0
@@ -226,12 +305,8 @@ func (s *StripedTransport) Start() error {
 		return fmt.Errorf("striped: no lane started: %w", firstErr)
 	}
 	go s.ro.run(s.done)
-	if arqEnabled {
-		go s.nackLoop()
-	}
-	if fecEnabled {
-		go s.fecLoop()
-	}
+	go s.ackLoop()
+	go s.lossLoop()
 	go s.statsLoop()
 	if _, ok := s.src.(WatchSource); ok {
 		go s.watchLoop()
@@ -254,154 +329,63 @@ func (s *StripedTransport) Stop() error {
 	return nil
 }
 
+// Send queues a frame for the lanes. It never blocks: a full queue drops, and
+// TCP above sees an ordinary loss.
 func (s *StripedTransport) Send(data []byte) error {
-	lane, depth := s.pickLane()
-	if lane == nil {
+	if !s.IsConnected() {
 		return fmt.Errorf("striped: no connected lane")
+	}
+	if len(data) == 0 {
+		return nil
 	}
 	if !s.takeTokens(len(data)) {
 		s.dropped.Add(1)
 		return nil
 	}
-	if depth >= stripeMaxDepth {
-		// Every lane is backed up. Drop here, before a seq is spent, so the
-		// receiver sees no hole to wait on - TCP just sees an ordinary loss.
+	if !s.snd.enqueue(data) {
 		s.dropped.Add(1)
 		return nil
 	}
 	s.accepted.Add(uint64(len(data)))
-	// A frame that does not fit one RTP packet is cut into pieces here, each
-	// with its own seq, so FEC and retransmission protect every piece alone:
-	// losing any one fragment of a multi-fragment lane frame would lose the
-	// whole frame, and its odds fall off geometrically with the fragment count.
-	var err error
-	for off := 0; ; off += stripePieceBytes {
-		end := off + stripePieceBytes
-		flag := byte(0)
-		if off > 0 {
-			flag |= pieceCont
-		}
-		if end < len(data) {
-			flag |= pieceMore
-		} else {
-			end = len(data)
-		}
-		if e := s.sendPiece(lane, flag, data[off:end]); e != nil {
-			err = e
-		}
-		if end >= len(data) {
-			break
-		}
-		if l, _ := s.pickLane(); l != nil {
-			lane = l
-		}
-	}
-	return err
+	s.wakePumps()
+	return nil
 }
 
-// Piece flags: the first byte of every stripe payload.
-const (
-	pieceCont = 1 // continues the previous piece
-	pieceMore = 2 // another piece follows
-)
-
-// stripePieceBytes is the most payload a piece carries: the lane's fragment
-// (maxVP8Payload minus its 8-byte header) minus the stripe header and flag.
-var stripePieceBytes = func() int {
-	lane := envIntOr("TELEMOST_FRAG_BYTES", 1312) - 8 // what one lane fragment carries
-	n := lane - fecDataHeader - 1
-	if fecEnabled {
-		// A parity frame (header + k seqs and lengths + a shard as long as the
-		// longest piece) must fit one fragment too.
-		if m := lane - (8 + 6*fecK) - 1; m < n {
-			n = m
-		}
-	}
-	if v := envIntOr("STRIPE_PIECE_BYTES", 0); v > 0 {
-		n = v
-	}
-	return n
-}()
-
-func (s *StripedTransport) sendPiece(lane Transport, flag byte, piece []byte) error {
-	var buf []byte
-	var closed *fecOpenGroup
-	if fecEnabled {
-		sq := s.seq.Add(1)
-		buf = make([]byte, fecDataHeader+1+len(piece))
-		buf[0] = stripeFecDataMagic
-		binary.BigEndian.PutUint32(buf[1:5], sq)
-		buf[fecDataHeader] = flag
-		copy(buf[fecDataHeader+1:], piece)
-		var gid uint32
-		var idx int
-		gid, idx, closed = s.fecAdd(sq, buf[fecDataHeader:])
-		binary.BigEndian.PutUint32(buf[5:9], gid)
-		buf[9] = byte(idx)
-	} else {
-		buf = make([]byte, stripeHeader+1+len(piece))
-		buf[0] = stripeMagic
-		binary.BigEndian.PutUint32(buf[1:5], s.seq.Add(1))
-		buf[stripeHeader] = flag
-		copy(buf[stripeHeader+1:], piece)
-	}
-	s.lastSendNs.Store(time.Now().UnixNano())
-	if arqEnabled {
-		sq := binary.BigEndian.Uint32(buf[1:5])
-		s.txMu.Lock()
-		s.txRing[sq%txRingSize] = txEntry{seq: sq, buf: buf, ok: true}
-		s.txMu.Unlock()
-	}
-	if i := s.laneIndex(lane); i >= 0 && i < 64 {
-		s.laneSent[i].Add(1)
-	}
-	err := lane.Send(buf)
-	if closed != nil {
-		s.fecEmit(closed)
-	}
-	return err
-}
-
-// pickLane returns the connected lane with the shortest send queue; ties (and
-// lanes that cannot report a depth) rotate round-robin.
-func (s *StripedTransport) pickLane() (Transport, int) {
+// eligible reports whether lane i may carry stripe traffic now: connected,
+// and watched by the far side (or, before the far side has said what it
+// watches, past its warmup).
+func (s *StripedTransport) eligible(i int, now time.Time) bool {
 	lanes, readyAt := s.snapshotLanes()
-	n := len(lanes)
-	if n == 0 {
-		return nil, 0
+	if i >= len(lanes) || !lanes[i].IsConnected() {
+		return false
 	}
-	now := time.Now()
 	s.watchMu.Lock()
 	watched := s.watched
 	if now.Sub(s.watchAt) > 5*time.Second {
 		watched = nil // stale or never heard: fall back to the warmup rule
 	}
 	s.watchMu.Unlock()
-	start := int(s.rr.Add(1)) % n
-	var best Transport
-	bestDepth := int(^uint(0) >> 1)
-	for k := 0; k < n; k++ {
-		i := (start + k) % n
-		l := lanes[i]
-		if !l.IsConnected() {
-			continue
-		}
-		if watched != nil {
-			if id, ok := l.(LaneIDer); !ok || !watched[id.LaneID()] {
-				continue
-			}
-		} else if now.Before(readyAt[i]) {
-			continue
-		}
-		d := 0
-		if q, ok := l.(QueueDepther); ok {
-			d = q.QueueDepth()
-		}
-		if d < bestDepth {
-			best, bestDepth = l, d
-		}
+	if watched != nil {
+		id, ok := lanes[i].(LaneIDer)
+		return ok && watched[id.LaneID()]
 	}
-	return best, bestDepth
+	return !now.Before(readyAt[i])
+}
+
+// pull is lane i's send clock asking for up to max frames.
+func (s *StripedTransport) pull(i int, max int) [][]byte {
+	if i >= maxStripeLanes || max <= 0 {
+		return nil
+	}
+	now := time.Now()
+	if !s.eligible(i, now) {
+		return nil
+	}
+	out := s.snd.pull(i, max, now)
+	if n := len(out); n > 0 {
+		s.laneSent[i].Add(uint64(n))
+	}
+	return out
 }
 
 func (s *StripedTransport) Receive(cb func([]byte)) {
@@ -449,26 +433,18 @@ func (s *StripedTransport) deliver(b []byte) {
 }
 
 func (s *StripedTransport) onLane(lane int, b []byte) {
-	if len(b) > fecDataHeader && b[0] == stripeFecDataMagic {
-		seq := binary.BigEndian.Uint32(b[1:5])
-		payload := b[fecDataHeader:]
-		s.ro.push(seq, payload)
-		s.fecOnData(binary.BigEndian.Uint32(b[5:9]), int(b[9]), seq, payload)
-		if lane >= 0 && lane < 64 {
+	if len(b) > stripeHeader && b[0] == stripeMagic {
+		if lane >= 0 && lane < maxStripeLanes {
 			s.laneRecv[lane].Add(1)
 		}
+		s.ro.push(binary.BigEndian.Uint32(b[1:5]), binary.BigEndian.Uint32(b[5:9]), b[stripeHeader:])
 		return
 	}
-	if len(b) > 8 && b[0] == stripeFecParityMagic {
-		s.fecOnParity(b)
-		return
-	}
-	if len(b) > 2 && b[0] == stripeNackMagic {
-		s.handleNack(b)
-		return
-	}
-	if len(b) == 5 && b[0] == stripeTailMagic {
-		s.ro.noteTail(binary.BigEndian.Uint32(b[1:5]))
+	if len(b) >= ackHeader && b[0] == stripeAckMagic {
+		s.ackRecv.Add(1)
+		if s.snd.onAck(b, time.Now()) {
+			s.wakePumps()
+		}
 		return
 	}
 	if len(b) > 1 && b[0] == stripeCtlMagic {
@@ -486,16 +462,51 @@ func (s *StripedTransport) onLane(lane int, b []byte) {
 		}
 		return
 	}
-	if len(b) < stripeHeader || b[0] != stripeMagic {
-		// Lane-level filler (keepalives) carries no stripe header; hand it up
-		// untouched - the codec layer decodes it to nothing.
-		s.deliver(b)
-		return
+	// Lane-level filler (keepalives) carries no stripe header; hand it up
+	// untouched - the codec layer decodes it to nothing.
+	s.deliver(b)
+}
+
+// ackLoop sends the receiver's state to the sender: every ackInterval while
+// new pieces arrive, and at least every 4 intervals while a hole is open.
+func (s *StripedTransport) ackLoop() {
+	t := time.NewTicker(ackInterval)
+	defer t.Stop()
+	var lastGen uint64
+	var lastAt time.Time
+	for {
+		select {
+		case <-s.done:
+			return
+		case now := <-t.C:
+			gen, holes, ok := s.ro.ackState()
+			if !ok || (gen == lastGen && (!holes || now.Sub(lastAt) < 4*ackInterval)) {
+				continue
+			}
+			lastGen, lastAt = gen, now
+			s.snd.setAck(s.ro.ackFrame())
+			s.ackSent.Add(1)
+			s.wakePumps()
+		}
 	}
-	if lane < 64 {
-		s.laneRecv[lane].Add(1)
+}
+
+// lossLoop catches what no ack reveals - the tail of a burst - by the
+// retransmission timeout, and keeps the lanes' figures.
+func (s *StripedTransport) lossLoop() {
+	t := time.NewTicker(ackInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case now := <-t.C:
+			if s.snd.detectLoss(now) {
+				s.wakePumps()
+			}
+			s.snd.tickLanes(now)
+		}
 	}
-	s.ro.push(binary.BigEndian.Uint32(b[1:5]), b[stripeHeader:])
 }
 
 func (s *StripedTransport) IsConnected() bool {
@@ -524,16 +535,6 @@ func (s *StripedTransport) Stats() TransportStats {
 	}
 	st.Connected = s.IsConnected()
 	return st
-}
-
-func (s *StripedTransport) laneIndex(l Transport) int {
-	lanes, _ := s.snapshotLanes()
-	for i, x := range lanes {
-		if x == l {
-			return i
-		}
-	}
-	return -1
 }
 
 // watchLoop tells the far side, every second and on every lane, which of its
@@ -579,7 +580,7 @@ func (s *StripedTransport) statsLoop() {
 				up++
 			}
 		}
-		d, sk, late, buffered, to := s.ro.snapshot()
+		d, sk, late, buffered, gaps := s.ro.snapshot()
 		loss, _ := s.uplinkLoss()
 		s.watchMu.Lock()
 		nw := len(s.watched)
@@ -587,25 +588,32 @@ func (s *StripedTransport) statsLoop() {
 			nw = -1
 		}
 		s.watchMu.Unlock()
+		ss := s.snd.snapshot()
 		var per []string
 		for i := range lanes {
-			if i >= 64 {
+			if i >= maxStripeLanes {
 				break
 			}
 			id := ""
 			if li, ok := lanes[i].(LaneIDer); ok && len(li.LaneID()) >= 4 {
 				id = li.LaneID()[:4]
 			}
-			per = append(per, fmt.Sprintf("%d:%s s%d/r%d", i, id, s.laneSent[i].Load(), s.laneRecv[i].Load()))
+			dead := ""
+			if ss.laneDead[i] {
+				dead = " DEAD"
+			}
+			per = append(per, fmt.Sprintf("%d:%s s%d/r%d loss%.0f%%%s", i, id, s.laneSent[i].Load(), s.laneRecv[i].Load(), ss.laneLoss[i]*100, dead))
 		}
-		utils.Infof("[STRIPE] per-lane %s", strings.Join(per, " "))
-		utils.Infof("[STRIPE] farWatches=%d lanes up=%d/%d delivered=%d skipped=%d late=%d buffered=%d gapTimeout=%s sendDropped=%d nack=%d rtx=%d rtxMiss=%d fecPar=%d fecRec=%d uplinkLoss=%.1f%% cap=%.0fKB/s",
-			nw, up, len(lanes), d, sk, late, buffered, to, s.dropped.Load(), s.nackSent.Load(), s.rtxSent.Load(), s.rtxMissed.Load(), s.fecParitySent.Load(), s.fecRecovered.Load(), loss*100, s.getCap()/1000)
+		utils.Packetf("[STRIPE] per-lane %s | arrival gaps 1:%d 2-3:%d 4-7:%d 8-15:%d 16-31:%d 32-63:%d 64-127:%d 128+:%d",
+			strings.Join(per, " "), gaps[0], gaps[1], gaps[2], gaps[3], gaps[4], gaps[5], gaps[6], gaps[7])
+		utils.Packetf("[STRIPE] farWatches=%d lanes up=%d/%d | rx delivered=%d skipped=%d late=%d buffered=%d acks=%d | tx pieces=%d rtx=%d (rto %d) dups=%d inflight=%d queue=%dKB/%dms codelDrop=%d sendDropped=%d acks=%d srtt=%s rto=%s | uplinkLoss=%.1f%% cap=%.0fKB/s",
+			nw, up, len(lanes), d, sk, late, buffered, s.ackSent.Load(),
+			ss.pieces, ss.rtx, ss.rtxTimeout, ss.dups, ss.inflight, ss.queueBytes/1024, ss.queueDelay.Milliseconds(), ss.codelDrops, s.dropped.Load(), s.ackRecv.Load(),
+			ss.srtt.Round(time.Millisecond), ss.rto.Round(time.Millisecond), loss*100, s.getCap()/1000)
 	}
 }
 
-// takeTokens enforces the autoscaler's rate cap (bytes/s) before a frame gets
-// a seq, so capping never leaves holes for the receiver to wait on.
+// takeTokens enforces the autoscaler's rate cap (bytes/s).
 func (s *StripedTransport) takeTokens(n int) bool {
 	s.capMu.Lock()
 	defer s.capMu.Unlock()
@@ -669,7 +677,7 @@ func (s *StripedTransport) uplinkReceived() uint64 {
 	return n
 }
 
-// autoscaleLoop grows the lane count while every ready lane stays backed up,
+// autoscaleLoop grows the lane count while the send queue stays backed up,
 // and runs an AIMD rate cap on the lanes' uplink loss: a new lane that brings
 // loss instead of throughput marks the link's ceiling and the cap holds the
 // rate just under it. Lanes are never removed; extra ones just carry less.
@@ -713,9 +721,8 @@ func (s *StripedTransport) autoscaleLoop() {
 		got := float64(ghist[0]+ghist[1]+ghist[2]) / 3 // packets/s the far end really received
 		loss, haveLoss := s.uplinkLoss()
 
-		_, depth := s.pickLane()
 		lanes, _ := s.snapshotLanes()
-		if depth >= stripeMaxDepth/2 {
+		if s.snd.backlogged() {
 			busy++
 		} else {
 			busy = 0
@@ -789,7 +796,7 @@ func (s *StripedTransport) autoscaleLoop() {
 			probing, probeAt, busy, lossSum, lossN = true, time.Now(), 0, 0, 0
 			s.addLane(fmt.Sprintf("overloaded at %.0f KB/s, uplink loss %.1f%%", rate/1000, loss*100))
 		}
-		if atCeiling == false && !ceilingAt.IsZero() && s.getCap() > 0 {
+		if !atCeiling && !ceilingAt.IsZero() && s.getCap() > 0 {
 			// Re-probe: lift the cap and let the next overload try a lane.
 			ceilingAt = time.Time{}
 			s.setCap(0)
@@ -797,89 +804,495 @@ func (s *StripedTransport) autoscaleLoop() {
 	}
 }
 
-// handleNack resends the frames the far end asked for.
-func (s *StripedTransport) handleNack(b []byte) {
-	n := int(b[1])
-	if len(b) < 2+4*n {
-		return
+// sender is the sending half of the link: the queue of new frames, the
+// pieces in flight, the retransmission queue and the ack waiting to go.
+type sender struct {
+	mu sync.Mutex
+
+	queue      []queuedFrame // new frames, oldest first
+	queueBytes int
+	cur        []byte // the rest of the frame being cut into pieces
+	curStarted bool
+
+	codelFirstAbove time.Time
+	codelDropping   bool
+	codelDropNext   time.Time
+	codelCount      int
+	codelDrops      uint64
+
+	seq     uint32 // last seq handed out
+	low     uint32 // lowest seq not yet acked
+	ring    []txEntry
+	rtxQ    []uint32
+	ack     []byte // the newest ack, waiting for a lane
+	pieces  uint64
+	rtx     uint64
+	dupSent uint64
+	rtxTime uint64 // retransmissions caused by the timeout, not by acks
+
+	laneTx  [maxStripeLanes]uint64 // transmissions per lane, in send order
+	laneAck [maxStripeLanes]uint64 // highest of them known delivered
+	lane    [maxStripeLanes]laneState
+
+	srtt, rttvar time.Duration
+	minRTT       time.Duration
+	minRTTAt     time.Time
+	triesLogAt   time.Time
+}
+
+type queuedFrame struct {
+	b  []byte
+	at time.Time
+}
+
+// txEntry is a piece in flight.
+type txEntry struct {
+	seq     uint32
+	buf     []byte
+	ok      bool  // sent and not yet acked
+	queued  bool  // waiting in rtxQ
+	dups    uint8 // spare-room copies sent since the last (re)send
+	dupAt   time.Time
+	lane    uint8
+	laneIdx uint64 // laneTx[lane] when it last left
+	at      time.Time
+	tries   uint8
+}
+
+// txRingSize bounds the pieces in flight (about 2 s at 11 full lanes).
+const txRingSize = 1 << 15
+
+func (q *sender) init() {
+	q.ring = make([]txEntry, txRingSize)
+	// A random first seq, so a restarted sender is far from the window the
+	// receiver still keeps for its previous run.
+	q.seq = mrand.Uint32()
+	q.low = q.seq + 1
+}
+
+// enqueue adds a frame to the send queue; false if the queue is full.
+func (q *sender) enqueue(b []byte) bool {
+	cp := append([]byte(nil), b...)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.queueBytes+len(cp) > sendQueueLimit {
+		return false
 	}
-	for i := 0; i < n; i++ {
-		sq := binary.BigEndian.Uint32(b[2+4*i:])
-		s.txMu.Lock()
-		e := s.txRing[sq%txRingSize]
-		s.txMu.Unlock()
-		if !e.ok || e.seq != sq {
-			s.rtxMissed.Add(1)
+	q.queue = append(q.queue, queuedFrame{b: cp, at: time.Now()})
+	q.queueBytes += len(cp)
+	return true
+}
+
+// setAck replaces the ack waiting to go out: acks are cumulative, only the
+// newest one matters.
+func (q *sender) setAck(b []byte) {
+	q.mu.Lock()
+	q.ack = b
+	q.mu.Unlock()
+}
+
+// pull hands lane i up to max frames: the ack, retransmissions, new pieces.
+func (q *sender) pull(i, max int, now time.Time) [][]byte {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out [][]byte
+	if q.ack != nil {
+		out = append(out, q.ack)
+		q.ack = nil
+	}
+	ls := &q.lane[i]
+	dead := ls.dead(now) && q.othersAlive(i, now)
+	if dead {
+		if now.Sub(ls.probeAt) < 100*time.Millisecond {
+			return out
+		}
+		ls.probeAt = now
+		max = len(out) + 1 // one new piece: if it arrives, the lane is back
+	}
+	start := len(out)
+	if !dead && len(q.rtxQ) > 0 {
+		// Resend on another lane than the one that lost it when there is
+		// one: losses come in bursts, and the lane may still be in one.
+		others := q.othersAlive(i, now)
+		keep := q.rtxQ[:0]
+		for _, sq := range q.rtxQ {
+			e := &q.ring[sq%txRingSize]
+			if !e.ok || e.seq != sq || !e.queued {
+				continue
+			}
+			// ...but not for long: the others may be failing too.
+			mine := others && int(e.lane) == i && now.Sub(e.at) < 2*q.rto()
+			if len(out) >= max || mine {
+				keep = append(keep, sq)
+				continue
+			}
+			e.queued = false
+			e.tries++
+			e.dups = 0
+			if e.tries == 4 && now.Sub(q.triesLogAt) > time.Second {
+				q.triesLogAt = now
+				utils.Debugf("[STRIPE] seq %d: 4th send, now on lane %d (was lane %d, %s ago)", sq, i, e.lane, now.Sub(e.at).Round(time.Millisecond))
+			}
+			q.stamp(e, i, now)
+			q.rtx++
+			out = append(out, e.buf)
+		}
+		q.rtxQ = keep
+	}
+	for len(out) < max {
+		if q.seq+1-q.low >= txRingSize {
+			break // the ring is full of pieces in flight
+		}
+		p := q.nextPiece(now)
+		if p == nil {
+			break
+		}
+		q.seq++
+		buf := make([]byte, stripeHeader+len(p))
+		buf[0] = stripeMagic
+		binary.BigEndian.PutUint32(buf[1:5], q.seq)
+		binary.BigEndian.PutUint32(buf[5:9], q.low)
+		copy(buf[stripeHeader:], p)
+		e := &q.ring[q.seq%txRingSize]
+		*e = txEntry{seq: q.seq, buf: buf, ok: true, tries: 1}
+		q.stamp(e, i, now)
+		q.pieces++
+		out = append(out, buf)
+	}
+	if len(out) < max && !dead && dupOn {
+		out = q.duplicates(i, max, now, out)
+	}
+	ls.sentN(len(out)-start, now)
+	return out
+}
+
+// duplicates fills a tick's spare room with second copies of pieces whose ack
+// is overdue, oldest first, on another lane than the first copy. A lane
+// always has its clock's worth of packets to send; when the data does not use
+// them they carry nothing but filler. Spent on early copies they repair a
+// loss a timeout sooner where no later piece of the same lane would reveal
+// it - the tail of a burst, a lane that went quiet - and while the SFU drops
+// the most, in the first seconds of traffic, a lost resend costs less. They
+// stop by themselves once the data fills the lanes.
+func (q *sender) duplicates(i, max int, now time.Time, out [][]byte) [][]byte {
+	if q.srtt == 0 {
+		return out // no round trip known yet: nothing is overdue
+	}
+	overdue := q.srtt * 5 / 4
+	if overdue < 40*time.Millisecond {
+		overdue = 40 * time.Millisecond
+	}
+	scanned := 0
+	for x := q.low; seqBefore(x, q.seq+1) && len(out) < max && scanned < 512; x++ {
+		scanned++
+		e := &q.ring[x%txRingSize]
+		if !e.ok || e.seq != x || e.queued || e.dups > 0 || int(e.lane) == i || now.Sub(e.at) < overdue {
 			continue
 		}
-		lane, _ := s.pickLane()
-		if lane == nil {
+		e.dups, e.dupAt = e.dups+1, now
+		q.dupSent++
+		out = append(out, e.buf)
+	}
+	return out
+}
+
+// dupOn: STRIPE_DUP=0 turns the spare-room copies off.
+var dupOn = os.Getenv("STRIPE_DUP") != "0"
+
+// othersAlive reports whether some lane other than i is carrying traffic.
+func (q *sender) othersAlive(i int, now time.Time) bool {
+	for j := range q.lane {
+		if j != i && q.lane[j].started && !q.lane[j].deliveredAt.IsZero() && !q.lane[j].dead(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (q *sender) stamp(e *txEntry, lane int, now time.Time) {
+	q.laneTx[lane]++
+	e.lane, e.laneIdx, e.at = uint8(lane), q.laneTx[lane], now
+}
+
+// nextPiece cuts the next piece ([flag][bytes]) off the queue.
+func (q *sender) nextPiece(now time.Time) []byte {
+	if q.cur == nil {
+		f, ok := q.dequeue(now)
+		if !ok {
+			return nil
+		}
+		q.cur, q.curStarted = f, false
+	}
+	n := len(q.cur)
+	if n > stripePieceBytes {
+		n = stripePieceBytes
+	}
+	flag := byte(0)
+	if q.curStarted {
+		flag |= pieceCont
+	}
+	if n < len(q.cur) {
+		flag |= pieceMore
+	}
+	p := make([]byte, 1+n)
+	p[0] = flag
+	copy(p[1:], q.cur[:n])
+	q.cur, q.curStarted = q.cur[n:], true
+	if len(q.cur) == 0 {
+		q.cur = nil
+	}
+	return p
+}
+
+// dequeue takes the oldest frame, dropping at the head as CoDel (RFC 8289)
+// says when frames have waited too long for too long.
+func (q *sender) dequeue(now time.Time) ([]byte, bool) {
+	for len(q.queue) > 0 {
+		f := q.queue[0]
+		q.queue[0] = queuedFrame{}
+		q.queue = q.queue[1:]
+		q.queueBytes -= len(f.b)
+		if q.codelShouldDrop(now.Sub(f.at), now) {
+			q.codelDrops++
+			continue
+		}
+		return f.b, true
+	}
+	q.codelFirstAbove = time.Time{}
+	q.codelDropping = false
+	return nil, false
+}
+
+func (q *sender) codelShouldDrop(sojourn time.Duration, now time.Time) bool {
+	okToDrop := false
+	if sojourn < codelTarget || q.queueBytes < 2*stripePieceBytes {
+		q.codelFirstAbove = time.Time{}
+	} else if q.codelFirstAbove.IsZero() {
+		q.codelFirstAbove = now.Add(codelInterval)
+	} else if !now.Before(q.codelFirstAbove) {
+		okToDrop = true
+	}
+	if q.codelDropping {
+		if !okToDrop {
+			q.codelDropping = false
+			return false
+		}
+		if !now.Before(q.codelDropNext) {
+			q.codelCount++
+			q.codelDropNext = q.codelControl(q.codelDropNext)
+			return true
+		}
+		return false
+	}
+	if okToDrop {
+		q.codelDropping = true
+		if q.codelCount > 2 && now.Sub(q.codelDropNext) < 16*codelInterval {
+			q.codelCount -= 2
+		} else {
+			q.codelCount = 1
+		}
+		q.codelDropNext = q.codelControl(now)
+		return true
+	}
+	return false
+}
+
+func (q *sender) codelControl(t time.Time) time.Time {
+	return t.Add(time.Duration(float64(codelInterval) / math.Sqrt(float64(q.codelCount))))
+}
+
+// onAck applies an ack; true if it queued retransmissions.
+func (q *sender) onAck(b []byte, now time.Time) bool {
+	cum := binary.BigEndian.Uint32(b[1:5])
+	hi := binary.BigEndian.Uint32(b[5:9])
+	n := int(b[9])
+	if len(b) < ackHeader+6*n {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	// Only an ack about the pieces of this run counts; one left over from
+	// before a restart (ours or the receiver's) describes other seqs.
+	inflight := int64(q.seq + 1 - q.low)
+	if d := int64(int32(cum - q.low)); d < -txRingSize || d > inflight {
+		return false
+	}
+	if d := int64(int32(hi - q.low)); d < -txRingSize-1 || d >= inflight {
+		return false
+	}
+	var sample time.Duration
+	acked := func(sq uint32) {
+		e := &q.ring[sq%txRingSize]
+		if !e.ok || e.seq != sq {
 			return
 		}
-		if lane.Send(e.buf) == nil {
-			s.rtxSent.Add(1)
+		e.ok, e.buf = false, nil
+		d := now.Sub(e.at)
+		// Which copy came in is unknown when there were several: a resent
+		// piece acked sooner than a round trip after the resend came in on
+		// its earlier copy, and crediting its lane with the resend would make
+		// every piece sent there since then look lost. A piece that also went
+		// out as a spare-room copy may have arrived on either lane.
+		// An ack sooner than a round trip after the copy left came in on the
+		// original.
+		original := e.dups == 0 || now.Sub(e.dupAt) < q.minRTT*7/8
+		if original && (e.tries == 1 || d >= q.minRTT*7/8) {
+			q.lane[e.lane].got(now)
+			if e.laneIdx > q.laneAck[e.lane] {
+				q.laneAck[e.lane] = e.laneIdx
+			}
 		}
+		if e.tries == 1 && original && (sample == 0 || d < sample) {
+			sample = d
+		}
+	}
+	for ; seqBefore(q.low, cum); q.low++ {
+		acked(q.low)
+	}
+	x := q.low
+	if seqBefore(x, cum) {
+		x = cum
+	}
+	for r := 0; r <= n && !seqBefore(hi, x); r++ {
+		end := hi + 1 // the end of the received stretch before run r
+		var runEnd uint32
+		if r < n {
+			start := binary.BigEndian.Uint32(b[ackHeader+6*r:])
+			cnt := uint32(binary.BigEndian.Uint16(b[ackHeader+6*r+4:]))
+			end, runEnd = start, start+cnt
+		}
+		for ; seqBefore(x, end); x++ {
+			acked(x)
+		}
+		if r < n && seqBefore(x, runEnd) {
+			x = runEnd
+		}
+	}
+	if sample > 0 {
+		q.rttSample(sample)
+	}
+	return q.detectLocked(now)
+}
+
+func (q *sender) rttSample(d time.Duration) {
+	if now := time.Now(); q.minRTT == 0 || d < q.minRTT || now.Sub(q.minRTTAt) > 10*time.Second {
+		q.minRTT, q.minRTTAt = d, now
+	}
+	if q.srtt == 0 {
+		q.srtt, q.rttvar = d, d/2
+		return
+	}
+	dev := q.srtt - d
+	if dev < 0 {
+		dev = -dev
+	}
+	q.rttvar = (3*q.rttvar + dev) / 4
+	q.srtt = (7*q.srtt + d) / 8
+}
+
+// rto is the link's retransmission timeout: a piece neither acked nor shown
+// lost by its lane after this long is sent again.
+func (q *sender) rto() time.Duration {
+	if q.srtt == 0 {
+		return 500 * time.Millisecond
+	}
+	r := q.srtt + 4*q.rttvar + 2*ackInterval
+	if r < 50*time.Millisecond {
+		r = 50 * time.Millisecond
+	}
+	if r > 2*time.Second {
+		r = 2 * time.Second
+	}
+	return r
+}
+
+func (q *sender) detectLoss(now time.Time) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.detectLocked(now)
+}
+
+// detectLocked queues every piece in flight that its lane shows lost, or
+// that has waited longer than the timeout (doubled once it has been resent:
+// a lost resend should not cost the stream hundreds of milliseconds more).
+func (q *sender) detectLocked(now time.Time) bool {
+	rto := q.rto()
+	added := false
+	for x := q.low; seqBefore(x, q.seq+1); x++ {
+		e := &q.ring[x%txRingSize]
+		if !e.ok || e.seq != x || e.queued {
+			continue
+		}
+		byLane := q.laneAck[e.lane] > e.laneIdx+laneReorderSlack
+		if !byLane {
+			wait := rto << min(int(e.tries)-1, 1)
+			if now.Sub(e.at) < wait {
+				continue
+			}
+			q.rtxTime++
+		}
+		q.lane[e.lane].lostOne()
+		e.queued = true
+		q.rtxQ = append(q.rtxQ, x)
+		added = true
+	}
+	return added
+}
+
+// tickLanes rolls the lanes' loss figures.
+func (q *sender) tickLanes(now time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.lane {
+		q.lane[i].tick(now)
 	}
 }
 
-// nackLoop asks the sender for the frames missing behind old holes.
-func (s *StripedTransport) nackLoop() {
-	t := time.NewTicker(25 * time.Millisecond)
-	defer t.Stop()
-	var lastTail time.Time
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-t.C:
-		}
-		if now := time.Now(); now.Sub(lastTail) >= 200*time.Millisecond &&
-			now.UnixNano()-s.lastSendNs.Load() < int64(3*time.Second) {
-			lastTail = now
-			msg := []byte{stripeTailMagic, 0, 0, 0, 0}
-			binary.BigEndian.PutUint32(msg[1:], s.seq.Load())
-			if lane, _ := s.pickLane(); lane != nil {
-				_ = lane.Send(msg)
-			}
-		}
-		miss := s.ro.holes(time.Now(), nackDelay, nackRepeat, nackPerPass)
-		for len(miss) > 0 {
-			n := len(miss)
-			if n > 200 {
-				n = 200
-			}
-			msg := make([]byte, 2+4*n)
-			msg[0], msg[1] = stripeNackMagic, byte(n)
-			for i := 0; i < n; i++ {
-				binary.BigEndian.PutUint32(msg[2+4*i:], miss[i])
-			}
-			miss = miss[n:]
-			if lane, _ := s.pickLane(); lane != nil {
-				_ = lane.Send(msg)
-				s.nackSent.Add(1)
-			}
-		}
+// backlogged reports whether new data is waiting longer than CoDel's target.
+func (q *sender) backlogged() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.queue) > 0 && time.Since(q.queue[0].at) >= codelTarget
+}
+
+type senderStats struct {
+	pieces, rtx, rtxTimeout, codelDrops, dups uint64
+	inflight, queueBytes                      int
+	queueDelay, srtt, rto                     time.Duration
+	laneLoss                                  [maxStripeLanes]float64
+	laneDead                                  [maxStripeLanes]bool
+}
+
+func (q *sender) snapshot() senderStats {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	st := senderStats{pieces: q.pieces, rtx: q.rtx, rtxTimeout: q.rtxTime, codelDrops: q.codelDrops, dups: q.dupSent,
+		inflight: int(q.seq + 1 - q.low), queueBytes: q.queueBytes, srtt: q.srtt, rto: q.rto()}
+	for i := range q.lane {
+		st.laneLoss[i], st.laneDead[i] = q.lane[i].loss, q.lane[i].dead(time.Now())
 	}
+	if len(q.queue) > 0 {
+		st.queueDelay = time.Since(q.queue[0].at)
+	}
+	return st
 }
 
 // reorderBuffer delivers frames in seq order. Frames sit in a ring indexed by
-// seq; a hole is given up as lost once the frame right after it has waited
-// longer than the gap timeout, so a run of holes behind stale frames clears in
-// one pass instead of costing one timeout each.
+// seq; a hole is given up on once the frame right after it has waited longer
+// than holeDeadline. It also keeps what the ack reports.
 type reorderBuffer struct {
 	mu      sync.Mutex
 	started bool
 	next    uint32
-	ring    [reorderWindow]reorderSlot
+	hi      uint32 // highest seq seen
+	gen     uint64 // bumped by every new piece
+	ring    []reorderSlot
 	count   int
-	est     time.Duration // smoothed upper estimate of how long holes take to fill
 	out     chan reorderOut
 	gapNext bool
-	nacked  map[uint32]time.Time
-	tailSeq uint32
-	tailAt  time.Time
 
 	delivered, skipped, late uint64
+	gaps                     [8]uint64 // runs of seqs jumped over on arrival: 1, 2-3, 4-7, ... 128+
 }
 
 type reorderSlot struct {
@@ -889,11 +1302,7 @@ type reorderSlot struct {
 	ok   bool
 }
 
-const (
-	reorderWindow     = 16384
-	reorderMinTimeout = 25 * time.Millisecond
-	reorderMaxTimeout = 400 * time.Millisecond
-)
+const reorderWindow = txRingSize
 
 // reorderOut is one in-order frame; gap says seqs were skipped just before it.
 type reorderOut struct {
@@ -902,7 +1311,7 @@ type reorderOut struct {
 }
 
 func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
-	r := &reorderBuffer{est: 40 * time.Millisecond, out: make(chan reorderOut, 8192), nacked: map[uint32]time.Time{}}
+	r := &reorderBuffer{ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
 	go func() {
 		for o := range r.out {
 			deliver(o.b, o.gap)
@@ -913,27 +1322,20 @@ func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
 
 func seqBefore(a, b uint32) bool { return int32(a-b) < 0 }
 
-func (r *reorderBuffer) timeout() time.Duration {
-	if arqEnabled {
-		return arqDeadline
-	}
-	to := 2*r.est + 10*time.Millisecond
-	if to < reorderMinTimeout {
-		to = reorderMinTimeout
-	}
-	if to > reorderMaxTimeout {
-		to = reorderMaxTimeout
-	}
-	return to
-}
-
-func (r *reorderBuffer) push(seq uint32, data []byte) {
+// push files piece seq; low is the sender's lowest unacknowledged seq.
+func (r *reorderBuffer) push(seq, low uint32, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
 	if !r.started {
 		r.started = true
-		r.next = seq
+		r.startAt(seq, low)
+	}
+	r.gen++ // even a duplicate or a late piece: the sender should hear we have it
+	if d := int32(seq - r.next); d >= 2*reorderWindow || d < -reorderWindow {
+		// Nowhere near the window: the sender restarted (each run starts at
+		// a random seq). Start over at its new position.
+		r.resyncLocked(seq, low)
 	}
 	if seqBefore(seq, r.next) {
 		r.late++
@@ -943,24 +1345,43 @@ func (r *reorderBuffer) push(seq uint32, data []byte) {
 	for seq-r.next >= reorderWindow {
 		r.skipToLocked(r.lowestLocked(seq))
 	}
-	if seq == r.next && r.count > 0 {
-		// A hole just filled: learn how long lane skew keeps holes open.
-		if nx := &r.ring[(seq+1)%reorderWindow]; nx.ok && nx.seq == seq+1 {
-			sample := now.Sub(nx.at)
-			if sample > r.est {
-				r.est = (r.est + 3*sample) / 4
-			} else {
-				r.est = (r.est*63 + sample) / 64
-			}
-		}
-	}
 	sl := &r.ring[seq%reorderWindow]
 	if sl.ok && sl.seq == seq {
 		return // duplicate
 	}
 	*sl = reorderSlot{seq: seq, data: data, at: now, ok: true}
 	r.count++
+	if seqBefore(r.hi, seq) {
+		if g := seq - r.hi - 1; g > 0 {
+			b := 0
+			for g > 1 && b < len(r.gaps)-1 {
+				g >>= 1
+				b++
+			}
+			r.gaps[b]++
+		}
+		r.hi = seq
+	}
 	r.drainLocked()
+}
+
+func (r *reorderBuffer) resyncLocked(seq, low uint32) {
+	utils.Infof("[STRIPE] peer restarted (seq %d, expected %d): starting over", seq, r.next)
+	for i := range r.ring {
+		r.ring[i] = reorderSlot{}
+	}
+	r.count, r.gapNext = 0, true
+	r.startAt(seq, low)
+}
+
+// startAt begins the stream at the sender's low mark, so pieces it sent
+// before the first one that got here are still waited for.
+func (r *reorderBuffer) startAt(seq, low uint32) {
+	r.next = seq
+	if d := seq - low; d < reorderWindow/2 {
+		r.next = low
+	}
+	r.hi = r.next - 1
 }
 
 func (r *reorderBuffer) drainLocked() {
@@ -972,7 +1393,6 @@ func (r *reorderBuffer) drainLocked() {
 		b := sl.data
 		*sl = reorderSlot{}
 		r.count--
-		delete(r.nacked, r.next)
 		r.next++
 		r.delivered++
 		r.out <- reorderOut{b: b, gap: r.gapNext}
@@ -995,10 +1415,8 @@ func (r *reorderBuffer) skipToLocked(s uint32) {
 	if seqBefore(r.next, s) {
 		r.skipped += uint64(s - r.next)
 		r.gapNext = true
-		for x := r.next; x != s; x++ {
-			delete(r.nacked, x)
-		}
 		r.next = s
+		r.gen++
 	}
 	r.drainLocked()
 }
@@ -1013,74 +1431,65 @@ func (r *reorderBuffer) run(done chan struct{}) {
 		case <-t.C:
 		}
 		r.mu.Lock()
-		to := r.timeout()
 		for r.count > 0 {
 			low := r.lowestLocked(r.next + reorderWindow)
-			if time.Since(r.ring[low%reorderWindow].at) <= to {
+			waited := time.Since(r.ring[low%reorderWindow].at)
+			if waited <= holeDeadline {
 				break
 			}
+			utils.Infof("[STRIPE] gave up on %d piece(s) from seq %d after %s", low-r.next, r.next, waited.Round(time.Millisecond))
 			r.skipToLocked(low)
 		}
 		r.mu.Unlock()
 	}
 }
 
-// holes lists up to max seqs that are missing behind a buffered frame that has
-// waited at least minAge, skipping seqs already asked for within repeat.
-// noteTail records the sender's high-water mark.
-func (r *reorderBuffer) noteTail(seq uint32) {
-	r.mu.Lock()
-	if r.started && (r.tailAt.IsZero() || !seqBefore(seq, r.tailSeq)) {
-		r.tailSeq, r.tailAt = seq, time.Now()
-	}
-	r.mu.Unlock()
-}
-
-func (r *reorderBuffer) holes(now time.Time, minAge, repeat time.Duration, max int) []uint32 {
+// ackState reports the change counter and whether a hole is open.
+func (r *reorderBuffer) ackState() (gen uint64, holes, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	tail := !r.tailAt.IsZero() && !seqBefore(r.tailSeq, r.next)
-	if r.count == 0 && !tail {
-		return nil
+	return r.gen, r.count > 0, r.started
+}
+
+// ackFrame builds an ack of the current state (see the wire formats).
+func (r *reorderBuffer) ackFrame() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	hi := r.hi
+	if seqBefore(hi, r.next) {
+		hi = r.next - 1
 	}
-	hi := r.next
-	for s := r.next; s-r.next < reorderWindow && s-r.next < 4096; s++ {
+	b := make([]byte, ackHeader, ackHeader+6*8)
+	b[0] = stripeAckMagic
+	binary.BigEndian.PutUint32(b[1:5], r.next)
+	n := 0
+	for s := r.next; seqBefore(s, hi); {
 		if sl := &r.ring[s%reorderWindow]; sl.ok && sl.seq == s {
-			hi = s
+			s++
+			continue
 		}
-	}
-	var out []uint32
-	var above time.Time // arrival of the nearest buffered frame above s
-	top := hi
-	if tail && seqBefore(hi, r.tailSeq) && r.tailSeq-r.next < 4096 {
-		top, above = r.tailSeq, r.tailAt // seqs up to the mark are missing, nothing buffered above them
-	}
-	for s := top; ; s-- {
-		sl := &r.ring[s%reorderWindow]
-		if sl.ok && sl.seq == s {
-			above = sl.at
-		} else if !above.IsZero() && now.Sub(above) >= minAge {
-			if t, ok := r.nacked[s]; !ok || now.Sub(t) >= repeat {
-				r.nacked[s] = now
-				out = append(out, s)
-			}
-		}
-		if s == r.next {
+		if n == ackMaxRuns {
+			hi = s - 1 // report no further than the runs listed
 			break
 		}
+		start := s
+		for seqBefore(s, hi) && s-start < math.MaxUint16 {
+			if sl := &r.ring[s%reorderWindow]; sl.ok && sl.seq == s {
+				break
+			}
+			s++
+		}
+		b = binary.BigEndian.AppendUint32(b, start)
+		b = binary.BigEndian.AppendUint16(b, uint16(s-start))
+		n++
 	}
-	if len(out) > max {
-		out = out[len(out)-max:] // keep the oldest (lowest) ones
-	}
-	// reverse to ascending order
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
-	return out
+	binary.BigEndian.PutUint32(b[5:9], hi)
+	b[9] = byte(n)
+	return b
 }
 
-func (r *reorderBuffer) snapshot() (delivered, skipped, late uint64, buffered int, to time.Duration) {
+func (r *reorderBuffer) snapshot() (delivered, skipped, late uint64, buffered int, gaps [8]uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.delivered, r.skipped, r.late, r.count, r.timeout()
+	return r.delivered, r.skipped, r.late, r.count, r.gaps
 }

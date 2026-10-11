@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"log"
 	mrand "math/rand"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -115,9 +117,22 @@ func runBenchSend(trans transport.Transport, mb int, compressible bool) {
 		}
 	}
 
+	if w := envSeconds("BENCH_SEND_WARMUP_SEC"); w > 0 {
+		log.Printf("[BENCH-SEND] warmup: holding %s so the sink can subscribe", w)
+		time.Sleep(w)
+	}
+	// BENCH_SEND_KBPS paces the sender; unpaced, a transport that drops
+	// instead of blocking would just throw most of the data away.
+	kbps, _ := strconv.Atoi(os.Getenv("BENCH_SEND_KBPS"))
+
 	var sent int64
 	start := time.Now()
 	for sent < total {
+		if kbps > 0 {
+			if ahead := time.Duration(float64(sent)/float64(kbps*1000)*float64(time.Second)) - time.Since(start); ahead > time.Millisecond {
+				time.Sleep(ahead)
+			}
+		}
 		if compressible {
 			payload[0] = byte(sent)
 			payload[1] = byte(sent >> 8)
@@ -140,7 +155,16 @@ func runBenchSend(trans transport.Transport, mb int, compressible bool) {
 	log.Printf("[BENCH-SEND] channel msgs=%d, %.1f tunnel pkts/msg, channel bytes=%.2f MB",
 		st.PacketsSent, ratio(tunnelPkts, int64(st.PacketsSent)), float64(st.BytesSent)/1e6)
 	log.Printf("[BENCH-SEND] draining to channel...")
-	time.Sleep(3 * time.Second)
+	drain := envSeconds("BENCH_SEND_DRAIN_SEC")
+	if drain == 0 {
+		drain = 3 * time.Second
+	}
+	time.Sleep(drain)
 	st = trans.Stats()
 	log.Printf("[BENCH-SEND] after drain: channel msgs=%d channel bytes=%.2f MB", st.PacketsSent, float64(st.BytesSent)/1e6)
+}
+
+func envSeconds(name string) time.Duration {
+	n, _ := strconv.Atoi(os.Getenv(name))
+	return time.Duration(n) * time.Second
 }

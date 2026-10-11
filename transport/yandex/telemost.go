@@ -176,6 +176,10 @@ type TelemostTransport struct {
 	frameMu    sync.Mutex
 	frameQueue [][]byte
 
+	// frameSource, when set (StripedTransport), is asked for frames on every
+	// tick after frameQueue: what goes out is decided at the moment it goes.
+	frameSource atomic.Pointer[func(max int) [][]byte]
+
 	lastSigPayload atomic.Value
 	lastSigAt      atomic.Int64
 
@@ -199,6 +203,7 @@ type TelemostTransport struct {
 
 	lastSendTime atomic.Int64
 	lastRecvTime atomic.Int64
+	videoAt      atomic.Int64 // last RTP on the subscribed video track
 }
 
 type TelemostConnectionResponse struct {
@@ -620,7 +625,7 @@ func (t *TelemostTransport) sendSetSlotsOffset(off int) error {
 		"uid":            uuid.New().String(),
 		"setSlotsOffset": map[string]interface{}{"offset": off},
 	})
-	utils.Debugf("[Telemost] setSlotsOffset -> %d [%s]", off, roleStr(t.isExitNode))
+	utils.Debugf("[Telemost] lane %d setSlotsOffset -> %d [%s]", t.laneIndex(), off, roleStr(t.isExitNode))
 	return t.writeWSMessage(websocket.TextMessage, data)
 }
 
@@ -1625,9 +1630,11 @@ var publishFPS = envIntDefault("TELEMOST_FPS", 120)
 // thing the SFU's own jitter and RTCP accounting watches for.
 var rtpTimestampStep = uint32(90000 / publishFPS)
 
-// publishPace spreads a tick's frames across the tick (default). TELEMOST_PACE=0
-// writes them back to back.
-var publishPace = envOrDefault("TELEMOST_PACE", "0") != "0"
+// publishPace spreads a tick's frames evenly across the tick instead of
+// writing them back to back (TELEMOST_PACE=0). Back-to-back bursts lose far
+// more on the way through the SFU: from a server exit 50-80% of a lane's
+// packets against 0-10% paced, and 30-40% against ~20% between two phones.
+var publishPace = envOrDefault("TELEMOST_PACE", "1") != "0"
 
 // envIntDefault reads a positive integer tuning knob.
 func envIntDefault(name string, def int) int {
@@ -1687,6 +1694,16 @@ func (t *TelemostTransport) runPublisherKeepalive() {
 			continue
 		}
 		frames := t.popFrames()
+		if src := t.frameSource.Load(); src != nil && len(frames) < maxFramesPerTick {
+			for _, w := range (*src)(maxFramesPerTick - len(frames)) {
+				frags, err := FragmentFrame(w)
+				if err != nil {
+					utils.Debugf("[Telemost] pulled frame: %v [%s]", err, roleStr(t.isExitNode))
+					continue
+				}
+				frames = append(frames, frags...)
+			}
+		}
 		if len(frames) == 0 {
 			frames = [][]byte{filler(sent)}
 		}
@@ -2479,7 +2496,7 @@ func (t *TelemostTransport) sendFrame(wire []byte) error {
 		}
 
 		pkt := rtp.Packet{Header: hdr, Payload: frame}
-		if utils.Level() >= utils.LevelDebug {
+		if utils.IsVerbose() {
 			t.dumpRTP("->", &pkt)
 		}
 		n, err := t.sharingTrack.WriteHeader(hdr, frame)
@@ -2843,6 +2860,27 @@ func (t *TelemostTransport) readSharingVideoTrack(track *webrtc.TrackRemote) {
 		}
 	}
 	var reasm frameReassembler
+	var rx struct{ pkts, gaps, late, bad atomic.Uint64 }
+	var lastSeq uint16
+	haveSeq := false
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+			}
+			got, gaps := rx.pkts.Load(), rx.gaps.Load()
+			utils.Packetf("[Telemost] lane %d rx: rtp=%d seqGaps=%d (%.1f%%) late=%d undecodable=%d | tx: rtp=%d sfuNack=%d resent=%d rrLoss=%.1f%% [%s]",
+				t.laneIndex(), got, gaps, 100*float64(gaps)/float64(max(got+gaps, 1)), rx.late.Load(), rx.bad.Load(),
+				t.stats.RTPSendSuccess.Load(), t.rtxStats.asked.Load(), t.rtxStats.resent.Load(),
+				100*float64(t.uplinkLoss.Load())/256, roleStr(t.isExitNode))
+		}
+	}()
 	rtpBuf := make([]byte, 1500)
 	for t.IsRunning() {
 		n, _, err := track.Read(rtpBuf)
@@ -2857,12 +2895,25 @@ func (t *TelemostTransport) readSharingVideoTrack(track *webrtc.TrackRemote) {
 		if len(pkt.Payload) == 0 {
 			continue
 		}
+		rx.pkts.Add(1)
+		if haveSeq {
+			switch d := pkt.SequenceNumber - lastSeq; {
+			case d == 0 || d >= 0x8000:
+				rx.late.Add(1)
+			default:
+				rx.gaps.Add(uint64(d - 1))
+				lastSeq = pkt.SequenceNumber
+			}
+		} else {
+			lastSeq, haveSeq = pkt.SequenceNumber, true
+		}
 		// Always count received RTP payload bytes for throughput stats.
 		t.stats.PacketsRecv.Add(1)
 		t.stats.BytesReceived.Add(uint64(len(pkt.Payload)))
 		t.lastRecvTime.Store(time.Now().UnixNano())
+		t.videoAt.Store(time.Now().UnixNano())
 
-		if utils.Level() >= utils.LevelDebug {
+		if utils.IsVerbose() {
 			t.dumpRTP("<-", &pkt)
 		}
 
@@ -2875,6 +2926,7 @@ func (t *TelemostTransport) readSharingVideoTrack(track *webrtc.TrackRemote) {
 
 		body, err := decoder.DecodeFrame(pkt.Payload)
 		if err != nil || len(body) == 0 {
+			rx.bad.Add(1)
 			continue
 		}
 		data, ok := reasm.push(body, time.Now().UnixNano())
@@ -2921,7 +2973,7 @@ func (t *TelemostTransport) readAudioCarrierTrack(track *webrtc.TrackRemote) {
 		t.stats.BytesReceived.Add(uint64(len(pkt.Payload)))
 		t.lastRecvTime.Store(time.Now().UnixNano())
 
-		if utils.Level() >= utils.LevelDebug {
+		if utils.IsVerbose() {
 			t.dumpRTP("<-", &pkt)
 		}
 

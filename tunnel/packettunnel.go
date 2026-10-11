@@ -55,7 +55,7 @@ func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcpProtocol(), udp.NewProtocol},
 	})
 
-	SetTCPBuffers(s)
+	TuneTCP(s)
 
 	ep := channel.New(256, mtu, "")
 	nicID := tcpip.NICID(1)

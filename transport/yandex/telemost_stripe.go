@@ -48,6 +48,7 @@ type TelemostGroup struct {
 	lanes   []*TelemostTransport
 	grow    func()
 	growing atomic.Bool
+	silent  map[string]time.Time // peers a lane watched and got nothing from
 }
 
 // Lanes returns the lanes created so far.
@@ -105,6 +106,7 @@ type stripeLane struct {
 	mu       sync.Mutex
 	parts    map[string]tmPart
 	target   string
+	targetAt time.Time // when target was set
 	view     *slotsView
 	shutdown bool // shutdownAllVideo last requested
 	lastReq  int
@@ -140,17 +142,29 @@ func (g *TelemostGroup) recompute() {
 		}
 		l.lane.mu.Unlock()
 	}
-	var peers []string
+	for id, at := range g.silent {
+		if time.Since(at) > silentFor {
+			delete(g.silent, id)
+		}
+	}
+	var peers, quiet []string
 	settled := 0
 	for id, p := range seen {
-		if p.streaming && !p.gone && !own[id] {
-			peers = append(peers, id)
-			if time.Since(p.since) >= peerSettle {
-				settled++
-			}
+		if !p.streaming || p.gone || own[id] {
+			continue
+		}
+		if _, silent := g.silent[id]; silent {
+			quiet = append(quiet, id)
+			continue
+		}
+		peers = append(peers, id)
+		if time.Since(p.since) >= peerSettle {
+			settled++
 		}
 	}
 	sort.Strings(peers)
+	sort.Strings(quiet)
+	peers = append(peers, quiet...) // the silent ones only if nothing else is left
 	lanes := append([]*TelemostTransport(nil), g.lanes...)
 	grow := g.grow
 	g.mu.Unlock()
@@ -165,7 +179,7 @@ func (g *TelemostGroup) recompute() {
 	// re-steer costs that lane a resubscription), and only free lanes pick
 	// up peers nobody watches yet.
 	alive := map[string]bool{}
-	for _, p := range peers {
+	for _, p := range peers[:len(peers)-len(quiet)] {
 		alive[p] = true
 	}
 	taken := map[string]bool{}
@@ -193,13 +207,51 @@ func (g *TelemostGroup) recompute() {
 	for i, l := range lanes {
 		l.setStripeTarget(targets[i])
 	}
+	// A lane that has watched its peer for a while and got nothing: the peer
+	// is most likely the ghost of a participant that left without a word
+	// (the SFU keeps those listed for a minute). Put it aside and let the
+	// lane take another one.
+	var silent []string
+	for _, l := range lanes {
+		l.lane.mu.Lock()
+		if l.lane.target != "" && !l.receiving() && time.Since(l.lane.targetAt) > silentAfter {
+			silent = append(silent, l.lane.target)
+		}
+		l.lane.mu.Unlock()
+	}
+	marked := false
+	g.mu.Lock()
+	for _, id := range silent {
+		if _, ok := g.silent[id]; ok {
+			continue
+		}
+		if g.silent == nil {
+			g.silent = map[string]time.Time{}
+		}
+		utils.Infof("[Telemost] nothing arrives from %q: watching another peer", short(id))
+		g.silent[id], marked = time.Now(), true
+	}
+	g.mu.Unlock()
+	if marked {
+		g.recompute()
+	}
 }
+
+// silentAfter is how long a lane may watch a peer and receive nothing before
+// the peer is put aside for silentFor.
+const (
+	silentAfter = 6 * time.Second
+	silentFor   = 90 * time.Second
+)
 
 func (t *TelemostTransport) setStripeTarget(target string) {
 	ln := t.lane
 	ln.mu.Lock()
 	changed := ln.target != target
 	ln.target = target
+	if changed {
+		ln.targetAt = time.Now()
+	}
 	needSlots := (target == "") != ln.shutdown
 	ln.mu.Unlock()
 	if !changed {
@@ -210,6 +262,14 @@ func (t *TelemostTransport) setStripeTarget(target string) {
 		_ = t.sendSetSlots()
 	}
 	t.steerSlots()
+}
+
+func shortAll(ids []string) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = short(id)
+	}
+	return out
 }
 
 func short(id string) string {
@@ -302,6 +362,8 @@ func (t *TelemostTransport) onSlotsConfig(sc interface{}) {
 	}
 	ln.mu.Lock()
 	ln.view = &slotsView{offset: raw.Offset, prev: ids(raw.PrevSlots), cur: ids(raw.Slots), next: ids(raw.NextSlots)}
+	utils.Debugf("[Telemost] lane %d slots: offset=%d cur=%v prev=%d next=%d target=%q", ln.index, raw.Offset,
+		shortAll(ln.view.cur), len(ln.view.prev), len(ln.view.next), short(ln.target))
 	ln.mu.Unlock()
 	t.steerSlots()
 }
@@ -358,8 +420,9 @@ func (t *TelemostTransport) steerSlots() {
 	_ = t.sendSetSlotsOffset(want)
 }
 
-// QueueDepth reports the fragments still waiting for the publish clock.
-func (t *TelemostTransport) QueueDepth() int { return t.queuedFrames() }
+// SetFrameSource implements transport.FramePuller: every tick of the publish
+// clock takes up to max frames from src, after anything queued by Send.
+func (t *TelemostTransport) SetFrameSource(src func(max int) [][]byte) { t.frameSource.Store(&src) }
 
 // UplinkLoss is the fraction of our published packets the SFU reported lost
 // in its latest Receiver Report.
@@ -379,10 +442,26 @@ func (g *TelemostGroup) Watching() []string {
 	var out []string
 	for _, l := range lanes {
 		l.lane.mu.Lock()
-		if l.lane.target != "" {
+		// Only a peer whose video really arrives: a subscription the SFU
+		// does not serve would make the peer send into nowhere.
+		if l.lane.target != "" && l.receiving() {
 			out = append(out, l.lane.target)
 		}
 		l.lane.mu.Unlock()
 	}
 	return out
+}
+
+// receiving reports whether the lane's subscription delivered anything lately
+// (a watched peer sends filler many times a second even when idle).
+func (t *TelemostTransport) receiving() bool {
+	return time.Since(time.Unix(0, t.videoAt.Load())) < 3*time.Second
+}
+
+// laneIndex is the lane's number in its group, -1 outside a group.
+func (t *TelemostTransport) laneIndex() int {
+	if t.lane == nil {
+		return -1
+	}
+	return t.lane.index
 }
