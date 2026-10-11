@@ -6,8 +6,8 @@ package provision
 // changes, commit it, then point PinnedCommit at that commit.
 const (
 	PinnedRepo   = "p1neappleXpress/OpenFlux"
-	PinnedCommit = "6450990e03c8b3609b9449bd5f4cafbc0131991e"
-	PinnedSHA256 = "49252106b2d83e6c6d6db35cdf72a03a9add8029e2e591f9077b94919d49c7bb"
+	PinnedCommit = "3459bfdf73be83b1128865de8737deb009ce0e7e"
+	PinnedSHA256 = "8a75cfd72a642a464d8d2e871172bcf37b1241d0d37e9323568557d3033f250f"
 )
 
 // Pinned returns the script location for this build.
