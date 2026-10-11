@@ -88,11 +88,25 @@ var tcpMinRTO = func() time.Duration {
 	return 3 * time.Second
 }()
 
-// TuneTCP sets the tunnel TCP's buffers and its retransmission timeout floor.
+// TuneTCP sets the tunnel TCP's buffers, retransmission timeout floor and loss
+// detection.
 func TuneTCP(s *stack.Stack) {
 	minRTO := tcpip.TCPMinRTOOption(tcpMinRTO)
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTO); err != nil {
 		utils.Debugf("[TUNNEL] set min RTO: %v", err)
+	}
+	// Loss detection by duplicate ACKs, not by time (RACK) and no tail loss
+	// probes. A carrier hands packets over in order, only sometimes late, so
+	// a real loss always shows up as duplicate ACKs - while RACK and TLP take
+	// lateness for loss: at the start of every connection the handshake's
+	// quick round trip set their clocks, the first data took a few times
+	// longer, and the spurious "recovery" left CUBIC at a window of 4 for the
+	// next ten seconds. OPENFLUX_TCP_RACK=1 restores gVisor's default.
+	if os.Getenv("OPENFLUX_TCP_RACK") != "1" {
+		recovery := tcpip.TCPRecovery(0)
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+			utils.Debugf("[TUNNEL] set loss recovery: %v", err)
+		}
 	}
 	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
