@@ -24,6 +24,13 @@ any other.
 native transports, used as the real test bed for the engine. `js/src/` holds
 their shared, un-bundled sources (see `cmd/scriptbundle` below).
 
+The apps link the engine in-process. On iOS the C API (`mobile/ios/script.go`)
+carries the same calls as gomobile's (`OpenFluxInspectTransport`,
+`OpenFluxScriptSettings`, `OpenFluxScriptEngineSelfTest`, the update calls
+below); a profile runs an installed transport through a Session spec of type
+`script` with `path`/`pubkey`/`name`, and since the Network Extension opens
+that file, the app installs transports into its App Group container.
+
 ## The host API
 
 Everything injected into a script's runtime is deliberately unrestricted -
@@ -255,7 +262,9 @@ wire, same author key. Everything else is asked about.
 CLI (desktop): `--check-script-update`, `--apply-script-update
 [--allow-wire-break]`, `--rollback-script`, each with `--id --pubkey
 --update=<url,…> [--version --wire --channel --dir]`, printing the JSON
-report. Mobile: `CheckScriptUpdate`, `ApplyScriptUpdate`, `RollbackScript`.
+report. Mobile: `CheckScriptUpdate`, `ApplyScriptUpdate`, `RollbackScript`
+(iOS C API: `OpenFluxCheckScriptUpdate`, `OpenFluxApplyScriptUpdate`,
+`OpenFluxRollbackScript`).
 
 ## Official keys
 

@@ -5,6 +5,16 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **iOS: the script-transport calls in the C API** (`mobile/ios/script.go`): `OpenFluxInspectTransport`,
+  `OpenFluxScriptSettings`, `OpenFluxScriptFingerprint`, `OpenFluxCompareScriptVersions`,
+  `OpenFluxOfficialScriptKey`, `OpenFluxScriptEngineAvailable`, `OpenFluxScriptEngineSelfTest`,
+  `OpenFluxCheckScriptUpdate`, `OpenFluxApplyScriptUpdate` and `OpenFluxRollbackScript` - the gomobile calls
+  Android has, as thin wrappers, so the iOS app inspects, sets up and updates a signed transport through the
+  core like every other client. The engine was already linked into the iOS library; a profile runs an
+  installed transport through a Session spec of type `script`.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed
