@@ -230,11 +230,11 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 			// Second-tier captcha (SmartCaptcha): cannot be solved with PoW.
 			if strings.Contains(loc, "showcaptcha") && !strings.Contains(loc, "showcaptchafast") {
 				utils.Debugf("[VOLGA] SmartCaptcha detected, external solver required")
-				return nil, ErrCaptchaRequired
+				return nil, authRedirectError(ErrCaptchaRequired, currentURL, loc)
 			}
 
 			if strings.Contains(loc, "passport.yandex") {
-				return nil, ErrLoginRequired
+				return nil, authRedirectError(ErrLoginRequired, currentURL, loc)
 			}
 
 			if strings.Contains(loc, "showcaptchafast") {
@@ -1199,7 +1199,7 @@ func (t *YandexVolgaTransport) Start() error {
 				reason = "login"
 			}
 			if t.errNotifier != nil {
-				t.errNotifier(err, "vyandex", t.docURL, "", reason)
+				t.errNotifier(err, "vyandex", authRequiredURL(err, t.docURL), "", reason)
 			}
 		}
 		return fmt.Errorf("auth: %w", err)
