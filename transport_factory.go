@@ -31,6 +31,10 @@ func transportFactory(baseCfg transport.TransportConfig, isExit bool) manager.Fa
 		if cfg == nil {
 			return nil, fmt.Errorf("factory: nil config")
 		}
+		baseCfg := baseCfg
+		if n, _ := cfg.Params["network"].(string); n != "" {
+			baseCfg.Network = n // this carrier's network (bonding)
+		}
 		return registry.New(cfg.Type, cfg.URL, cfg.Params, registry.Options{
 			Base:              baseCfg,
 			IsExit:            isExit,

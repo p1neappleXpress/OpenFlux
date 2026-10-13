@@ -62,7 +62,13 @@ jobs:
           build windows arm64 "" .exe
           build darwin  amd64
           build darwin  arm64
-          cd dist && sha256sum openflux-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+          # The subscription service (docs/subscriptions.ru.md) runs on a Linux server.
+          for arch in amd64 arm64; do
+            echo "building opensub-linux-$arch"
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 GOFLAGS=-buildvcs=false \
+              go build -trimpath -ldflags "-s -w" -o "dist/opensub-linux-$arch" ./cmd/opensub
+          done
+          cd dist && sha256sum openflux-* opensub-* > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -79,7 +85,7 @@ jobs:
           else tag="v${{ inputs.version }}"; fi
           # The release shows its CHANGELOG.md section, then what the assets are.
           awk -v v="${tag#v}" 'index($0, "## [")==1 { if (f) exit; f = (index($0, "## [" v "]") == 1); next } f' CHANGELOG.md > notes.md
-          printf '\n%s\n' "Кросс-платформенная сборка CLI (клиент/выходная нода): \`openflux-<os>-<arch>[.exe]\`. Контрольные суммы — в \`SHA256SUMS.txt\`. Для установки выходной ноды по SSH из приложения используется отдельный релиз \`node-v*\` (см. deploy/node-install.sh)." >> notes.md
+          printf '\n%s\n' "Кросс-платформенная сборка CLI (клиент/выходная нода): \`openflux-<os>-<arch>[.exe]\`. Сервис подписок: \`opensub-linux-<arch>\` (см. docs/subscriptions.ru.md). Контрольные суммы — в \`SHA256SUMS.txt\`. Для установки выходной ноды по SSH из приложения используется отдельный релиз \`node-v*\` (см. deploy/node-install.sh)." >> notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
             # The tag was moved to rebuild an existing release: replace its
             # assets and refresh the notes instead of failing on create.

@@ -42,6 +42,15 @@ const (
 	// predate these ignore them, which the Session detects and tolerates.
 	SubtypeLinkPing Subtype = 0x20
 	SubtypeLinkPong Subtype = 0x21
+
+	// Bonding (one Session striped over several carriers). A client that
+	// wants it offers SubtypeBonding (payload: version byte 1) after the
+	// handshake; an exit that supports it answers the same, and from then
+	// on both split packets over all live carriers and acknowledge what
+	// arrived with SubtypeBondingAck (see BondingAck). Exits that predate
+	// bonding ignore the offer, so the client never splits for them.
+	SubtypeBonding    Subtype = 0x30
+	SubtypeBondingAck Subtype = 0x31
 )
 
 // ControlPacket is a decoded control message: subtype, flags, payload.

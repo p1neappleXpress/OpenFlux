@@ -22,14 +22,18 @@ case "$role" in
 esac
 
 case "$transport" in
-  yandex|vyandex|oneme) ;;
+  yandex|vyandex|boards|mailru|cupsonline|oneme) ;;
   *)
-    echo "TRANSPORT must be one of yandex, vyandex, oneme (got '$transport')" >&2
+    echo "TRANSPORT must be one of yandex, vyandex, boards, mailru, cupsonline, oneme (got '$transport')" >&2
     exit 2
     ;;
 esac
 
-set -- "--$role" --transport "$transport"
+core_role=client
+if [ "$role" = exit-node ]; then
+  core_role=exit
+fi
+set -- --role "$core_role" --transport "$transport"
 
 if [ "$role" = client ]; then
   set -- "$@" --socks5 "$listen"

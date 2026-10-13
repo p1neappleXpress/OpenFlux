@@ -87,9 +87,9 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	case "cupsonline":
 		// Stripes over its rooms itself when the room list says so (see
 		// transport.PackRooms); an old list keeps the old wire.
-		return cupsonline.NewCupsonlineTransport(url, base, !o.IsExit), nil
+		return cupsonline.NewCupsonlineTransport(url, base, !roleParam(params, "exit", o.IsExit)), nil
 	case "avito":
-		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !o.IsExit), nil
+		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !roleParam(params, "exit", o.IsExit)), nil
 	case "oneme":
 		uid, _ := strconv.ParseInt(str("uid"), 10, 64)
 		return oneme.NewOneMeTransport(roleParam(params, "exit", o.IsExit), str("token"), uid, base), nil

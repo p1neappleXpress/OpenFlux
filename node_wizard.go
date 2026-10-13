@@ -11,8 +11,8 @@ package main
 // Request:  {"id": 1, "method": "connect", "params": {...}}
 // Response: {"id": 1, "ok": true, ...} or {"id": 1, "ok": false, "error": "..."}
 //
-// Secrets (SSH and sudo passwords, private key, channel key) arrive only
-// on stdin and never go to the log or the command line.
+// Secrets (SSH and sudo passwords, private key, channel key, Yandex
+// cookies) arrive only on stdin and never go to the log or the command line.
 
 import (
 	"bufio"
@@ -26,6 +26,7 @@ import (
 
 	"github.com/p1neappleXpress/OpenFlux/provision"
 	"github.com/p1neappleXpress/OpenFlux/provision/phphost"
+	"github.com/p1neappleXpress/OpenFlux/transport/avito"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
@@ -46,14 +47,25 @@ type wizardParams struct {
 	HostKey      string `json:"hostKey"`
 	Channel      string `json:"channel"`
 	ChannelPort  int    `json:"channelPort"`
+	WithCookies  bool   `json:"withCookies"`
 	DocumentURL  string `json:"documentUrl"`
 	Key          string `json:"key"`
 	SudoPassword string `json:"sudoPassword"`
+	Cookies      string `json:"cookies"`
 	Name         string `json:"name"`
 	// Transports are the channel's carriers besides direct. Without them,
 	// DocumentURL alone means a Yandex document (older apps).
 	Transports []provision.ChannelTransport `json:"transports"`
 	AutoUpdate bool                         `json:"autoUpdate"`
+	// Mode is how the node forwards traffic: "l4" (default) or "l3"; on
+	// setTransports "" keeps the channel's own.
+	Mode string `json:"mode"`
+	// Context is an installed channel's encryption context (see
+	// provision.ChannelInfo): a link for it keeps it.
+	Context string `json:"context"`
+	// Source picks the node's core: "fork" (default) or "official", see
+	// provision.PinnedFor.
+	Source string `json:"source"`
 }
 
 // transports is the channel's carriers from the request.
@@ -64,9 +76,9 @@ func (p wizardParams) transports() []provision.ChannelTransport {
 	return p.Transports
 }
 
-// channel is the channel the request describes, its key aside.
+// channel is the channel the request describes, key and cookies aside.
 func (p wizardParams) channel() provision.Channel {
-	return provision.Channel{ID: p.Channel, Transports: p.transports(), Port: p.ChannelPort, AutoUpdate: p.AutoUpdate}
+	return provision.Channel{ID: p.Channel, Transports: p.transports(), Port: p.ChannelPort, AutoUpdate: p.AutoUpdate, Mode: p.Mode}
 }
 
 // nodeWizard holds the SSH connection between calls.
@@ -75,16 +87,21 @@ type nodeWizard struct {
 	// Tests replace these to run without a VDS or Yandex.
 	dial      func(context.Context, provision.Target) (*provision.Conn, error)
 	checkDoc  func(string) (yandex.VolgaDocument, error)
-	newScript func() provision.Script
+	newScript func(source string) (provision.Script, error)
 	newRooms  func(context.Context) (string, error)
+	// newAvitoRooms makes Avito Code rooms; they need no sign-in.
+	newAvitoRooms func(context.Context) (string, error)
 }
 
 func newNodeWizard() *nodeWizard {
 	return &nodeWizard{
 		dial:      provision.Dial,
 		checkDoc:  func(u string) (yandex.VolgaDocument, error) { return yandex.CheckVolgaDocument(u, nil) },
-		newScript: provision.Pinned,
+		newScript: provision.PinnedFor,
 		newRooms:  cupsonline.CreateRoomList,
+		newAvitoRooms: func(ctx context.Context) (string, error) {
+			return avito.CreateRoomList(ctx, "")
+		},
 	}
 }
 
@@ -161,7 +178,7 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
-		plan, err := conn.Plan(p.channel())
+		plan, err := conn.Plan(p.channel(), p.WithCookies)
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
@@ -173,10 +190,57 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 		}
 		ch := p.channel()
 		ch.Key = p.Key
+		if p.Cookies != "" {
+			if ch.Cookies, err = provision.ChannelCookies(ch.Transports, p.Cookies); err != nil {
+				return wizardFailure(err, nil)
+			}
+		}
 		if err := conn.Apply(ch, p.SudoPassword); err != nil {
 			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
 		}
 		return wizardOK(nil)
+	case "setCookies":
+		conn, err := w.connected()
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		cookies, _, err := provision.CookieStore(p.DocumentURL, p.Cookies)
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		if err := conn.SetCookies(p.Channel, cookies, p.SudoPassword); err != nil {
+			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+		}
+		return wizardOK(nil)
+	case "showChannel":
+		conn, err := w.connected()
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		info, err := conn.Show(p.Channel, p.SudoPassword)
+		if err != nil {
+			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+		}
+		return wizardOK(map[string]interface{}{"channel": info})
+	case "setTransports":
+		conn, err := w.connected()
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		var cookies string
+		if p.Cookies != "" {
+			if cookies, err = provision.ChannelCookies(p.transports(), p.Cookies); err != nil {
+				return wizardFailure(err, nil)
+			}
+		}
+		if err := conn.SetChannel(p.Channel, p.transports(), p.Mode, cookies, p.SudoPassword); err != nil {
+			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+		}
+		info, err := conn.Show(p.Channel, p.SudoPassword)
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		return wizardOK(map[string]interface{}{"channel": info})
 	case "remove":
 		conn, err := w.connected()
 		if err != nil {
@@ -186,6 +250,9 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 			return wizardFailure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
 		}
 		return wizardOK(nil)
+	case "signedIn":
+		_, signedIn, err := provision.CookieStore("x", p.Cookies)
+		return wizardOK(map[string]interface{}{"signedIn": err == nil && signedIn})
 	case "checkDocument":
 		return w.checkDocument(p.DocumentURL)
 	case "createRooms":
@@ -196,8 +263,16 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 			return wizardFailure(fmt.Errorf("не удалось создать комнаты cups.online: %v", err), nil)
 		}
 		return wizardOK(map[string]interface{}{"rooms": rooms})
+	case "createAvitoRooms":
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rooms, err := w.newAvitoRooms(ctx)
+		if err != nil {
+			return wizardFailure(fmt.Errorf("не удалось создать комнаты Avito: %v", err), nil)
+		}
+		return wizardOK(map[string]interface{}{"rooms": rooms})
 	case "shareLink":
-		link, err := provision.ShareLink(p.Name, p.Key, p.Host, p.ChannelPort, p.transports())
+		link, err := provision.ShareLinkContext(p.Name, p.Key, p.Host, p.ChannelPort, p.transports(), p.Context)
 		if err != nil {
 			return wizardFailure(err, nil)
 		}
@@ -212,6 +287,10 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 // can compare the fingerprint; a changed key with "mismatch": true.
 func (w *nodeWizard) connect(p wizardParams) map[string]interface{} {
 	w.disconnect()
+	script, err := w.newScript(p.Source)
+	if err != nil {
+		return wizardFailure(err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn, err := w.dial(ctx, provision.Target{
@@ -225,7 +304,7 @@ func (w *nodeWizard) connect(p wizardParams) map[string]interface{} {
 		}
 		return wizardFailure(err, nil)
 	}
-	if err := conn.FetchScript(w.newScript()); err != nil {
+	if err := conn.FetchScript(script); err != nil {
 		conn.Close()
 		return wizardFailure(err, nil)
 	}

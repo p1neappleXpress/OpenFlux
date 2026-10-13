@@ -89,3 +89,11 @@ func TestParseConfMissingFile(t *testing.T) {
 		t.Fatal("expected error for missing file")
 	}
 }
+
+func TestConfBoolWords(t *testing.T) {
+	for v, want := range map[string]bool{"yes": true, "Yes": true, "on": true, "true": true, "1": true, "no": false, "off": false, "false": false} {
+		if got := confBool(v, !want); got != want {
+			t.Errorf("confBool(%q) = %v", v, got)
+		}
+	}
+}

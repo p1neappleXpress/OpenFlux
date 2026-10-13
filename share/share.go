@@ -126,6 +126,16 @@ var knownTypes = map[string]bool{
 	"cupsonline": true, "avito": true, "direct": true, "telemost": true,
 }
 
+// Shareable reports whether a link can carry a carrier of this type that
+// rides a service (a document, a board, a conference): direct, the exit's own
+// port, is not one, and MAX is not shareable at all.
+func Shareable(typ string) bool {
+	if !knownTypes[typ] {
+		return false
+	}
+	return typ != "direct"
+}
+
 // Validate reports whether c describes something a client can connect with.
 func (c *Config) Validate() error {
 	if len(c.Transports) == 0 {

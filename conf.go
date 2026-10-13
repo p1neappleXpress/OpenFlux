@@ -87,6 +87,12 @@ func confBool(v string, def bool) bool {
 	if v == "" {
 		return def
 	}
+	switch strings.ToLower(v) {
+	case "yes", "on":
+		return true
+	case "no", "off":
+		return false
+	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
 		return def

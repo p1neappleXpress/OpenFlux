@@ -56,6 +56,8 @@ type VolgaConfig struct {
 	// (iOS caps it at 50 MB) cannot afford them.
 	WSReadBufferSize  int
 	WSWriteBufferSize int
+	// Network the relay and listener dial through (TransportConfig.Network).
+	Network string
 }
 
 func DefaultVolgaConfig() VolgaConfig {
@@ -539,11 +541,23 @@ type relayClient struct {
 	stopMu   sync.RWMutex
 	stopped  bool
 	stopOnce sync.Once
+
+	// onAuthRejected asks for a fresh authorization. The relay calls it
+	// once per authorization the server turns down (rejected remembers
+	// which), then holds the batch until the new one is published, at most
+	// authWait, and sends it again. Set before Start.
+	onAuthRejected func()
+	rejected       atomic.Pointer[volgaAuth]
+	authWait       time.Duration
 }
+
+// errAuthRejected is a relay request the server refused for its
+// authorization: the Volga token expires after a while (#64, #109).
+var errAuthRejected = errors.New("relay: authorization rejected")
 
 func newRelayClient(auth *atomic.Pointer[volgaAuth], cfg VolgaConfig, stats *VolgaStats) *relayClient {
 	tr := &http.Transport{
-		DialContext:         dialIPv4First,
+		DialContext:         dialIPv4FirstOn(cfg.Network),
 		MaxIdleConns:        cfg.MaxIdleConns,
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:     cfg.IdleConnTimeout,
@@ -634,7 +648,7 @@ func (r *relayClient) worker(id int) {
 			return
 		}
 		r.stats.WorkerBusy.Add(1)
-		err := r.sendBatch(batch)
+		err := r.deliver(batch)
 		if err != nil {
 			r.stats.HTTPReqsFailed.Add(1)
 			utils.Debugf("[VOLGA] batch send failed: %v", err)
@@ -673,8 +687,53 @@ func (r *relayClient) worker(id int) {
 	}
 }
 
-func (r *relayClient) sendBatch(batch [][]byte) error {
+// deliver sends a batch, and once more with a fresh authorization if the
+// server rejected the current one.
+func (r *relayClient) deliver(batch [][]byte) error {
 	auth := r.auth.Load()
+	err := r.sendBatchAuth(auth, batch)
+	if !errors.Is(err, errAuthRejected) {
+		return err
+	}
+	if r.rejected.Swap(auth) != auth && r.onAuthRejected != nil {
+		utils.Debugf("[VOLGA] relay authorization rejected; refreshing it")
+		r.onAuthRejected()
+	}
+	if !r.waitForNewAuth(auth) {
+		return err
+	}
+	return r.sendBatchAuth(r.auth.Load(), batch)
+}
+
+// waitForNewAuth waits until an authorization other than old is published.
+func (r *relayClient) waitForNewAuth(old *volgaAuth) bool {
+	wait := r.authWait
+	if wait <= 0 {
+		wait = 10 * time.Second
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if a := r.auth.Load(); a != nil && a != old {
+			return true
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			return false
+		case <-r.ctx.Done():
+			return false
+		}
+	}
+}
+
+func (r *relayClient) sendBatch(batch [][]byte) error {
+	return r.sendBatchAuth(r.auth.Load(), batch)
+}
+
+func (r *relayClient) sendBatchAuth(auth *volgaAuth, batch [][]byte) error {
 	if auth == nil {
 		return fmt.Errorf("authorization unavailable")
 	}
@@ -783,6 +842,9 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: status %d", errAuthRejected, resp.StatusCode)
+	}
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -964,7 +1026,7 @@ func (w *wsListener) connect() error {
 	header.Set("Cookie", strings.Join(cookieParts, "; "))
 
 	dialer := websocket.Dialer{
-		NetDialContext:   dialIPv4First,
+		NetDialContext:   dialIPv4FirstOn(w.config.Network),
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
 		ReadBufferSize:   w.config.WSReadBufferSize,
 		WriteBufferSize:  w.config.WSWriteBufferSize,
@@ -1169,6 +1231,7 @@ func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *Yand
 // resource profile, e.g. SlimVolgaConfig on a phone.
 func NewYandexVolgaTransportWithConfig(docURL string, cfg transport.TransportConfig, volga VolgaConfig) *YandexVolgaTransport {
 	jar, _ := cookiejar.New(nil)
+	volga.Network = cfg.Network
 	return &YandexVolgaTransport{
 		BaseTransport: transport.NewBaseTransport(cfg),
 		docURL:        docURL,
@@ -1219,7 +1282,6 @@ func (t *YandexVolgaTransport) Start() error {
 func (t *YandexVolgaTransport) startLinks(auth *volgaAuth) {
 	t.auth.Store(auth)
 	relay := newRelayClient(&t.auth, t.config, t.stats)
-	relay.Start()
 	ws := newWSListener(&t.auth, func() (*volgaAuth, error) {
 		return authorizeWithJar(t.docURL, t.jar())
 	}, t.config, t.stats, relay, func(data []byte) {
@@ -1231,6 +1293,9 @@ func (t *YandexVolgaTransport) startLinks(auth *volgaAuth) {
 		}
 		t.RecordReceive(len(data))
 	})
+	// A reconnect of the listener refreshes the authorization for both.
+	relay.onAuthRejected = ws.RequestReconnect
+	relay.Start()
 	ws.Start()
 	t.linkMu.Lock()
 	t.relay, t.ws = relay, ws

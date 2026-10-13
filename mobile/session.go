@@ -19,6 +19,9 @@ type sessionSpec struct {
 	URL      string                 `json:"url"`
 	Priority int                    `json:"priority"`
 	Params   map[string]interface{} `json:"params"`
+	// Network binds the carrier to one network ("cellular", "wifi"; ""
+	// is the default route) through the app's NetworkBinder.
+	Network string `json:"network"`
 }
 
 // sessionOptions tunes buildSessionWith beyond the specs.
@@ -130,8 +133,14 @@ func buildSessionWith(specsJSON, secret string, exit bool, opt sessionOptions) (
 	config := transport.DefaultConfig()
 	keys := make(map[string]string)
 	types := make(map[string]string)
+	if !exit && wantsBonding(specsJSON) {
+		sess.SetBonding(true)
+		appendLog("[ANDROID] Session: бондинг запрошен, транспорты разделят трафик, когда нода согласится")
+	}
 	for _, spec := range specs {
 		types[spec.Name] = spec.Type
+		config := config
+		config.Network = spec.Network
 		raw, err := newRawTransport(spec.Type, spec.URL, spec.Params, config, exit)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: %w", spec.Name, err)
@@ -185,6 +194,16 @@ func buildSessionWith(specsJSON, secret string, exit bool, opt sessionOptions) (
 	proxy := &authProxy{demux: demux}
 	setAuthProxy(proxy)
 	attachSessionCaptcha(m, keys, proxy)
+	setClientSession(m, types)
 	appendLog("[ANDROID] Session: шифрование AES-256-GCM, согласование с нодой")
 	return demux, sess, nil
+}
+
+// wantsBonding reads {"bonding": true} next to the transports: the client
+// then splits the Session over all its carriers (see Session.SetBonding).
+func wantsBonding(specsJSON string) bool {
+	var o struct {
+		Bonding bool `json:"bonding"`
+	}
+	return json.Unmarshal([]byte(specsJSON), &o) == nil && o.Bonding
 }
