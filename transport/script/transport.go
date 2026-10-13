@@ -2,9 +2,11 @@ package script
 
 import (
 	"crypto/ed25519"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,8 @@ type ScriptTransport struct {
 	name      string
 	scriptSrc []byte
 	pkg       *Package // non-nil when loaded from a .flux package, nil for a plain .js
+	pubKey    ed25519.PublicKey // the key the package/.js was verified against; what an update must stay pinned to
+	file      string            // base name it was loaded from, so an update replaces that very file
 	cfgURL    string
 	cfgParams map[string]interface{}
 
@@ -118,6 +122,8 @@ func New(name, scriptPath string, pubKey ed25519.PublicKey, url string, params m
 		name:          name,
 		scriptSrc:     src,
 		pkg:           pkg,
+		pubKey:        append(ed25519.PublicKey(nil), pubKey...),
+		file:          filepath.Base(scriptPath),
 		cfgURL:        url,
 		cfgParams:     params,
 		cookieJar:     jar,
@@ -156,6 +162,27 @@ func (t *ScriptTransport) setRoomList(packed string) {
 // (author/description/icon for a UI listing), or nil for a plain signed .js
 // file with no package wrapper.
 func (t *ScriptTransport) Package() *Package { return t.pkg }
+
+// Installed is the update record for this transport: what CheckUpdate /
+// ApplyUpdate need to find, verify and pin a newer package. It is available
+// only for a .flux loaded with an update source (ok is false for a plain .js,
+// a package with no `update` URLs, or an empty pinned key - none of which can
+// be updated in place), so a caller tests ok before enrolling it in a
+// RecoveryLadder or an auto-update loop.
+func (t *ScriptTransport) Installed() (inst Installed, ok bool) {
+	if t.pkg == nil || len(t.pkg.Manifest.Update) == 0 || len(t.pubKey) == 0 {
+		return Installed{}, false
+	}
+	m := t.pkg.Manifest
+	return Installed{
+		ID:        m.EffectiveID(),
+		File:      t.file,
+		Version:   m.Version,
+		Wire:      m.EffectiveWire(),
+		PubkeyHex: hex.EncodeToString(t.pubKey),
+		Update:    append([]string(nil), m.Update...),
+	}, true
+}
 
 // buildHTTPClients makes a follow/no-redirect client pair sharing one
 // *http.Transport (so they share the connection pool and netbind-wrapped

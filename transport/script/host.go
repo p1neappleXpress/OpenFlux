@@ -477,17 +477,28 @@ func registerWS(vm *goja.Runtime, t *ScriptTransport) {
 		// transport except boards (which needs one - see boardsReadDeadline
 		// in boards.go).
 		var readTimeout time.Duration
+		// opts.compress: offer permessage-deflate on the upgrade. Some servers
+		// (Mail.ru's nginx) answer 409 Conflict to an upgrade that does not
+		// carry the Sec-WebSocket-Extensions header, which gorilla only sends
+		// when compression is enabled - without it the handshake is rejected
+		// before any auth. Off by default, matching the native transports that
+		// do not need it (issue #163, the native mailru sets it too).
+		var compress bool
 		if opts, ok := call.Argument(2).(*goja.Object); ok {
 			if v := opts.Get("readTimeoutMs"); v != nil && !goja.IsUndefined(v) {
 				readTimeout = time.Duration(v.ToInteger()) * time.Millisecond
+			}
+			if v := opts.Get("compress"); v != nil && !goja.IsUndefined(v) {
+				compress = v.ToBoolean()
 			}
 		}
 
 		promise, resolve, reject := vm.NewPromise()
 		utils.SafeGo("script."+t.name+".ws-dial", func() {
 			dialer := websocket.Dialer{
-				HandshakeTimeout: 15 * time.Second,
-				NetDialContext:   t.dialer().DialContext,
+				HandshakeTimeout:  15 * time.Second,
+				NetDialContext:    t.dialer().DialContext,
+				EnableCompression: compress,
 			}
 			conn, resp, err := dialer.Dial(reqURL, headers)
 			t.loop.RunOnLoop(func(vm *goja.Runtime) {

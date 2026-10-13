@@ -1,37 +1,30 @@
 // Script-transport port of transport/mailru/mailru.go. Line-for-line the
-// same protocol: tunnels packets through the "cursor" field of Mail.ru's
-// public-document coauthoring WebSocket. Every constant, timing, and
-// message shape below matches the native transport exactly - this file is
-// a faithfulness test for the host API, not a rewrite of the protocol.
+// same protocol: tunnels packets through the chat ("message") channel of
+// Mail.ru's public-document coauthoring WebSocket. Every constant, timing,
+// and message shape below matches the native transport exactly - this file
+// is a faithfulness test for the host API, not a rewrite of the protocol.
 //
-// Kept in step with the native transport (parity is tested byte for byte in
-// transport/script/parity_test.go): the saveChanges "editor activity" stream,
-// every cursor entry of a batched server message, and a failed keep-alive
-// closing the socket so the transport reconnects.
+// Why the chat channel and not the cursor field: the current Mail.ru server
+// (R7/OnlyOffice 2026.2.1.2268) validates cursor and saveChanges writes
+// against the live document model and closes the socket ("access deny",
+// code 4004) on any synthetic one. The chat channel is free-form text the
+// server broadcasts verbatim to every other participant without validating
+// it against the document, so it is the carrier. The old cursor keep-alive
+// and saveChanges "editor activity" are gone; the Socket.IO ping/pong keeps
+// the WebSocket up on its own.
 //
 // The Go<->JS packet boundary (write()/emit()) carries raw bytes as
-// ArrayBuffers; mailru's own wire format needs those bytes as base64 text
-// spliced into the cursor field, so this script calls the host's
-// base64.encode/decode explicitly at that one seam - fast (native Go
-// codec, no hand-rolled JS base64) and the only place bytes<->text
-// conversion happens at all.
+// ArrayBuffers; the chat message needs those bytes as base64 text behind the
+// CHAT_DATA_TAG marker, so this script calls the host's base64.encode/decode
+// explicitly at that one seam - fast (native Go codec, no hand-rolled JS
+// base64) and the only place bytes<->text conversion happens at all.
 
 var USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
-var CURSOR_RE = /"cursor":"[^;]+;([^"]+)"/g;
-var KEEPALIVE_MS = 10000; // transport.DefaultConfig().KeepAliveInterval
-var ACTIVITY_MIN_MS = 500; // editorActivityLoop: a random delay in [0.5 s, 5 s]
-var ACTIVITY_MAX_MS = 5000;
-
-// saveChanges message in the Mail.ru web client's format; the two %s are
-// UserId and UserShortId in excelAdditionalInfo. Byte-identical to
-// saveChangesMessageTemplate in mailru.go. isCoAuthoring/releaseLocks are
-// false here (true for yandex.docs).
-var SAVE_CHANGES_TEMPLATE_PARTS = [
-  '42["message",{"type":"saveChanges","changes":"[\\"76;AgAAADEA//8BAOwbfF7pEAAALQEAAAMAAAAAAAAAAAAAAAAAAAAAAAAA9v///xoAAAAyADAAMgA2AC4AMgAuADEALgAyADIANgA4AA==\\",\\"35;BgAAADYAMgA3AAEAHAABAAAAAAAAAAEAAABhAAAAAAMAAAA=\\",\\"35;BgAAADYAMgA3AAEAHAABAAAAAQAAAAEAAABzAAAAAAMAAAA=\\",\\"35;BgAAADYAMgA3AAEAHAABAAAAAgAAAAEAAABkAAAAAAMAAAA=\\"]","startSaveChanges":true,"endSaveChanges":true,"isCoAuthoring":false,"isExcel":false,"deleteIndex":null,"excelAdditionalInfo":"{\\"UserId\\":\\"',
-  '\\",\\"UserShortId\\":\\"',
-  '\\",\\"CursorInfo\\":\\"14;BgAAADYAMgA3AAMAAAA=\\"}","unlock":false,"releaseLocks":false}]',
-];
+// CHAT_DATA_TAG prefixes every tunnel payload carried over the chat channel,
+// so a receiver can tell our frames from a human's chat message and skip
+// anything it cannot decode as ours. Same as chatDataTag in mailru.go.
+var CHAT_DATA_TAG = "OFX1";
 var MAX_RECONNECT_ATTEMPTS = 999999; // transport.DefaultConfig().MaxReconnectAttempts
 
 var weblink = "";
@@ -41,9 +34,8 @@ var baseUserID = "";
 var userID = null;
 var userCounter = 0;
 var connectedAt = null;
-var keepAliveTimer = null;
-var activityTimer = null;
-var docInfo = null; // the live session's fetchDocInfo result (editor user id for saveChanges)
+var docInfo = null; // the live session's fetchDocInfo result (editor user id for self-echo filtering)
+var ownID = ""; // docInfo.editorUserId: the server echoes our own chat back, skip it
 var connectGen = 0; // bumped by every connectToDoc: a stale attempt closes what it opened
 var reconnectTimer = null; // at most one reconnect pending
 
@@ -57,29 +49,39 @@ function randUserID() {
   return pad(Math.floor(Math.random() * 1000000000), 10);
 }
 
-// buildSaveChanges is the saveChanges message for one participant: UserId is
-// the editor's real user id (the session's generated one when the server gave
-// none), UserShortId the same without its last character. Same as
-// BuildSaveChanges in mailru.go.
-function buildSaveChanges(userId) {
-  var short = userId;
-  if (short.length > 1) short = short.slice(0, short.length - 1);
-  return (
-    SAVE_CHANGES_TEMPLATE_PARTS[0] + userId +
-    SAVE_CHANGES_TEMPLATE_PARTS[1] + short +
-    SAVE_CHANGES_TEMPLATE_PARTS[2]
-  );
-}
-
-// cursorPayloads: the base64 payload of every cursor entry in a server
-// message, in order, without the keep-alive entries (a batched message may
-// carry several, a peer's keep-alive among them).
-function cursorPayloads(text) {
+// decodeChatData extracts tunnel packets from a server chat broadcast
+//
+//   42["message",{"type":"message","messages":[{"message":"…","useridoriginal":"…"},…]}]
+//
+// It keeps only entries from other participants (useridoriginal != ownID, since
+// the server echoes every chat back to its own sender) whose text carries
+// CHAT_DATA_TAG, and base64-decodes the remainder. Human chat and presence
+// entries (no tag) are ignored. Same logic as decodeChatData in mailru.go.
+function decodeChatData(text, own) {
+  var i = text.indexOf("[");
+  if (i < 0) return [];
+  var arr;
+  try {
+    arr = JSON.parse(text.slice(i));
+  } catch (e) {
+    return [];
+  }
+  if (!arr || arr.length < 2) return [];
+  var payload = arr[1];
+  if (!payload || payload.type !== "message" || !payload.messages) return [];
   var out = [];
-  var m;
-  CURSOR_RE.lastIndex = 0;
-  while ((m = CURSOR_RE.exec(text)) !== null) {
-    if (m[1] && m[1] !== "---KA---") out.push(m[1]);
+  for (var k = 0; k < payload.messages.length; k++) {
+    var m = payload.messages[k];
+    if (!m || typeof m.message !== "string") continue;
+    if (own && m.useridoriginal === own) continue; // the server's echo of our own chat
+    if (m.message.indexOf(CHAT_DATA_TAG) !== 0) continue; // a human's chat, or a presence entry
+    var bytes;
+    try {
+      bytes = base64.decode(m.message.slice(CHAT_DATA_TAG.length));
+    } catch (e) {
+      continue;
+    }
+    out.push(bytes);
   }
   return out;
 }
@@ -174,43 +176,6 @@ async function fetchDocInfo(link) {
   };
 }
 
-function startKeepAlive() {
-  if (keepAliveTimer) clearInterval(keepAliveTimer);
-  keepAliveTimer = setInterval(function () {
-    if (!sock) return;
-    try {
-      sock.send('42["message",{"type":"cursor","cursor":"18;---KA---"}]');
-    } catch (e) {
-      // Same as the native keep-alive: a write that fails means a dead
-      // connection - close it so the reconnect (via onclose) happens.
-      setState("reconnecting", String(e));
-      try {
-        sock.close();
-      } catch (e2) {}
-    }
-  }, KEEPALIVE_MS);
-}
-
-// editorActivityLoop: sends a saveChanges message at a random interval in
-// [0.5 s, 5 s] so the stream looks like a live person editing. Skipped while
-// there is no session (mid-reconnect), exactly like the native loop.
-function startEditorActivity() {
-  if (activityTimer) clearTimeout(activityTimer);
-  var tick = function () {
-    activityTimer = null;
-    if (!running) return;
-    if (sock && docInfo) {
-      try {
-        sock.send(buildSaveChanges(docInfo.editorUserId || userID));
-      } catch (e) {
-        // the next tick tries again; a dead socket is the keep-alive's to notice
-      }
-    }
-    activityTimer = setTimeout(tick, ACTIVITY_MIN_MS + Math.floor(Math.random() * (ACTIVITY_MAX_MS - ACTIVITY_MIN_MS + 1)));
-  };
-  activityTimer = setTimeout(tick, ACTIVITY_MIN_MS + Math.floor(Math.random() * (ACTIVITY_MAX_MS - ACTIVITY_MIN_MS + 1)));
-}
-
 function handleMessage(text) {
   // Socket.IO ping/pong.
   if (text === "2") {
@@ -227,19 +192,14 @@ function handleMessage(text) {
     return; // auth ack - fire-and-forget, same as the native transport
   }
 
-  if (text.indexOf("cursor") !== -1) {
-    // One server message may carry several cursor entries (it batches them
-    // under load), a peer's keep-alive among them: deliver every payload, in
-    // order.
-    var payloads = cursorPayloads(text);
-    for (var i = 0; i < payloads.length; i++) {
-      var bytes;
-      try {
-        bytes = base64.decode(payloads[i]); // cursor field is base64 text -> bytes
-      } catch (e) {
-        continue;
-      }
-      emit(bytes);
+  // Tunnel data arrives as a chat broadcast the server relays from the other
+  // participant:
+  //   42["message",{"type":"message","messages":[{message,useridoriginal,…}]}]
+  // decodeChatData keeps only our-tagged frames from other participants.
+  if (text.indexOf('"messages"') !== -1) {
+    var packets = decodeChatData(text, ownID);
+    for (var i = 0; i < packets.length; i++) {
+      emit(packets[i]);
     }
   }
 }
@@ -247,6 +207,7 @@ function handleMessage(text) {
 function onSocketClose(attempt) {
   sock = null;
   docInfo = null;
+  ownID = "";
   var next = attempt;
   // A connection that had been up for >15s gets the fast (attempt=1)
   // backoff on its next try instead of continuing to climb - identical to
@@ -266,10 +227,20 @@ function connectToDoc(attempt) {
     try {
       var info = await fetchDocInfo(weblink);
       if (myGen !== connectGen || !running) return; // superseded while fetching
-      var newSock = await ws.open(info.wsURL, {
-        "User-Agent": USER_AGENT,
-        Origin: "https://docs.datacloudmail.ru",
-      });
+      var newSock = await ws.open(
+        info.wsURL,
+        {
+          "User-Agent": USER_AGENT,
+          // A real browser always sends Accept-Language; some Mail.ru edge
+          // nodes answer 409 to the upgrade without it (issue #164).
+          "Accept-Language": "en-US,en;q=0.9",
+          Origin: "https://docs.datacloudmail.ru",
+        },
+        // Mail.ru's nginx requires permessage-deflate on the upgrade or it
+        // answers 409 Conflict (issue #163). The native transport sets
+        // EnableCompression for the same reason.
+        { compress: true }
+      );
       if (myGen !== connectGen || !running) {
         try {
           newSock.close();
@@ -279,6 +250,7 @@ function connectToDoc(attempt) {
 
       sock = newSock;
       docInfo = info;
+      ownID = info.editorUserId;
       if (userID === null) {
         userID = baseUserID + pad(userCounter++ % 1000, 3);
       }
@@ -343,7 +315,7 @@ var Transport = {
   info: function () {
     return {
       name: "mailru",
-      version: "1.1.0",
+      version: "1.2.0",
       cookieDomain: "https://cloud.mail.ru/",
       mtu: 0, // unbounded - native mailru never fragments either
       reliable: false,
@@ -366,14 +338,17 @@ var Transport = {
     weblink = normalizeWeblink(raw);
     baseUserID = randUserID();
     running = true;
-    startKeepAlive();
-    startEditorActivity();
     connectToDoc(0);
   },
 
   write: function (bytes) {
     if (!sock) throw new Error("mailru: not connected");
-    sock.send('42["message",{"type":"cursor","cursor":"18;' + base64.encode(bytes) + '"}]');
+    // Ride the document's chat channel: the server broadcasts a chat
+    // "message" verbatim to every other participant without validating it
+    // against the document model (unlike cursor/saveChanges, now rejected).
+    // The CHAT_DATA_TAG marker tells our frames apart from a human's chat and
+    // from the server's echo of our own messages. base64 is JSON-safe text.
+    sock.send('42["message",{"type":"message","message":"' + CHAT_DATA_TAG + base64.encode(bytes) + '"}]');
   },
 
   close: function () {
@@ -381,15 +356,14 @@ var Transport = {
     connectGen++;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
-    if (keepAliveTimer) clearInterval(keepAliveTimer);
-    if (activityTimer) clearTimeout(activityTimer);
-    activityTimer = null;
     if (sock) {
       try {
         sock.close();
       } catch (e) {}
     }
     sock = null;
+    docInfo = null;
+    ownID = "";
   },
 
   // Generic cookie exchange (see host.go / transport.go FetchCookies /
@@ -402,6 +376,7 @@ var Transport = {
     if (kind === "cookiesApplied") {
       userID = null;
       docInfo = null;
+      ownID = "";
       connectGen++; // drop an attempt in flight: the one below starts from the new cookies
       var old = sock;
       sock = null; // its onclose is ignored (sock !== newSock): one reconnect, below

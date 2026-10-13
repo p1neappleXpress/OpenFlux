@@ -307,6 +307,8 @@ func main() {
 	scriptPath := flag.String("script-path", "", "Path to the script transport's <name>.flux or <name>.js (needs <name>.js.sig beside a bare .js)")
 	scriptPubkey := flag.String("script-pubkey", "", "Hex-encoded ed25519 public key the script transport's signature is checked against")
 	scriptName := flag.String("script-name", "", "Carrier name for the script transport (default: the name in its own info())")
+	scriptAutoUpdate := flag.Bool("script-auto-update", false, "Node: keep .flux transports current and self-heal (check/apply auto-OK updates, roll back, hot-swap without a restart)")
+	scriptUpdateChannel := flag.String("script-update-channel", "stable", "Node: update channel for --script-auto-update (stable | nightly)")
 	configPath := flag.String("config", "",
 		"Path to an OpenFlux .conf file. Command-line flags override values from the file.")
 	shareFlag := flag.Bool("share", false,
@@ -940,6 +942,13 @@ DEPRECATED (removed in v2)
 
 		if err := registerBootstrapTransports(managerInst, specs, config, secret, sessionContext, rooms); err != nil {
 			log.Fatalf("bootstrap transports: %v", err)
+		}
+
+		// Headless auto-update for .flux carriers (the app's ScriptUpdater has
+		// no equivalent on a CLI/exit node): keep them current and self-heal by
+		// hot-swapping a reloaded package into the live Session.
+		if *scriptAutoUpdate {
+			startNodeScriptUpdater(context.Background(), managerInst, specs, config, *scriptUpdateChannel)
 		}
 
 		// Persist each cookie-carrying transport's jar and replay what was

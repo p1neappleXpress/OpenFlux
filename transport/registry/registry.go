@@ -85,17 +85,11 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	case "mailru":
 		return mailru.NewMailruDocsTransport(url, base), nil
 	case "cupsonline":
-		inner := cupsonline.NewCupsonlineTransport(url, base, !o.IsExit)
-		return &stripedRoomTransport{
-			StripedTransport: transport.NewStripedTransport([]transport.Transport{inner}),
-			inner:            inner,
-		}, nil
+		// Stripes over its rooms itself when the room list says so (see
+		// transport.PackRooms); an old list keeps the old wire.
+		return cupsonline.NewCupsonlineTransport(url, base, !o.IsExit), nil
 	case "avito":
-		inner := avito.NewAvitoTransport(url, base, o.AvitoCookies, !o.IsExit)
-		return &stripedRoomTransport{
-			StripedTransport: transport.NewStripedTransport([]transport.Transport{inner}),
-			inner:            inner,
-		}, nil
+		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !o.IsExit), nil
 	case "oneme":
 		uid, _ := strconv.ParseInt(str("uid"), 10, 64)
 		return oneme.NewOneMeTransport(roleParam(params, "exit", o.IsExit), str("token"), uid, base), nil
@@ -152,43 +146,6 @@ func newTelemost(url string, params map[string]interface{}, o Options) transport
 	}
 	g := yandex.NewTelemostGroup(str("cookies"), url, n, o.IsExit, o.Base)
 	return transport.NewStripedTransportAuto(g.Lanes(), g, maxLanes, auto)
-}
-
-// stripedRoomTransport wraps a StripedTransport around a room-based carrier
-// (CupsOnline, Avito) while forwarding RoomList/OnRoomList and cookies to
-// the inner transport.
-type stripedRoomTransport struct {
-	*transport.StripedTransport
-	inner transport.Transport
-}
-
-func (s *stripedRoomTransport) RoomList() string {
-	type rl interface{ RoomList() string }
-	if r, ok := s.inner.(rl); ok {
-		return r.RoomList()
-	}
-	return ""
-}
-
-func (s *stripedRoomTransport) OnRoomList(f func(string)) {
-	type orl interface{ OnRoomList(func(string)) }
-	if r, ok := s.inner.(orl); ok {
-		r.OnRoomList(f)
-	}
-}
-
-func (s *stripedRoomTransport) FetchCookies() (map[string]string, error) {
-	if ce, ok := s.inner.(transport.CookieExchanger); ok {
-		return ce.FetchCookies()
-	}
-	return nil, nil
-}
-
-func (s *stripedRoomTransport) ApplyCookies(v map[string]string) error {
-	if ce, ok := s.inner.(transport.CookieExchanger); ok {
-		return ce.ApplyCookies(v)
-	}
-	return nil
 }
 
 // A Telemost carrier starts with telemostLanes lanes and adds one whenever

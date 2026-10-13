@@ -111,15 +111,64 @@ func (m *Manager) Add(name, typ string, raw transport.Transport, priority int, p
 	m.order = insertByPriority(m.order, name, priority, m.entries)
 
 	// If the raw transport wants to report out-of-band errors (captcha,
-	// login required), subscribe on its behalf. The callback captures the
-	// transport name so the notifier can route it back to the right IPC
-	// channel.
+	// login required), subscribe on its behalf.
+	m.subscribeErrors(name, raw)
+	return nil
+}
+
+// subscribeErrors wires a transport's out-of-band error reports (captcha,
+// login required) back to the manager, tagged with the transport name so the
+// notifier routes them to the right IPC channel. Shared by Add and ReloadWith.
+func (m *Manager) subscribeErrors(name string, raw transport.Transport) {
 	if en, ok := raw.(transport.ErrorNotifier); ok {
-		transportName := name
 		en.SetErrorNotifier(func(_ error, _, url, html, reason string) {
-			m.NotifyCaptcha(transportName, url, html, reason)
+			m.NotifyCaptcha(name, url, html, reason)
 		})
 	}
+}
+
+// ReloadWith hot-swaps an attached transport for a freshly built one from
+// `build` - a script transport reloaded from an updated .flux - keeping the
+// Session and every other carrier up, so only this one link blinks while it
+// reconnects. The new transport is built first; a build or swap failure leaves
+// the running one untouched. On success the entry's raw transport and its
+// error subscription follow the new instance.
+func (m *Manager) ReloadWith(name string, build func() (transport.Transport, error)) error {
+	m.mu.RLock()
+	e, ok := m.entries[name]
+	var priority int
+	var prev transport.Transport
+	if ok {
+		priority = e.Priority
+		prev = e.Raw
+	}
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("manager: transport %q not found", name)
+	}
+	raw, err := build()
+	if err != nil {
+		return fmt.Errorf("manager: rebuild %q: %w", name, err)
+	}
+	if raw == nil {
+		return fmt.Errorf("manager: rebuild %q: nil transport", name)
+	}
+	if err := m.session.ReplaceTransport(name, raw, m.secret, m.context, priority); err != nil {
+		_ = raw.Stop()
+		return err
+	}
+	m.mu.Lock()
+	e.Raw = raw
+	m.mu.Unlock()
+	// Stop the superseded transport. ReplaceTransport already tore down the
+	// Session link wrapping it (that raw == prev here); stopping it again is a
+	// harmless, idempotent close that also covers a carrier the Session never
+	// held a link for.
+	if prev != nil && prev != raw {
+		_ = prev.Stop()
+	}
+	m.subscribeErrors(name, raw)
+	utils.Debugf("[MANAGER] reloaded transport %q", name)
 	return nil
 }
 
@@ -152,6 +201,18 @@ func (m *Manager) Remove(name string) error {
 
 	_ = m.session.RemoveTransport(name)
 	_ = e.Raw.Stop()
+	return nil
+}
+
+// Raw returns the transport currently attached under name, or nil. It follows
+// a ReloadWith hot-swap, so a caller that polls liveness (the auto-updater's
+// Watch) always sees the live instance, not a stale one.
+func (m *Manager) Raw(name string) transport.Transport {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if e, ok := m.entries[name]; ok {
+		return e.Raw
+	}
 	return nil
 }
 

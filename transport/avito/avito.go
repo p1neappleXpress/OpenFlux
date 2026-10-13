@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,7 @@ import (
 var baseURL = "https://code.avito.ru"
 
 const (
-	avitoUA    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+	avitoUA     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 	shareDBType = "http://sharejs.org/types/textv1"
 )
 
@@ -157,8 +158,14 @@ type avitoWS struct {
 	connected atomic.Bool
 	onData    func([]byte)
 	sendQueue chan []byte
-	ackCh     chan map[string]interface{}
 	stats     *channelStats
+
+	// Striped wire (see stripe.go): an op carries a run of framed pieces
+	// ([len u32][piece]...) instead of one packet; pull, when set, makes the
+	// room a lane's send side, and wake says the stripe has something.
+	framed bool
+	pull   atomic.Pointer[func(max int) [][]byte]
+	wake   chan struct{}
 }
 
 type channelStats struct {
@@ -319,33 +326,50 @@ func (w *avitoWS) connectAndServe() error {
 		return err
 	}
 	w.connected.Store(true)
-	w.ackCh = make(chan map[string]interface{}, 1)
 	utils.Debugf("[AVITO] WS ready: %s ver=%d docLen=%d", w.roomID[:8], w.ver, w.docLen)
 
-	// Single reader dispatches acks to sendLoop and peer ops to onData.
+	// Single reader dispatches acks to sendLoop and peer ops to onData. Both
+	// loops belong to this socket: done ends them with it, and the send loop
+	// is waited for, so a loop from a dead socket never takes the next one's
+	// acks or writes into it with a stale version.
+	c := &avitoConn{done: make(chan struct{}), ack: make(chan map[string]interface{}, 1)}
 	readDone := make(chan error, 1)
 	go func() {
-		readDone <- w.readLoop()
+		readDone <- w.readLoop(c)
 	}()
 
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- w.sendLoop()
+		sendDone <- w.sendLoop(c)
 	}()
 
+	sendEnded := false
 	select {
-	case err := <-readDone:
-		return err
-	case err := <-sendDone:
-		return err
+	case err = <-readDone:
+	case err = <-sendDone:
+		sendEnded = true
 	case <-w.ctx.Done():
-		return errStopped
+		err = errStopped
 	}
+	close(c.done)
+	w.connected.Store(false)
+	conn.Close()
+	if !sendEnded {
+		<-sendDone
+	}
+	return err
+}
+
+// avitoConn is one socket's lifetime: done closes when it ends, ack carries
+// the server's replies to the send loop.
+type avitoConn struct {
+	done chan struct{}
+	ack  chan map[string]interface{}
 }
 
 // readLoop is the sole reader on the WebSocket. It routes ack replies to
 // the sendLoop's ackCh and delivers peer ops to onData.
-func (w *avitoWS) readLoop() error {
+func (w *avitoWS) readLoop(c *avitoConn) error {
 	for {
 		w.conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
 		_, raw, err := w.conn.ReadMessage()
@@ -366,7 +390,9 @@ func (w *avitoWS) readLoop() error {
 		default:
 			// Ack for our op, or any other server reply.
 			select {
-			case w.ackCh <- msg:
+			case c.ack <- msg:
+			case <-c.done:
+				return errStopped
 			case <-w.ctx.Done():
 				return errStopped
 			}
@@ -389,7 +415,11 @@ func (w *avitoWS) handlePeerOp(msg map[string]interface{}) {
 			continue
 		}
 		if w.onData != nil {
-			w.onData(decoded)
+			if w.framed {
+				splitFramed(decoded, w.onData)
+			} else {
+				w.onData(decoded)
+			}
 		}
 		w.stats.opsRecv.Add(1)
 		w.stats.bytesRecv.Add(uint64(len(decoded)))
@@ -403,20 +433,25 @@ func (w *avitoWS) handlePeerOp(msg map[string]interface{}) {
 	}
 }
 
-func (w *avitoWS) sendLoop() error {
+func (w *avitoWS) sendLoop(c *avitoConn) error {
+	if src := w.pull.Load(); src != nil {
+		return w.pullLoop(c, *src)
+	}
 	for {
 		select {
 		case <-w.ctx.Done():
 			return errStopped
+		case <-c.done:
+			return errStopped
 		case data := <-w.sendQueue:
-			if err := w.sendOp(data); err != nil {
+			if err := w.sendOp(c, data); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (w *avitoWS) sendOp(data []byte) error {
+func (w *avitoWS) sendOp(c *avitoConn, data []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(data)
 
 	var op []interface{}
@@ -435,7 +470,7 @@ func (w *avitoWS) sendOp(data []byte) error {
 
 	// Wait for the ack from readLoop.
 	select {
-	case reply := <-w.ackCh:
+	case reply := <-c.ack:
 		if errMsg := reply["error"]; errMsg != nil {
 			w.stats.errors.Add(1)
 			return fmt.Errorf("op error: %v", errMsg)
@@ -445,6 +480,8 @@ func (w *avitoWS) sendOp(data []byte) error {
 		} else {
 			w.ver++
 		}
+	case <-c.done:
+		return errStopped
 	case <-w.ctx.Done():
 		return errStopped
 	}
@@ -474,6 +511,10 @@ type AvitoTransport struct {
 	roomIDs  []string
 	config   AvitoConfig
 	isClient bool
+	// striped: the room pairs are the lanes of a stripe (the list says so,
+	// or an exit creates new rooms); otherwise packets go round-robin.
+	striped bool
+	stripe  atomic.Pointer[transport.StripedTransport]
 
 	roomsMu    sync.Mutex
 	roomList   string
@@ -504,44 +545,35 @@ func NewAvitoTransport(rawURL string, cfg transport.TransportConfig, cookies str
 		cancel:        cancel,
 		statsStart:    time.Now(),
 	}
-	t.roomIDs = parseRoomList(rawURL)
+	t.roomIDs, t.striped = parseRooms(rawURL)
+	if len(t.roomIDs) == 0 && !isClient {
+		t.striped = stripeNewRooms()
+	}
 	return t
 }
 
-func parseRoomList(rawURL string) []string {
+// stripeNewRooms: rooms an exit creates now get the striped list, unless
+// AVITO_STRIPE=0 asks for the old wire (peers from 0.7.0).
+func stripeNewRooms() bool { return os.Getenv("AVITO_STRIPE") != "0" }
+
+// parseRooms pulls the room ids out of --url (the packed list, bare or as
+// ?rooms=) and whether the list is in the striped format.
+func parseRooms(rawURL string) ([]string, bool) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
-		return nil
+		return nil, false
 	}
 	if u, err := url.Parse(rawURL); err == nil {
-		q := u.Query()
-		if packed := q.Get("rooms"); packed != "" {
-			if ids, err := unpackRooms(packed); err == nil {
-				return ids
+		if packed := u.Query().Get("rooms"); packed != "" {
+			if ids, striped, err := transport.UnpackRooms(packed); err == nil {
+				return ids, striped
 			}
 		}
 	}
-	if ids, err := unpackRooms(rawURL); err == nil {
-		return ids
+	if ids, striped, err := transport.UnpackRooms(rawURL); err == nil {
+		return ids, striped
 	}
-	return nil
-}
-
-func packRooms(ids []string) string {
-	raw, _ := json.Marshal(ids)
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
-
-func unpackRooms(s string) ([]string, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	if err := json.Unmarshal(raw, &ids); err != nil {
-		return nil, err
-	}
-	return ids, nil
+	return nil, false
 }
 
 func (t *AvitoTransport) Start() error {
@@ -585,6 +617,8 @@ func (t *AvitoTransport) Start() error {
 				ctx:       t.ctx,
 				sendQueue: make(chan []byte, t.config.SendQueueSize),
 				stats:     &channelStats{idx: i, roomID: id},
+				framed:    t.striped,
+				wake:      make(chan struct{}, 1),
 			}
 			ws.onData = onData
 			wss[i] = ws
@@ -594,6 +628,13 @@ func (t *AvitoTransport) Start() error {
 
 	t.txWss = mkWS(txIDs, nil)
 	t.rxWss = mkWS(rxIDs, t.CallReceive)
+	if t.striped {
+		// Wires the pairs in as lanes before the rooms start, so their send
+		// loops come up pulling.
+		if err := t.startStripe(); err != nil {
+			return err
+		}
+	}
 
 	for _, ws := range t.txWss {
 		go ws.run()
@@ -602,7 +643,7 @@ func (t *AvitoTransport) Start() error {
 		go ws.run()
 	}
 
-	utils.Debugf("[AVITO] transport started: %d tx + %d rx rooms", len(t.txWss), len(t.rxWss))
+	utils.Debugf("[AVITO] transport started: %d tx + %d rx rooms, striped=%v", len(t.txWss), len(t.rxWss), t.striped)
 	t.SetConnected(true)
 
 	go t.statsLoop()
@@ -659,7 +700,7 @@ func (t *AvitoTransport) enterRooms() ([]string, error) {
 	}
 
 	fmt.Printf("\n=== COPY THIS TO CLIENT ===\n")
-	fmt.Printf("%s\n", packRooms(ids))
+	fmt.Printf("%s\n", transport.PackRooms(ids, t.striped))
 	fmt.Printf("===========================\n")
 	fmt.Printf("Save it and pass it back as --url to reuse these rooms after a restart.\n\n")
 	t.setRoomList(ids)
@@ -679,7 +720,7 @@ func (t *AvitoTransport) OnRoomList(f func(packed string)) {
 }
 
 func (t *AvitoTransport) setRoomList(ids []string) {
-	packed := packRooms(ids)
+	packed := transport.PackRooms(ids, t.striped)
 	t.roomsMu.Lock()
 	changed := packed != t.roomList
 	t.roomList = packed
@@ -693,10 +734,16 @@ func (t *AvitoTransport) setRoomList(ids []string) {
 func (t *AvitoTransport) Stop() error {
 	t.cancel()
 	t.SetConnected(false)
+	if st := t.stripe.Load(); st != nil {
+		_ = st.Stop()
+	}
 	return t.BaseTransport.Stop()
 }
 
 func (t *AvitoTransport) Send(data []byte) error {
+	if st := t.stripe.Load(); st != nil {
+		return st.Send(data)
+	}
 	ws := t.pickTxRoom()
 	if ws == nil {
 		return errNoRoom
@@ -840,7 +887,7 @@ func CreateRoomList(ctx context.Context, cookies string) (string, error) {
 			}
 		}
 	}
-	return packRooms(ids), nil
+	return transport.PackRooms(ids, stripeNewRooms()), nil
 }
 
 // FetchCookies returns the cookies this transport was started with.

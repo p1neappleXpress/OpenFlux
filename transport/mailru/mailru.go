@@ -65,6 +65,20 @@ type DocSession struct {
 	WriteQueue chan []byte
 	UserID     string
 	writeMu    sync.Mutex
+
+	// ready is closed once co-editing writes are allowed on this session:
+	// either we have replied authChangesAck to the server's authChanges, or
+	// the readiness fallback fired (a legacy server that never sends
+	// authChanges). The write paths hold their first co-editing write until
+	// it is closed — see markReady and handleMessage.
+	ready     chan struct{}
+	readyOnce sync.Once
+}
+
+// markReady unblocks co-editing writes on this session. Safe to call more than
+// once (the authChanges ack and the fallback timer may both fire).
+func (s *DocSession) markReady() {
+	s.readyOnce.Do(func() { close(s.ready) })
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
@@ -78,6 +92,20 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 
 // docWriteTimeout bounds one WebSocket write to the document.
 const docWriteTimeout = 20 * time.Second
+
+// authChangesAckMsg acknowledges the server's authChanges. A participant that
+// advertised supportAuthChangesAck (our auth does) must reply with this after
+// the server sends authChanges; otherwise the modern Mail.ru/R7 co-editing
+// backend keeps the session un-ready and closes the socket (close 1005) on the
+// first write. Captured from the live editor (docs.datacloudmail.ru,
+// v2026.2.1.2268): the ack carries only its type, in our usual "message" envelope.
+const authChangesAckMsg = `42["message",{"type":"authChangesAck"}]`
+
+// authChangesReadyFallback is how long a session waits for the server's
+// authChanges before releasing co-editing writes anyway, so a server that does
+// not run the authChangesAck handshake is not stalled. A modern server sends
+// authChanges within a round-trip, so this only matters for a legacy one.
+const authChangesReadyFallback = 3 * time.Second
 
 const mailruSocketIOHandshakeTimeout = 15 * time.Second
 
@@ -208,8 +236,11 @@ func (t *MailruDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
-	utils.SafeGo("mailru.keepAlive", t.keepAliveLoop)
-	utils.SafeGo("mailru.editorActivity", t.editorActivityLoop)
+	// Data rides the editor chat channel (see writerLoop/handleMessage). The old
+	// cursor keepalive and saveChanges "editor activity" are gone: the current
+	// Mail.ru server (R7 2026.2.1.2268) validates cursor/saveChanges against the
+	// live document model and closes the socket ("access deny", code 4004) on any
+	// such write. The Engine.IO ping/pong (handled in handleMessage) keeps the WS up.
 	t.connectToDoc(0)
 
 	return nil
@@ -316,6 +347,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			Conn:       conn,
 			WriteQueue: writeQueue,
 			UserID:     userID,
+			ready:      make(chan struct{}),
 		}
 
 		if err := waitMailruSocketIO(session, info.Token); err != nil {
@@ -374,6 +406,14 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		messagePart, _ := json.Marshal([]interface{}{"message", authMsg})
 		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
+		// A modern Mail.ru/R7 server replies to this auth (which advertises
+		// supportAuthChangesAck) with an authChanges message and only accepts
+		// our writes after we ack it; handleMessage does that and marks the
+		// session ready. Guard against an older server that never sends
+		// authChanges: release the writes after a short grace period so the
+		// carrier is not stalled forever waiting for an ack that never comes.
+		time.AfterFunc(authChangesReadyFallback, session.markReady)
+
 		connectedAt := time.Now()
 		for t.IsRunning() {
 			_, message, err := conn.ReadMessage()
@@ -431,8 +471,13 @@ func (t *MailruDocsTransport) writerLoop() {
 			continue
 		}
 
-		payload := base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+		// Tunnel data rides the document's chat channel: the server broadcasts a
+		// chat "message" verbatim to every other participant and does not validate
+		// its text against the document model (unlike cursor/saveChanges, which it
+		// now rejects). We tag the base64 payload so our frames are told apart from
+		// a human's chat and from the server's echo of our own messages.
+		payload := chatDataTag + base64.StdEncoding.EncodeToString(pending)
+		msg := fmt.Sprintf(`42["message",{"type":"message","message":%q}]`, payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[M-DOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
@@ -454,6 +499,13 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 		t.Mu.Unlock()
 
 		if session != nil && session.Conn != nil {
+			// Skip the keepalive until co-editing is ready (authChanges acked /
+			// fallback fired): a cursor write before then gets the socket closed.
+			select {
+			case <-session.ready:
+			default:
+				continue
+			}
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[M-DOCS] Keep-alive failed, closing the connection to reconnect: %v", err)
 				t.SetConnected(false)
@@ -490,6 +542,14 @@ func (t *MailruDocsTransport) editorActivityLoop() {
 		session := t.session
 		t.Mu.RUnlock()
 		if session == nil || session.Conn == nil {
+			continue
+		}
+
+		// Skip until co-editing is ready (authChanges acked / fallback fired),
+		// so saveChanges never goes out before the server accepts our writes.
+		select {
+		case <-session.ready:
+		default:
 			continue
 		}
 
@@ -556,18 +616,75 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 
-	if strings.Contains(text, "cursor") {
-		for _, base64Str := range cursorPayloads(text) {
-			decoded, err := base64.StdEncoding.DecodeString(base64Str)
-			if err != nil {
-				utils.Debugf("[M-DOCS] Base64 decode error: %v", err)
-				continue
-			}
-			t.RecordReceive(len(decoded))
-			t.CallReceive(decoded)
+	// Tunnel data arrives as a chat broadcast the server relays from the other
+	// participant:
+	//   42["message",{"type":"message","messages":[{message,useridoriginal,…}]}]
+	// decodeChatData keeps only our-tagged frames from other participants.
+	if strings.Contains(text, `"messages"`) {
+		ownID := ""
+		if session != nil {
+			ownID = session.Info.EditorUserID
+		}
+		for _, pkt := range decodeChatData(data, ownID) {
+			t.RecordReceive(len(pkt))
+			t.CallReceive(pkt)
 		}
 	}
 }
+
+// chatDataTag prefixes every tunnel payload carried over the chat channel, so a
+// receiver can tell our frames from a human's chat message and skip anything it
+// cannot decode as ours.
+const chatDataTag = "OFX1"
+
+// decodeChatData extracts tunnel packets from a server chat broadcast
+//
+//	42["message",{"type":"message","messages":[{"message":"…","useridoriginal":"…"},…]}]
+//
+// It keeps only entries from other participants (useridoriginal != ownID, since
+// the server echoes every chat back to its own sender) whose text carries
+// chatDataTag, and base64-decodes the remainder. Human chat and presence entries
+// (no tag) are ignored.
+func decodeChatData(frame []byte, ownID string) [][]byte {
+	i := bytes.IndexByte(frame, '[')
+	if i < 0 {
+		return nil
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(frame[i:], &arr); err != nil || len(arr) < 2 {
+		return nil
+	}
+	var payload struct {
+		Type     string `json:"type"`
+		Messages []struct {
+			Message        string `json:"message"`
+			UserIDOriginal string `json:"useridoriginal"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(arr[1], &payload); err != nil || payload.Type != "message" {
+		return nil
+	}
+	var out [][]byte
+	for _, m := range payload.Messages {
+		if ownID != "" && m.UserIDOriginal == ownID {
+			continue // the server's echo of our own chat
+		}
+		if !strings.HasPrefix(m.Message, chatDataTag) {
+			continue // a human's chat, or a presence entry
+		}
+		dec, err := base64.StdEncoding.DecodeString(m.Message[len(chatDataTag):])
+		if err != nil {
+			utils.Debugf("[M-DOCS] chat payload decode error: %v", err)
+			continue
+		}
+		out = append(out, dec)
+	}
+	return out
+}
+
+// DecodeChatData is the exported form of decodeChatData (pure; the JS port is
+// compared with it in transport/script/parity_test.go).
+func DecodeChatData(frame []byte, ownID string) [][]byte { return decodeChatData(frame, ownID) }
 
 // cursorPayloads returns the base64 payload of every cursor entry in a server
 // message, in order, without the keep-alive entries.

@@ -70,6 +70,7 @@ type StripedTransport struct {
 
 	pumpMu sync.Mutex
 	pumps  []chan struct{} // wake-ups of the lanes that cannot pull
+	wakers []LaneWaker     // pulling lanes that sleep while there is nothing
 
 	stopOnce sync.Once
 	done     chan struct{}
@@ -77,10 +78,21 @@ type StripedTransport struct {
 
 const maxStripeLanes = 64
 
+// MaxLanes is the most lanes a stripe runs, so a carrier can cap how many
+// rooms/channels it opens.
+func MaxLanes() int { return maxStripeLanes }
+
 // FramePuller is a lane whose send clock takes frames from a source on every
 // tick (up to max of them) instead of draining a queue filled by Send.
 type FramePuller interface {
 	SetFrameSource(src func(max int) [][]byte)
+}
+
+// LaneWaker is a FramePuller that sleeps while the stripe has nothing for it
+// (a WebSocket lane has no clock of its own to tick on); Wake tells it there
+// is something now. It must not block.
+type LaneWaker interface {
+	Wake()
 }
 
 // LossReporter is implemented by lanes that know their recent uplink loss
@@ -178,6 +190,32 @@ type LaneIDer interface {
 	LaneID() string
 }
 
+// StripeOptions tune a stripe for its carrier. The defaults fit Telemost:
+// small pieces (one SFU packet), lanes that lose packets, a round trip of a
+// few hundred milliseconds. Lanes over a WebSocket (cups.online, Avito) carry
+// whole messages of kilobytes, lose nothing while the socket is up and may
+// take a second to answer a big message.
+type StripeOptions struct {
+	// PieceBytes is the most one piece carries (0: the default).
+	PieceBytes int
+	// DeadAfter is how long a lane that keeps sending may hear nothing back
+	// before it counts as dead and only probes (0: the default, 600 ms).
+	DeadAfter time.Duration
+	// NoDups turns off the spare-room copies of overdue pieces: a lane that
+	// does not lose packets only wastes its turn on them.
+	NoDups bool
+}
+
+// SetOptions applies o; call it before Start.
+func (s *StripedTransport) SetOptions(o StripeOptions) {
+	s.snd.mu.Lock()
+	defer s.snd.mu.Unlock()
+	s.snd.pieceBytes, s.snd.noDups = o.PieceBytes, o.NoDups
+	for i := range s.snd.lane {
+		s.snd.lane[i].deadAfter = o.DeadAfter
+	}
+}
+
 // NewStripedTransport bonds lanes into one transport. Both ends must stripe.
 func NewStripedTransport(lanes []Transport) *StripedTransport {
 	return NewStripedTransportAuto(lanes, nil, len(lanes), false)
@@ -233,6 +271,11 @@ func (s *StripedTransport) attach(idx int, l Transport) {
 	l.Receive(func(b []byte) { s.onLane(idx, b) })
 	if p, ok := l.(FramePuller); ok {
 		p.SetFrameSource(func(max int) [][]byte { return s.pull(idx, max) })
+		if w, ok := l.(LaneWaker); ok {
+			s.pumpMu.Lock()
+			s.wakers = append(s.wakers, w)
+			s.pumpMu.Unlock()
+		}
 		return
 	}
 	wake := make(chan struct{}, 1)
@@ -272,6 +315,9 @@ func (s *StripedTransport) wakePumps() {
 		case w <- struct{}{}:
 		default:
 		}
+	}
+	for _, w := range s.wakers {
+		w.Wake()
 	}
 	s.pumpMu.Unlock()
 }
@@ -781,6 +827,18 @@ type sender struct {
 	minRTT       time.Duration
 	minRTTAt     time.Time
 	triesLogAt   time.Time
+
+	// Per-stripe overrides of the Telemost-tuned defaults; see StripeOptions.
+	pieceBytes int
+	noDups     bool
+}
+
+// piece is the most one piece carries on this stripe.
+func (q *sender) piece() int {
+	if q.pieceBytes > 0 {
+		return q.pieceBytes
+	}
+	return stripePieceBytes
 }
 
 type queuedFrame struct {
@@ -918,7 +976,7 @@ func (q *sender) pull(i, max int, now time.Time) [][]byte {
 		q.pieces++
 		out = append(out, buf)
 	}
-	if len(out) < max && !dead && dupOn {
+	if len(out) < max && !dead && dupOn && !q.noDups {
 		out = q.duplicates(i, max, now, out)
 	}
 	// Held back: everything the tick allowed went out - by the pace or, at
@@ -1013,8 +1071,8 @@ func (q *sender) nextPiece(now time.Time) []byte {
 		q.cur, q.curStarted = f, false
 	}
 	n := len(q.cur)
-	if n > stripePieceBytes {
-		n = stripePieceBytes
+	if n > q.piece() {
+		n = q.piece()
 	}
 	flag := byte(0)
 	if q.curStarted {
@@ -1054,7 +1112,7 @@ func (q *sender) dequeue(now time.Time) ([]byte, bool) {
 
 func (q *sender) codelShouldDrop(sojourn time.Duration, now time.Time) bool {
 	okToDrop := false
-	if sojourn < codelTarget || q.queueBytes < 2*stripePieceBytes {
+	if sojourn < codelTarget || q.queueBytes < 2*q.piece() {
 		q.codelFirstAbove = time.Time{}
 	} else if q.codelFirstAbove.IsZero() {
 		q.codelFirstAbove = now.Add(codelInterval)

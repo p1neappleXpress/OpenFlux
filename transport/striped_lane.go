@@ -51,6 +51,8 @@ type laneState struct {
 	busyAt    time.Time // the last window that carried traffic
 	limitedAt time.Time // the last window the rate held the lane back
 	rampUntil time.Time
+
+	deadAfter time.Duration // 0: deadAfterDefault
 }
 
 // pacingOn: STRIPE_PACE=0 lets every lane send all its clock allows.
@@ -133,8 +135,14 @@ func (l *laneState) lostOne() {
 // forwarding it (a subscription that never started or broke). Such a lane
 // only gets a probe now and then until something arrives again.
 func (l *laneState) dead(now time.Time) bool {
-	return l.started && l.unanswered >= 20 && now.Sub(l.deliveredAt) > 600*time.Millisecond
+	after := l.deadAfter
+	if after <= 0 {
+		after = deadAfterDefault
+	}
+	return l.started && l.unanswered >= 20 && now.Sub(l.deliveredAt) > after
 }
+
+const deadAfterDefault = 600 * time.Millisecond
 
 // pace adjusts the rate after a window that lost loss of what it sent.
 func (l *laneState) pace(loss float64, now time.Time) {

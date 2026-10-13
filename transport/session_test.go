@@ -19,10 +19,14 @@ type negotiationWire struct {
 	peer    *negotiationWire
 	packets [][]byte
 	drop    bool
+	startN  int
+	stopN   int
 }
 
-func (w *negotiationWire) Start() error            { return nil }
-func (w *negotiationWire) Stop() error             { return nil }
+func (w *negotiationWire) Start() error            { w.mu.Lock(); w.startN++; w.mu.Unlock(); return nil }
+func (w *negotiationWire) Stop() error             { w.mu.Lock(); w.stopN++; w.mu.Unlock(); return nil }
+func (w *negotiationWire) stops() int              { w.mu.Lock(); defer w.mu.Unlock(); return w.stopN }
+func (w *negotiationWire) starts() int             { w.mu.Lock(); defer w.mu.Unlock(); return w.startN }
 func (w *negotiationWire) IsConnected() bool       { return true }
 func (w *negotiationWire) Stats() TransportStats   { return TransportStats{} }
 func (w *negotiationWire) Receive(cb func([]byte)) { w.mu.Lock(); w.cb = cb; w.mu.Unlock() }
@@ -132,6 +136,77 @@ func TestSessionHandshakeAndData(t *testing.T) {
 	}
 	if a.Send(testIPv4(28, 58)) == nil {
 		t.Fatal("unknown protocol accepted")
+	}
+}
+
+func TestSessionReplaceTransportHotSwap(t *testing.T) {
+	ca, cb, wa, wb := sessionPair(t)
+
+	got := make(chan []byte, 8)
+	cb.Receive(func(p []byte) { got <- append([]byte(nil), p...) })
+
+	errs := make(chan error, 2)
+	go func() { errs <- ca.Start() }()
+	go func() { errs <- cb.Start() }()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("handshake timeout")
+		}
+	}
+
+	// Data flows over the original carrier.
+	first := testIPv4(200, 17)
+	if err := ca.Send(first); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if !bytes.Equal(p, first) {
+			t.Fatal("first packet changed in flight")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first packet never arrived")
+	}
+
+	// Hot-swap both ends' "primary" carrier for a new peered pair, exactly as a
+	// reload-from-updated-.flux does: the session's handshake and keys stay up,
+	// only the one link blinks.
+	na, nb := &negotiationWire{}, &negotiationWire{}
+	na.peer, nb.peer = nb, na
+	if err := ca.ReplaceTransport("primary", na, testSessionSecret, testSessionCtx, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.ReplaceTransport("primary", nb, testSessionSecret, testSessionCtx, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old carriers were torn down (raw Stop() reached through the chain),
+	// the new ones started in their place.
+	if wa.stops() == 0 || wb.stops() == 0 {
+		t.Fatalf("old carriers not stopped on swap: wa=%d wb=%d", wa.stops(), wb.stops())
+	}
+	if na.starts() == 0 || nb.starts() == 0 {
+		t.Fatalf("new carriers not started on swap: na=%d nb=%d", na.starts(), nb.starts())
+	}
+
+	// Data flows over the hot-swapped carrier: the session never dropped. Each
+	// attempt is a distinct packet so nothing is mistaken for a stale one.
+	deadline := time.Now().Add(3 * time.Second)
+	for i := 0; ; i++ {
+		_ = ca.Send(testIPv4(220+i, 17))
+		select {
+		case <-got:
+			return // something we just sent crossed the new carrier
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no data crossed the hot-swapped carrier")
+		}
 	}
 }
 
