@@ -27,6 +27,7 @@ final class WsClient
         $key = base64_encode(random_bytes(16));
         $req = "GET $path HTTP/1.1\r\nHost: $host\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
              . "Sec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\nUser-Agent: " . PhpboxUtil::UA . "\r\n"
+             . "Accept-Language: en-US,en;q=0.9\r\n"
              . "Origin: $origin\r\n"
              . ($cookieHeader !== '' ? "Cookie: $cookieHeader\r\n" : '')
              . "\r\n";
@@ -119,7 +120,8 @@ final class WsClient
                 return null;
             }
         }
-        $chunk = @fread($this->sock, 65536);
+        $u = stream_get_meta_data($this->sock)['unread_bytes'] ?? 0;
+        $chunk = @fread($this->sock, $u > 0 ? $u : 65536);
         if ($chunk === false || ($chunk === '' && feof($this->sock))) {
             $this->markClosed();
             return null;

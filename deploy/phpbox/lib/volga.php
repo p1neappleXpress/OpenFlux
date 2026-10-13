@@ -147,6 +147,10 @@ final class VolgaAuth
             'Content-Type: application/x-www-form-urlencoded',
             'Origin: https://disk.yandex.ru',
             'Referer: ' . $finalURL,
+            'Upgrade-Insecure-Requests: 1',
+            'Sec-Fetch-Dest: iframe',
+            'Sec-Fetch-Mode: navigate',
+            'Sec-Fetch-Site: cross-site',
         ]));
         if ($code !== 302 || $location === '') {
             throw new VolgaAuthError('other', "auth/initial status $code (expected 302 with a Location)");

@@ -62,8 +62,14 @@ final class MailruCarrier implements Carrier
         if (!$this->ws->connect($info['wsURL'], self::ORIGIN, PhpboxUtil::cookieHeader($this->cookieFile))) {
             echo "ws handshake failed\n"; return false;
         }
-        // Auth, fired immediately (as transport/mailru; the server buffers it).
+        // Engine.IO open (0{...}) before Socket.IO connect (40{token}) -> ack (40{...}) -> editor auth (#147).
+        if (!$this->expectPrefix('0{')) {
+            echo "engine.io open missing\n"; $this->ws->close(); return false;
+        }
         $this->ws->writeText('40' . json_encode(['token' => $info['token']]));
+        if (!$this->expectPrefix('40')) {
+            echo "socket.io connect missing\n"; $this->ws->close(); return false;
+        }
         $auth = [
             'type' => 'auth', 'docid' => $info['docKey'], 'documentCallbackUrl' => $info['callbackURL'],
             'token' => 'fghhfgsjdgfjs',
@@ -79,6 +85,19 @@ final class MailruCarrier implements Carrier
         ];
         $this->ws->writeText('42' . json_encode(['message', $auth]));
         return true;
+    }
+
+    private function expectPrefix(string $prefix): bool
+    {
+        $deadline = microtime(true) + 15;
+        while (microtime(true) < $deadline && !$this->ws->closed) {
+            $f = $this->ws->readFrame(3.0);
+            if ($f === null || $f === '') { continue; }
+            if ($f === '2') { $this->ws->writeText('3'); continue; }
+            if (str_starts_with($f, $prefix)) { return true; }
+            if ($f === '1' || str_starts_with($f, '41') || str_starts_with($f, '44')) { return false; }
+        }
+        return false;
     }
 
     public function onReadable($sock): void
@@ -128,7 +147,8 @@ final class MailruCarrier implements Carrier
         [$body, $code] = PhpboxUtil::http(self::API_EDIT, $this->cookieFile, 'POST',
             json_encode(['x-email' => 'anonym', 'public' => '/' . $this->weblink, 'platform' => 'desktop_web']),
             ['Content-Type: application/json', 'Accept: application/json, text/plain, */*',
-             'X-Api-Version: 4', 'Referer: https://cloud.mail.ru/public/' . $this->weblink . '?weblink=' . $this->weblink]);
+             'Accept-Language: en-US,en;q=0.9', 'X-Api-Version: 4',
+             'Referer: https://cloud.mail.ru/public/' . $this->weblink . '?weblink=' . $this->weblink]);
         if ($code !== 200) { echo "edit API status $code\n"; return null; }
         $res = json_decode($body, true);
         if (!is_array($res)) { echo "edit API bad JSON\n"; return null; }

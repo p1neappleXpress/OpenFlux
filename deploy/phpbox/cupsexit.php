@@ -32,7 +32,7 @@ const BYTES_PER_NUMBER = 6;
 // ===========================================================================
 final class CupsCarrier implements PacedCarrier
 {
-    private Mux $mux;
+    private ?Mux $mux = null;
     private WsClient $ws;
     private array $auth = [];
     private string $cookieFile;
@@ -49,7 +49,7 @@ final class CupsCarrier implements PacedCarrier
         $this->ws = new WsClient();
     }
 
-    public function setMux(Mux $m): void { $this->mux = $m; }
+    public function setMux(Mux $m): void { $this->mux = $m; $this->drain(); }
     public function sockets(): array { return $this->ws->sock ? [$this->ws->sock] : []; }
 
     public function msgCap(): int { return MAX_MSG_DATA; }
@@ -89,6 +89,7 @@ final class CupsCarrier implements PacedCarrier
     public function connect(): bool
     {
         $this->sent = $this->echoed = 0;     // a new link: nothing of ours is pending at the server
+        $this->recvBuf = $this->lastDisconnect = '';
         [$html, $code] = PhpboxUtil::http($this->roomURL, $this->cookieFile, 'GET', null,
             ['Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language: ru-RU,ru;q=0.9']);
         if ($code !== 200) { echo "GET room status $code\n"; return false; }
@@ -116,23 +117,41 @@ final class CupsCarrier implements PacedCarrier
             echo "ws handshake failed\n"; return false;
         }
         $this->ws->writeText(json_encode(['id' => 1, 'connect' => ['token' => $a['connToken'], 'name' => 'js']]));
-        if (!$this->expect(1)) { echo "connect reply missing\n"; return false; }
+        if (!$this->expect(1)) { echo "connect reply missing\n"; $this->ws->close(); return false; }
         $this->ws->writeText(json_encode(['id' => 2, 'subscribe' => ['channel' => $a['channel'], 'token' => $a['subToken']]]));
-        if (!$this->expect(2)) { echo "subscribe reply missing\n"; return false; }
+        if (!$this->expect(2)) { echo "subscribe reply missing\n"; $this->ws->close(); return false; }
         return true;
     }
 
     private function expect(int $id): bool
     {
         $deadline = microtime(true) + 12;
-        while (microtime(true) < $deadline) {
+        while (microtime(true) < $deadline && !$this->ws->closed) {
             $f = $this->ws->readFrame(3.0);
-            if ($f === null) { continue; }
-            if ($f === '{}') { $this->ws->writeText('{}'); continue; }
+            if ($f === null || $f === '') { continue; }
+            $found = false;
+            $refused = false;
             foreach (explode("\n", trim($f)) as $line) {
-                $o = json_decode($line, true);
-                if (is_array($o) && (($o['id'] ?? null) === $id)) { return true; }
+                $line = trim($line);
+                if ($line === '') { continue; }
+                if (!$found && $line !== '{}') {
+                    $o = json_decode($line, true);
+                    if (is_array($o) && (($o['id'] ?? null) === $id)) {
+                        $found = true;
+                        if (!empty($o['error'])) {
+                            $err = $o['error'];
+                            $this->lastDisconnect = is_array($err)
+                                ? trim(($err['code'] ?? '') . ' ' . ($err['message'] ?? ''))
+                                : json_encode($err);
+                            $refused = true;
+                        }
+                        continue;
+                    }
+                }
+                $this->onMessage($line);
             }
+            if ($refused) { return false; }
+            if ($found) { return true; }
         }
         return false;
     }
@@ -148,6 +167,7 @@ final class CupsCarrier implements PacedCarrier
     private function onMessage(string $msg): void
     {
         foreach (explode("\n", trim($msg)) as $line) {
+            $line = trim($line);
             if ($line === '') { continue; }
             if ($line === '{}') { $this->ws->writeText('{}'); continue; }
             // The server sends every member's cursors to everyone, ours included: skip ours and the other generations'
@@ -171,14 +191,19 @@ final class CupsCarrier implements PacedCarrier
             $cursors = $this->peerCursors($obj);
             if ($cursors === null) { continue; }
             $this->recvBuf .= $this->cursorsToChunk($cursors);
-            while (strlen($this->recvBuf) >= 2) {
-                $ln = unpack('n', substr($this->recvBuf, 0, 2))[1];
-                if ($ln === 0) { $this->recvBuf = ''; break; }
-                if (strlen($this->recvBuf) < 2 + $ln) { break; }
-                $pkt = substr($this->recvBuf, 2, $ln);
-                $this->recvBuf = substr($this->recvBuf, 2 + $ln);
-                $this->mux->onPacket($pkt);
-            }
+            $this->drain();
+        }
+    }
+
+    private function drain(): void
+    {
+        while ($this->mux && strlen($this->recvBuf) >= 2) {
+            $ln = unpack('n', substr($this->recvBuf, 0, 2))[1];
+            if ($ln === 0) { $this->recvBuf = ''; break; }
+            if (strlen($this->recvBuf) < 2 + $ln) { break; }
+            $pkt = substr($this->recvBuf, 2, $ln);
+            $this->recvBuf = substr($this->recvBuf, 2 + $ln);
+            $this->mux->onPacket($pkt);
         }
     }
 
@@ -299,6 +324,15 @@ final class CupsCarrier implements PacedCarrier
             $ok = $ok && $pass;
             printf("selftest len=%-5d %s\n", strlen($p), $pass ? 'OK' : 'FAIL');
         }
+        $c = new self('http://invalid');
+        $c->auth = ['roomUUID' => 'r', 'userUUID' => 'own-u'];
+        $ownLine = json_encode(['push' => ['pub' => ['data' => ['type' => 'cursors_update', 'payload' => ['user_uuid' => 'own-u', 'cursors' => [['row' => 1, 'column' => 2]]]]]]]);
+        $discLine = json_encode(['disconnect' => ['code' => 3000, 'reason' => 'expired']]);
+        $c->onMessage("{}\n$ownLine\r\n$discLine\n");
+        $pass = ($c->echoed === 1 && str_contains($c->why(), '3000'));
+        $ok = $ok && $pass;
+        printf("selftest multiline frame %s\n", $pass ? 'OK' : 'FAIL');
+        @unlink($c->cookieFile);
         echo $ok ? "SELFTEST PASS\n" : "SELFTEST FAIL\n";
         exit($ok ? 0 : 1);
     }
