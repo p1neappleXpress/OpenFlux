@@ -26,6 +26,7 @@ import (
 
 	"github.com/p1neappleXpress/OpenFlux/provision"
 	"github.com/p1neappleXpress/OpenFlux/provision/phphost"
+	"github.com/p1neappleXpress/OpenFlux/transport/avito"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
@@ -77,6 +78,8 @@ type nodeWizard struct {
 	checkDoc  func(string) (yandex.VolgaDocument, error)
 	newScript func() provision.Script
 	newRooms  func(context.Context) (string, error)
+	// newAvitoRooms makes Avito Code rooms; they need no sign-in.
+	newAvitoRooms func(context.Context) (string, error)
 }
 
 func newNodeWizard() *nodeWizard {
@@ -85,6 +88,9 @@ func newNodeWizard() *nodeWizard {
 		checkDoc:  func(u string) (yandex.VolgaDocument, error) { return yandex.CheckVolgaDocument(u, nil) },
 		newScript: provision.Pinned,
 		newRooms:  cupsonline.CreateRoomList,
+		newAvitoRooms: func(ctx context.Context) (string, error) {
+			return avito.CreateRoomList(ctx, "")
+		},
 	}
 }
 
@@ -194,6 +200,14 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 		rooms, err := w.newRooms(ctx)
 		if err != nil {
 			return wizardFailure(fmt.Errorf("не удалось создать комнаты cups.online: %v", err), nil)
+		}
+		return wizardOK(map[string]interface{}{"rooms": rooms})
+	case "createAvitoRooms":
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rooms, err := w.newAvitoRooms(ctx)
+		if err != nil {
+			return wizardFailure(fmt.Errorf("не удалось создать комнаты Avito: %v", err), nil)
 		}
 		return wizardOK(map[string]interface{}{"rooms": rooms})
 	case "shareLink":

@@ -19,6 +19,7 @@ import (
 
 	"github.com/p1neappleXpress/OpenFlux/provision"
 	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/avito"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 	"github.com/p1neappleXpress/OpenFlux/tunnel"
@@ -354,6 +355,19 @@ func fetchIP(ctx context.Context, trans transport.Transport) (string, error) {
 		}
 	}
 	return "", lastErr
+}
+
+// NodeCreateAvitoRooms creates Avito Code rooms for a new channel's config
+// (no sign-in needed), like NodeCreateCupsRooms.
+func NodeCreateAvitoRooms() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	rooms, err := avito.CreateRoomList(ctx, "")
+	if err != nil {
+		return failure(fmt.Errorf("не удалось создать комнаты Avito: %v", err), nil)
+	}
+	appendLog("[NODE] Созданы комнаты Avito для канала")
+	return result(map[string]interface{}{"rooms": rooms})
 }
 
 // NodeCreateCupsRooms creates cups.online rooms for a new channel's

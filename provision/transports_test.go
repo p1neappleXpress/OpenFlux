@@ -22,7 +22,7 @@ func TestCheckTransportsCleansAndOrders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []ChannelTransport{{"vyandex", testVolga}, {"mailru", testMailru}, {"cupsonline", testRooms}}
+	want := []ChannelTransport{{Type: "vyandex", URL: testVolga}, {Type: "mailru", URL: testMailru}, {Type: "cupsonline", URL: testRooms}}
 	if len(got) != len(want) {
 		t.Fatalf("got %+v", got)
 	}
@@ -38,16 +38,16 @@ func TestCheckTransportsCleansAndOrders(t *testing.T) {
 
 func TestCheckTransportsRefuses(t *testing.T) {
 	for name, ts := range map[string][]ChannelTransport{
-		"twice":        {{"vyandex", testVolga}, {"vyandex", testVolga}},
-		"unknown":      {{"boards", "https://boards.yandex.ru/whiteboard/?hash=1"}},
-		"direct":       {{"direct", "1.2.3.4:5"}},
-		"max":          {{"oneme", "token"}},
-		"volga link":   {{"vyandex", "https://disk.yandex.ru/i/abc"}},
-		"mailru link":  {{"mailru", "https://cloud.mail.ru/home/doc.docx"}},
-		"mailru other": {{"mailru", "https://evil.example/public/a/b"}},
-		"rooms":        {{"cupsonline", "not base64!"}},
-		"no rooms":     {{"cupsonline", ""}},
-		"newline":      {{"mailru", testMailru + "\nkey=0"}},
+		"twice":        {{Type: "vyandex", URL: testVolga}, {Type: "vyandex", URL: testVolga}},
+		"unknown":      {{Type: "boards", URL: "https://boards.yandex.ru/whiteboard/?hash=1"}},
+		"direct":       {{Type: "direct", URL: "1.2.3.4:5"}},
+		"max":          {{Type: "oneme", URL: "token"}},
+		"volga link":   {{Type: "vyandex", URL: "https://disk.yandex.ru/i/abc"}},
+		"mailru link":  {{Type: "mailru", URL: "https://cloud.mail.ru/home/doc.docx"}},
+		"mailru other": {{Type: "mailru", URL: "https://evil.example/public/a/b"}},
+		"rooms":        {{Type: "cupsonline", URL: "not base64!"}},
+		"no rooms":     {{Type: "cupsonline", URL: ""}},
+		"newline":      {{Type: "mailru", URL: testMailru + "\nkey=0"}},
 	} {
 		if _, err := CheckTransports(ts); err == nil {
 			t.Errorf("%s: accepted %+v", name, ts)
@@ -60,9 +60,9 @@ func TestSessionContextPicksTheTopDocument(t *testing.T) {
 		ts   []ChannelTransport
 		want string
 	}{
-		{[]ChannelTransport{{"vyandex", testVolga}, {"mailru", testMailru}}, testVolga},
-		{[]ChannelTransport{{"cupsonline", testRooms}, {"mailru", testMailru}}, testMailru},
-		{[]ChannelTransport{{"cupsonline", testRooms}}, "http://#"},
+		{[]ChannelTransport{{Type: "vyandex", URL: testVolga}, {Type: "mailru", URL: testMailru}}, testVolga},
+		{[]ChannelTransport{{Type: "cupsonline", URL: testRooms}, {Type: "mailru", URL: testMailru}}, testMailru},
+		{[]ChannelTransport{{Type: "cupsonline", URL: testRooms}}, "http://#"},
 		{nil, "http://#"},
 	} {
 		if got := SessionContext(c.ts); got != c.want {
@@ -73,7 +73,7 @@ func TestSessionContextPicksTheTopDocument(t *testing.T) {
 
 func TestShareLinkCarriesTheChosenTransports(t *testing.T) {
 	key := strings.Repeat("ab", 32)
-	link, err := ShareLink("Нода", key, "203.0.113.5", 8445, []ChannelTransport{{"cupsonline", testRooms}, {"mailru", testMailru}})
+	link, err := ShareLink("Нода", key, "203.0.113.5", 8445, []ChannelTransport{{Type: "cupsonline", URL: testRooms}, {Type: "mailru", URL: testMailru}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestShareLinkCarriesTheChosenTransports(t *testing.T) {
 }
 
 func TestChannelConfigLines(t *testing.T) {
-	ch := Channel{ID: "of-abc", Transports: []ChannelTransport{{"mailru", testMailru}, {"vyandex", testVolga}}, AutoUpdate: true}
+	ch := Channel{ID: "of-abc", Transports: []ChannelTransport{{Type: "mailru", URL: testMailru}, {Type: "vyandex", URL: testVolga}}, AutoUpdate: true}
 	cfg, err := ch.config()
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestChannelConfigLines(t *testing.T) {
 	if cfg, _ = ch.config(); cfg != "channel=of-abc\nport=20001\nautoupdate=no\n" {
 		t.Fatalf("direct only config:\n%s", cfg)
 	}
-	ch.Transports = []ChannelTransport{{"mailru", testMailru + "\nkey=" + strings.Repeat("0", 64)}}
+	ch.Transports = []ChannelTransport{{Type: "mailru", URL: testMailru + "\nkey=" + strings.Repeat("0", 64)}}
 	if _, err := ch.config(); err == nil {
 		t.Fatal("a line break in a link must not reach the script")
 	}

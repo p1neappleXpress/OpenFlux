@@ -533,6 +533,10 @@ DEPRECATED (removed in v2)
 				*debug = 1
 			}
 		}
+		// A node channel with .flux carriers keeps them current (node-install.sh writes it).
+		if v, ok := confValue(conf.Interface, "ScriptAutoUpdate"); ok && !setFlags["script-auto-update"] {
+			*scriptAutoUpdate = confBool(v, false)
+		}
 		if v, ok := confValue(conf.Interface, "Sensitive"); ok && !setFlags["sensitive"] && !setFlags["sensetive"] {
 			*sensitive = confBool(v, *sensitive)
 		}
