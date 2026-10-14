@@ -474,7 +474,7 @@ URL = YOUR_YANDEX_DOC_URL
 ```
 
 Ключи `[Interface]`: `Role`, `Inbound`, `Transport`, `Mode`, `Codec`,
-`Socks5`, `EncryptionKeyFile`, `CookieStore`, `IPCSocket`, `URL`, `Debug`.
+`Socks5`, `ExitSocks5`, `EncryptionKeyFile`, `CookieStore`, `IPCSocket`, `URL`, `Debug`.
 Секции транспортов: `Type` (по умолчанию имя секции), `Priority` (по умолчанию
 50), `URL`, `Dial` / `Listen` (direct) и `Token` / `UID` (MAX). `.conf` с
 секциями транспортов всегда запускается как согласованная сессия.
@@ -582,6 +582,7 @@ URL = YOUR_YANDEX_DOC_URL
 | `--socks5` | `-s` | `:1080` | Адрес SOCKS5-прокси |
 | `--http-proxy` | | | Дополнительно поднять HTTP-прокси (CONNECT + обычные запросы) на этом адресе |
 | `--local-ip` | `-l` | (авто) | Egress IP для l3 SNAT / фильтра RST |
+| `--exit-socks5` | | | Exit, только l4: исходящий TCP (CONNECT) и UDP (UDP ASSOCIATE) через SOCKS5-прокси, `host:port` или `socks5://[user:pass@]host:port` — например, локальный xray/sing-box, который маршрутизирует по назначению. Без явного `--mode` включает `l4`. В `.conf`: `ExitSocks5` |
 | `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: строка на каждый пакет (`-> 52 bytes - UDP ...`); `2`: плюс рабочие логи; `3`: плюс hexdump |
 | `--sensitive` | | `false` | Ещё и ключи, а с `-ddd` — расшифрованные фреймы (куки, токены) |
 | `--encryption-key-file` | | | Файл с общим секретом для AES-256-GCM |

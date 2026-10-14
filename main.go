@@ -33,6 +33,7 @@ var (
 	maxToken     string
 	maxUid       string
 	localIP      string
+	exitSocks5   string
 )
 
 // expandShortFlags rewrites single-letter flag aliases into their long
@@ -319,6 +320,7 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
+	flag.StringVar(&exitSocks5, "exit-socks5", "", "Exit (l4 mode): send outgoing TCP and UDP through this SOCKS5 proxy, host:port or socks5://[user:pass@]host:port")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
@@ -411,6 +413,11 @@ MODE  (only with --role=exit)
                                WinDivert.dll + WinDivert64.sys beside the core.
   -m, --mode=l4                Stream proxy (TCP termination + re-dial).
   -l, --local-ip=<ip>          Egress IP for SNAT. Auto-detected.
+      --exit-socks5=<addr>     l4 only: send the exit's outgoing TCP and UDP
+                               through a SOCKS5 proxy instead of straight to
+                               the internet (e.g. a local xray/sing-box that
+                               routes per destination). host:port or
+                               socks5://[user:pass@]host:port.
 
 TRANSPORT MODIFIERS
   -c, --codec=batched          zstd + coalescing. Default.
@@ -519,6 +526,7 @@ DEPRECATED (removed in v2)
 		applyConfString(conf.Interface, "Mode", "mode", mode, setFlags)
 		applyConfString(conf.Interface, "Codec", "codec", codec, setFlags)
 		applyConfString(conf.Interface, "Socks5", "socks5", socksAddr, setFlags)
+		applyConfString(conf.Interface, "ExitSocks5", "exit-socks5", &exitSocks5, setFlags)
 		applyConfString(conf.Interface, "EncryptionKeyFile", "encryption-key-file", encryptionKeyFile, setFlags)
 		applyConfString(conf.Interface, "SessionContext", "session-context", sessionContextFlag, setFlags)
 		applyConfString(conf.Interface, "CookieStore", "cookie-store", cookieStorePath, setFlags)
@@ -636,6 +644,11 @@ DEPRECATED (removed in v2)
 	}
 	if *mode == "" {
 		*mode = "l3"
+		// An upstream proxy only works for connections the exit opens
+		// itself, so asking for one picks l4 unless a mode was given.
+		if exitSocks5 != "" {
+			*mode = "l4"
+		}
 	}
 
 	if *codec != codecBatched && *codec != codecLegacy {
@@ -670,7 +683,8 @@ DEPRECATED (removed in v2)
 
 	// Warn when the exit runs on l4 (gVisor): it works everywhere but is
 	// slower than l3 (SNAT/DNAT: Linux as root, Windows with WinDivert).
-	if *role == roleExit && *mode == "l4" {
+	// Not when an upstream SOCKS5 is set: that needs l4.
+	if *role == roleExit && *mode == "l4" && exitSocks5 == "" {
 		log.Printf("warning: exit on l4 (gVisor). l3 is faster: Linux as root, Windows as Administrator.")
 	}
 
@@ -696,6 +710,16 @@ DEPRECATED (removed in v2)
 	exitMode, err := tunnel.ParseExitMode(*mode)
 	if err != nil {
 		log.Fatalf("--mode: %v", err)
+	}
+	if exitSocks5 != "" && isExit {
+		// L3 forwards raw packets with SNAT; there is no connection of the
+		// exit's own to hand to a proxy.
+		if exitMode == tunnel.ExitModeL3 {
+			log.Fatalf("--exit-socks5 needs --mode=l4 (l3 forwards raw packets and cannot use a proxy)")
+		}
+		if err := tunnel.SetExitSocks5(exitSocks5); err != nil {
+			log.Fatalf("%v", err)
+		}
 	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
@@ -1215,6 +1239,9 @@ func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, acti
 }
 
 func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
+	if addr := tunnel.ExitSocks5Addr(); addr != "" {
+		log.Printf("Exit traffic goes through SOCKS5 %s", addr)
+	}
 	if exitMode == tunnel.ExitModeL3 {
 		if err := tunnel.SetLocalIP(localIP); err != nil {
 			log.Fatalf("--local-ip: %v", err)
