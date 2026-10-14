@@ -44,6 +44,43 @@ against either.
   - the WinDivert backend is not wired yet, and `l4` is the working
   fallback until then. On non-root hosts, use `l4`.
 
+### l4 upstream HTTP CONNECT proxy
+
+An `l4` exit dials outbound TCP through one injectable dialer
+(`tunnel.DialFunc`, default `tunnel.DirectDial`). With
+`--upstream-proxy=http://127.0.0.1:10808` (or `UpstreamProxy` in the
+`.conf` `[Interface]` section) that dialer becomes an HTTP CONNECT client
+(`tunnel/upstream.go`): every outbound TCP connection is established with
+`CONNECT host:port` against the proxy, and application bytes flow over the
+returned `net.Conn` once the proxy answers `200`.
+
+```bash
+# Exit without upstream (old behavior, unchanged default)
+./openflux --role=exit --mode=l4 --transport=boards --url="YOUR_BOARD_URL"
+
+# Exit with upstream: TCP leaves through a local Xray/3x-ui HTTP inbound,
+# whose existing VLESS outbound and routing stay configured in Xray itself
+./openflux --role=exit --mode=l4 --transport=boards --url="YOUR_BOARD_URL" \
+    --upstream-proxy=http://127.0.0.1:10808
+```
+
+- Only `l4` TCP is proxied. UDP (including DNS carried over UDP) keeps
+  dialing directly; HTTP CONNECT cannot carry it in this implementation.
+  With no `--upstream-proxy` everything dials directly, as before.
+- The proxy endpoint must be reachable from the exit host. If it is down,
+  refuses the CONNECT, or stays silent past the handshake timeout, the flow
+  fails and the client connection closes - the exit never falls back to a
+  direct dial on its own.
+- Format: `http://host:port` or bare `host:port`; Basic auth as
+  `http://user:pass@host:port` (sent as `Proxy-Authorization`). Other
+  schemes (`socks5://`, `https://`, ...) are rejected. Credentials never
+  appear in logs (the startup line prints a redacted address).
+- Health check through the proxy itself, without OpenFlux:
+  `curl -x http://127.0.0.1:10808 https://ifconfig.me` should return the
+  address the proxy egresses from.
+- In `l3` mode the flag is accepted but ignored with a warning: L3
+  forwards packets (SNAT/DNAT) and never dials TCP.
+
 ### l3 and kernel RSTs
 
 In `l3` mode the kernel sees return packets for connections it never opened

@@ -319,6 +319,8 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
+	upstreamProxyFlag := flag.String("upstream-proxy", "",
+		"Exit (l4 only): route outbound TCP through an HTTP CONNECT proxy, e.g. http://127.0.0.1:10808. Empty = dial directly. UDP always dials directly.")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
@@ -411,6 +413,9 @@ MODE  (only with --role=exit)
                                WinDivert.dll + WinDivert64.sys beside the core.
   -m, --mode=l4                Stream proxy (TCP termination + re-dial).
   -l, --local-ip=<ip>          Egress IP for SNAT. Auto-detected.
+      --upstream-proxy=<url>   l4 only: HTTP CONNECT proxy for outbound TCP,
+                               e.g. http://127.0.0.1:10808. Empty = direct.
+                               UDP always dials directly.
 
 TRANSPORT MODIFIERS
   -c, --codec=batched          zstd + coalescing. Default.
@@ -524,6 +529,7 @@ DEPRECATED (removed in v2)
 		applyConfString(conf.Interface, "CookieStore", "cookie-store", cookieStorePath, setFlags)
 		applyConfString(conf.Interface, "IPCSocket", "ipc-socket", ipcSocketPath, setFlags)
 		applyConfString(conf.Interface, "URL", "url", &globalDocUrl, setFlags)
+		applyConfString(conf.Interface, "UpstreamProxy", "upstream-proxy", upstreamProxyFlag, setFlags)
 		if v, ok := confValue(conf.Interface, "Debug"); ok && !setFlags["debug"] {
 			if b, err := strconv.Atoi(v); err == nil {
 				*debug = b
@@ -696,6 +702,17 @@ DEPRECATED (removed in v2)
 	exitMode, err := tunnel.ParseExitMode(*mode)
 	if err != nil {
 		log.Fatalf("--mode: %v", err)
+	}
+
+	// Validate the exit upstream early, before any transport starts, so a
+	// typo fails fast instead of hanging in carrier setup.
+	upstreamProxy, err := tunnel.ParseUpstreamProxy(*upstreamProxyFlag)
+	if err != nil {
+		log.Fatalf("--upstream-proxy: %v", err)
+	}
+	if upstreamProxy != nil && *role != roleExit {
+		log.Printf("warning: --upstream-proxy is set but --role=%s: only the exit dials through it, ignoring", *role)
+		upstreamProxy = nil
 	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
@@ -1171,7 +1188,7 @@ DEPRECATED (removed in v2)
 		if printLink != nil {
 			printLink()
 		}
-		runExit(trans, exitMode)
+		runExit(trans, exitMode, upstreamProxy)
 	case roleClient:
 		runClient(trans, *inbound, *socksAddr, *httpProxyAddr, exitMode)
 	default:
@@ -1214,17 +1231,23 @@ func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, acti
 	}
 }
 
-func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
+func runExit(trans transport.Transport, exitMode tunnel.ExitMode, upstream *tunnel.UpstreamProxy) {
 	if exitMode == tunnel.ExitModeL3 {
 		if err := tunnel.SetLocalIP(localIP); err != nil {
 			log.Fatalf("--local-ip: %v", err)
 		}
+		if upstream != nil {
+			log.Printf("warning: --upstream-proxy is ignored in l3 mode (L3 forwards packets, it does not dial TCP); use --mode=l4 to route TCP through the proxy")
+		}
 	}
-	ex, err := tunnel.NewExitNode(trans, exitMode.String())
+	ex, err := tunnel.NewExitNodeWithUpstream(trans, exitMode.String(), upstream)
 	if err != nil {
 		log.Fatalf("exit node: %v", err)
 	}
 	log.Printf("Running as EXIT NODE (mode=%s)", ex.Mode())
+	if upstream != nil {
+		log.Printf("Upstream proxy: %s (TCP via HTTP CONNECT; UDP direct)", upstream.StringRedacted())
+	}
 	if err := ex.Start(); err != nil {
 		log.Fatalf("exit start: %v", err)
 	}

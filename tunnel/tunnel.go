@@ -65,6 +65,11 @@ type TCPTunnel struct {
 	stopOnce    sync.Once
 	stopCh      chan struct{}
 	udpFlows    atomic.Int32
+	// exitDial dials outbound TCP from the exit node. Nil means
+	// DirectDial. Set via SetExitDialer/SetExitUpstream; when an
+	// HTTP CONNECT upstream is configured, TCP leaves through it.
+	// UDP always dials directly (see handleExitUDP).
+	exitDial DialFunc
 }
 
 var (
@@ -129,6 +134,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 		exitMode:   mode,
 		startTime:  time.Now(),
 		stopCh:     make(chan struct{}),
+		exitDial:   DirectDial,
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
@@ -178,6 +184,34 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	utils.SafeGo("tunnel.printStats", t.printStats)
 	return t
+}
+
+// SetExitDialer overrides how the L4 exit dials outbound TCP.
+// Nil restores DirectDial. UDP is unaffected and always dials directly.
+func (t *TCPTunnel) SetExitDialer(fn DialFunc) {
+	if fn == nil {
+		fn = DirectDial
+	}
+	t.exitDial = fn
+}
+
+// SetExitUpstream routes the L4 exit's outbound TCP through an HTTP
+// CONNECT proxy. Nil restores direct dialing.
+func (t *TCPTunnel) SetExitUpstream(u *UpstreamProxy) {
+	if u == nil {
+		t.SetExitDialer(nil)
+		return
+	}
+	t.SetExitDialer(u.Dial)
+}
+
+// dialExit is the single egress point for L4 TCP.
+func (t *TCPTunnel) dialExit(network, address string) (net.Conn, error) {
+	fn := t.exitDial
+	if fn == nil {
+		fn = DirectDial
+	}
+	return fn(network, address)
 }
 
 func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
@@ -273,7 +307,7 @@ func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	local := gonet.NewTCPConn(&wq, ep)
 
 	utils.SafeGo("exit.flow", func() {
-		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+		remote, err := t.dialExit("tcp", dest)
 		if err != nil {
 			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
 			local.Close()
