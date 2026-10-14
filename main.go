@@ -657,10 +657,10 @@ DEPRECATED (removed in v2)
 		log.Fatalf("unknown --role=%q (want client|exit|bench-send|bench-sink)", *role)
 	}
 
-	// Windows full tunnel: bind the core's sockets to the real interface
+	// Windows/Linux full tunnel: bind the core's sockets to the real interface
 	// before any transport dials, so the carriers stay out of the tunnel
 	// once it takes the default route (see package netbind).
-	if *role == roleClient && *inbound == inboundTUN && runtime.GOOS == "windows" {
+	if *role == roleClient && *inbound == inboundTUN && (runtime.GOOS == "windows" || runtime.GOOS == "linux") {
 		index, err := netbind.BindDefault()
 		if err != nil {
 			log.Fatalf("tun: %v", err)

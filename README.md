@@ -35,7 +35,7 @@ The original code is provided **as is**, **without any warranties**.
 | Platform | Download | Notes |
 |----------|----------|-------|
 | **macOS**   | build from source | CLI + utun L3 client (`--inbound=tun`, default on macOS) |
-| **Linux**   | build from source | CLI client (SOCKS5) / exit node (L3 or L4) |
+| **Linux**   | build from source | CLI client (`--inbound=tun` via TUN - needs root, or SOCKS5) / exit node (L3 or L4) |
 | **Windows** | build from source | CLI client (SOCKS5, or `--inbound=tun` via Wintun - needs administrator) / exit node (`l4`, or `l3` via QEMU - see docs) |
 | **Desktop** | [OpenFluxDesktop releases](https://github.com/p1neappleXpress/OpenFluxDesktop) | Windows/macOS/Linux: full tunnel or SOCKS5/HTTP proxy, multi-transport sessions, encryption, an in-app node-deployment wizard over SSH |
 | **Android** | [OpenFluxAndroid releases](https://github.com/p1neappleXpress/OpenFluxAndroid) | System-wide VPN or local SOCKS5, multi-transport sessions with failover, encryption, captcha handling in a built-in browser |
