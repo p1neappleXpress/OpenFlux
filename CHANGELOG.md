@@ -5,6 +5,15 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **An L4 exit can send its traffic through an upstream SOCKS5 proxy** (`--exit-socks5`, `ExitSocks5` in a
+  `.conf`): `host:port` or `socks5://user:pass@host:port`. TCP goes through CONNECT, UDP through UDP
+  ASSOCIATE. The usual use is a router on the same server - xray, sing-box, mihomo on `127.0.0.1` - that
+  decides per destination whether a connection leaves from this server or is passed on to another one.
+  Without a `--mode` it picks `l4`; with `--mode=l3`, which forwards raw packets, the exit refuses to start.
+  When the proxy is down the connection fails rather than going out directly.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed

@@ -19,6 +19,7 @@ with inline examples.
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
 | `--http-proxy` | | | Also serve an HTTP proxy (CONNECT + plain requests) on this address |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
+| `--exit-socks5` | | | Exit, l4 only: send outgoing TCP (CONNECT) and UDP (UDP ASSOCIATE) through a SOCKS5 proxy, `host:port` or `socks5://[user:pass@]host:port`, e.g. a local xray/sing-box that routes per destination. Picks `--mode=l4` when no mode is given. `.conf`: `ExitSocks5` |
 | `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: one line per packet; `2`: plus operational logs; `3`: plus hexdumps |
 | `--sensitive` | | `false` | Also log key material and, with `-ddd`, plaintext frames (cookie jars, tokens) |
 | `--encryption-key-file` | | | AES-256-GCM shared secret file |

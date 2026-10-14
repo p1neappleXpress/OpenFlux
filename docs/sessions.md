@@ -54,7 +54,7 @@ URL = YOUR_YANDEX_DOC_URL
 
 `./openflux --config=client.conf`; flags on the command line override the
 file. `[Interface]` keys: `Role`, `Inbound`, `Transport`, `Mode`, `Codec`,
-`Socks5`, `EncryptionKeyFile`, `CookieStore`, `IPCSocket`, `URL`, `Debug`.
+`Socks5`, `ExitSocks5`, `EncryptionKeyFile`, `CookieStore`, `IPCSocket`, `URL`, `Debug`.
 Transport sections take `Type` (defaults to the section name), `Priority`
 (default 50), `URL`, `Dial` / `Listen` (direct) and `Token` / `UID` (MAX). A
 `.conf` with transport sections always runs as a negotiated session.
