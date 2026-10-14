@@ -32,12 +32,9 @@ var (
 
 func init() {
 	var err error
-	// SpeedDefault (~level 3): far better ratio than LZ4 at a CPU cost that is
-	// irrelevant next to the Yandex channel's latency. Single-shot EncodeAll /
-	// DecodeAll are safe for concurrent use on a shared instance.
 	zstdEnc, err = zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedDefault),
-		zstd.WithEncoderConcurrency(1),
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(2),
 	)
 	if err != nil {
 		panic(fmt.Sprintf("zstd encoder init: %v", err))
@@ -73,6 +70,12 @@ func frameBatch(pkts [][]byte) []byte {
 // the whole batch with zstd only when that actually shrinks it.
 func encodeBatch(pkts [][]byte) []byte {
 	framed := frameBatch(pkts)
+	if len(framed) < 512 {
+		out := make([]byte, 2, 2+len(framed))
+		out[0] = batchFormatVersion
+		out[1] = 0
+		return append(out, framed...)
+	}
 	compressed := zstdEnc.EncodeAll(framed, nil)
 
 	if len(compressed) < len(framed) {
@@ -137,9 +140,13 @@ func decodeBatch(data []byte) ([][]byte, error) {
 		if len(framed) < n {
 			return nil, fmt.Errorf("truncated packet: need %d, have %d", n, len(framed))
 		}
-		pkt := make([]byte, n)
-		copy(pkt, framed[:n])
-		pkts = append(pkts, pkt)
+		if flags&batchFlagZstd != 0 {
+			pkts = append(pkts, framed[:n:n])
+		} else {
+			pkt := make([]byte, n)
+			copy(pkt, framed[:n])
+			pkts = append(pkts, pkt)
+		}
 		framed = framed[n:]
 	}
 	return pkts, nil

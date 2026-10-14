@@ -698,10 +698,18 @@ DEPRECATED (removed in v2)
 		log.Fatalf("--mode: %v", err)
 	}
 
-	// The exit node often runs on a tiny VPS; keep the heap tight under load
-	// (GC aggressively). Set GOMEMLIMIT in the environment for a hard soft-cap.
+	// The exit node often runs on a tiny VPS; keep the heap tight under load.
+	// Set GOMEMLIMIT in the environment for a hard soft-cap.
 	if *role == roleExit {
-		godebug.SetGCPercent(20)
+		if v := os.Getenv("OPENFLUX_GOGC"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 25 && n <= 800 {
+				godebug.SetGCPercent(n)
+			} else {
+				godebug.SetGCPercent(50)
+			}
+		} else {
+			godebug.SetGCPercent(50)
+		}
 	}
 
 	utils.SetLevel(*debug)

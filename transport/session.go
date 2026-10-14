@@ -1008,7 +1008,10 @@ func (s *Session) Send(p []byte) error {
 	if err != nil {
 		return err
 	}
-	raw = append(raw, p...)
+	out := make([]byte, 0, len(raw)+len(p))
+	out = append(out, raw...)
+	out = append(out, p...)
+	raw = out
 
 	top := topLinks(links)
 	key := extractFlowKeyBytes(p)

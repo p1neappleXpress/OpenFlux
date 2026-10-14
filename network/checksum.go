@@ -7,27 +7,19 @@ import (
 )
 
 func TCPChecksum(tcpData []byte, srcIP, dstIP [4]byte) uint16 {
-	pseudoHeader := []byte{
-		srcIP[0], srcIP[1], srcIP[2], srcIP[3],
-		dstIP[0], dstIP[1], dstIP[2], dstIP[3],
-		0, 6,
-		0, 0,
-	}
-
+	sum := uint32(srcIP[0])<<8 | uint32(srcIP[1])
+	sum += uint32(srcIP[2])<<8 | uint32(srcIP[3])
+	sum += uint32(dstIP[0])<<8 | uint32(dstIP[1])
+	sum += uint32(dstIP[2])<<8 | uint32(dstIP[3])
+	sum += uint32(6) // protocol TCP
 	tcpLen := len(tcpData)
-	pseudoHeader[10] = byte(tcpLen >> 8)
-	pseudoHeader[11] = byte(tcpLen & 0xff)
+	sum += uint32(tcpLen)
 
-	all := make([]byte, 0, len(pseudoHeader)+tcpLen)
-	all = append(all, pseudoHeader...)
-	all = append(all, tcpData...)
-
-	sum := uint32(0)
-	for i := 0; i < len(all)-1; i += 2 {
-		sum += uint32(all[i])<<8 | uint32(all[i+1])
+	for i := 0; i+1 < tcpLen; i += 2 {
+		sum += uint32(tcpData[i])<<8 | uint32(tcpData[i+1])
 	}
-	if len(all)%2 == 1 {
-		sum += uint32(all[len(all)-1]) << 8
+	if tcpLen%2 == 1 {
+		sum += uint32(tcpData[tcpLen-1]) << 8
 	}
 
 	for sum>>16 > 0 {
