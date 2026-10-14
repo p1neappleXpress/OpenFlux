@@ -73,6 +73,14 @@ type DocSession struct {
 	// it is closed — see markReady and handleMessage.
 	ready     chan struct{}
 	readyOnce sync.Once
+
+	// carried is set once tunnel data from the peer arrived on this session.
+	// The server cuts a working anonymous editor after about a dozen chat
+	// messages, so a session that carried data and then dropped hit that
+	// cut, not a fault: see the reconnect in connectToDoc. Only received
+	// data counts: a write the server accepts and then answers by closing
+	// proves nothing, and must not buy an immediate reconnect.
+	carried atomic.Bool
 }
 
 // markReady unblocks co-editing writes on this session. Safe to call more than
@@ -438,8 +446,12 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 				t.SetConnected(false)
 				conn.Close()
 
+				// A session that carried data was cut by the server's message
+				// limit, which under load comes every few seconds: reconnect at
+				// once with a fresh count. Growing back-off is for sessions that
+				// failed without carrying anything (until 15 s of uptime).
 				next := attempt
-				if time.Since(connectedAt) > 15*time.Second {
+				if session.carried.Load() || time.Since(connectedAt) > 15*time.Second {
 					next = -1
 				}
 				t.scheduleReconnect(next)
@@ -639,6 +651,9 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 			ownID = session.Info.EditorUserID
 		}
 		for _, pkt := range decodeChatData(data, ownID) {
+			if session != nil {
+				session.carried.Store(true)
+			}
 			t.RecordReceive(len(pkt))
 			t.CallReceive(pkt)
 		}
@@ -725,6 +740,11 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 		return // one is already waiting
 	}
 	d := reconnectBackoff(next)
+	if next == 0 {
+		// After a session that carried data (see connectToDoc): the cut is
+		// the server's rhythm, so come straight back.
+		d = carriedReconnectDelay
+	}
 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)
 	time.Sleep(d)
 	t.reconnecting.Store(false) // a failed connect schedules the next one itself
@@ -735,6 +755,12 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 	t.RecordReconnect()
 	t.connectToDoc(next)
 }
+
+// carriedReconnectDelay is the pause before reconnecting after a session that
+// carried data. Under load the server's message limit cuts every few seconds;
+// the back-off below (0.5 s growing to 15 s) turned each cut into seconds
+// without a carrier.
+const carriedReconnectDelay = 50 * time.Millisecond
 
 // reconnectBackoff returns an exponential backoff with jitter, capped at 15s.
 func reconnectBackoff(n int) time.Duration {
