@@ -1,6 +1,8 @@
 package oneme
 
 import (
+	"fmt"
+
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
@@ -35,8 +37,15 @@ func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transp
 func (t *OneMeTransport) Start() error {
 	utils.Debugf("creating max client ...")
 	t.oneMeClient = *NewMaxClient()
-	t.oneMeClient.Connect()
-	t.oneMeClient.LoginByToken(t.token)
+	// Without a socket there is nothing to log in or call over: report it
+	// instead of writing to a nil connection, which took the whole process
+	// down (the app or the exit node) whenever MAX was unreachable.
+	if err := t.oneMeClient.Connect(); err != nil {
+		return fmt.Errorf("max: connect: %w", err)
+	}
+	if err := t.oneMeClient.LoginByToken(t.token); err != nil {
+		return fmt.Errorf("max: login: %w", err)
+	}
 
 	if t.exit {
 		utils.Debugf("configured ch for exit node")
