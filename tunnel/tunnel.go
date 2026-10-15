@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/proxy"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -214,7 +216,24 @@ func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 	local := gonet.NewUDPConn(&wq, ep)
-	remote, err := net.DialTimeout("udp", dest, 10*time.Second)
+	var remote net.Conn
+	var err error
+	if socksAddr := os.Getenv("OPENFLUX_EXIT_SOCKS5"); socksAddr != "" {
+		remote, err = dialSOCKS5UDP(socksAddr, dest)
+		if err != nil {
+			utils.Debugf("[EXIT KILLSWITCH] SOCKS5 UDP dial %s via %s failed: %v — dropping flow to prevent IP leak", dest, socksAddr, err)
+			local.Close()
+			t.udpFlows.Add(-1)
+			return true
+		}
+	} else if os.Getenv("OPENFLUX_STRICT_PROXY") == "1" {
+		utils.Debugf("[EXIT KILLSWITCH] UDP dial %s blocked: OPENFLUX_STRICT_PROXY is active but OPENFLUX_EXIT_SOCKS5 is not configured", dest)
+		local.Close()
+		t.udpFlows.Add(-1)
+		return true
+	} else {
+		remote, err = net.DialTimeout("udp", dest, 10*time.Second)
+	}
 	if err != nil {
 		utils.Debugf("[EXIT] UDP dial %s failed: %v", dest, err)
 		local.Close()
@@ -273,7 +292,28 @@ func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	local := gonet.NewTCPConn(&wq, ep)
 
 	utils.SafeGo("exit.flow", func() {
-		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+		var remote net.Conn
+		var err error
+		if socksAddr := os.Getenv("OPENFLUX_EXIT_SOCKS5"); socksAddr != "" {
+			dialer, dErr := proxy.SOCKS5("tcp", socksAddr, nil, &net.Dialer{Timeout: 10 * time.Second})
+			if dErr != nil {
+				utils.Debugf("[EXIT KILLSWITCH] SOCKS5 dialer init failed: %v — dropping flow to prevent IP leak", dErr)
+				local.Close()
+				return
+			}
+			remote, err = dialer.Dial("tcp", dest)
+			if err != nil {
+				utils.Debugf("[EXIT KILLSWITCH] SOCKS5 dial %s via %s failed: %v — dropping flow to prevent IP leak", dest, socksAddr, err)
+				local.Close()
+				return
+			}
+		} else if os.Getenv("OPENFLUX_STRICT_PROXY") == "1" {
+			utils.Debugf("[EXIT KILLSWITCH] TCP dial %s blocked: OPENFLUX_STRICT_PROXY is active but OPENFLUX_EXIT_SOCKS5 is not configured", dest)
+			local.Close()
+			return
+		} else {
+			remote, err = net.DialTimeout("tcp", dest, 10*time.Second)
+		}
 		if err != nil {
 			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
 			local.Close()

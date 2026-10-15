@@ -33,6 +33,7 @@ var (
 	maxToken     string
 	maxUid       string
 	localIP      string
+	exitSocks5   string
 )
 
 // expandShortFlags rewrites single-letter flag aliases into their long
@@ -319,6 +320,7 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
+	flag.StringVar(&exitSocks5, "exit-socks5", "", "Exit node (l4 mode): route outgoing TCP and UDP via an upstream SOCKS5 proxy (host:port)")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
@@ -1215,6 +1217,9 @@ func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, acti
 }
 
 func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
+	if exitSocks5 != "" {
+		_ = os.Setenv("OPENFLUX_EXIT_SOCKS5", exitSocks5)
+	}
 	if exitMode == tunnel.ExitModeL3 {
 		if err := tunnel.SetLocalIP(localIP); err != nil {
 			log.Fatalf("--local-ip: %v", err)
