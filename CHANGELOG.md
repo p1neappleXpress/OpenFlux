@@ -5,6 +5,14 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stopped stripe is released.** The delivery goroutine of a stripe's reorder
+  buffer ranged over a channel nobody closed, so it outlived `Stop()` and kept the
+  buffer's ring (32768 slots) and the stripe itself: about 5 MiB per stripe for the
+  life of the process, for every cups.online stripe a session ever made. It now ends
+  with the stripe, and a full queue no longer blocks the buffer after Stop.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed

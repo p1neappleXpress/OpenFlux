@@ -194,7 +194,7 @@ func NewStripedTransportAuto(lanes []Transport, src LaneSource, maxLanes int, au
 	s := &StripedTransport{lanes: lanes, readyAt: make([]time.Time, len(lanes)), src: src,
 		maxLanes: maxLanes, scale: autoscale, done: make(chan struct{})}
 	s.snd.init()
-	s.ro = newReorderBuffer(s.deliverPiece)
+	s.ro = newReorderBuffer(s.deliverPiece, s.done)
 	if src != nil {
 		src.SetGrowHook(func() { go s.addLane("peer lane appeared") })
 	}
@@ -1343,6 +1343,7 @@ type reorderBuffer struct {
 	ring    []reorderSlot
 	count   int
 	out     chan reorderOut
+	done    <-chan struct{} // closed when the stripe stops: the delivery goroutine ends and a full out no longer blocks
 	gapNext bool
 
 	delivered, skipped, late uint64
@@ -1364,11 +1365,18 @@ type reorderOut struct {
 	gap bool
 }
 
-func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
-	r := &reorderBuffer{ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
+// newReorderBuffer delivers the in-order frames from its own goroutine until done is closed (nil: never), which
+// is the stripe's Stop: without it the goroutine, and the stripe it holds, outlived every stripe.
+func newReorderBuffer(deliver func([]byte, bool), done <-chan struct{}) *reorderBuffer {
+	r := &reorderBuffer{ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192), done: done}
 	go func() {
-		for o := range r.out {
-			deliver(o.b, o.gap)
+		for {
+			select {
+			case o := <-r.out:
+				deliver(o.b, o.gap)
+			case <-done:
+				return
+			}
 		}
 	}()
 	return r
@@ -1449,7 +1457,12 @@ func (r *reorderBuffer) drainLocked() {
 		r.count--
 		r.next++
 		r.delivered++
-		r.out <- reorderOut{b: b, gap: r.gapNext}
+		select {
+		case r.out <- reorderOut{b: b, gap: r.gapNext}:
+		case <-r.done:
+			// The stripe stopped: nobody delivers any more, and a full out must not hold the lock.
+			return
+		}
 		r.gapNext = false
 	}
 }

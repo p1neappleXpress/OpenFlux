@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/binary"
 	"math/rand"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ func TestReorderBufferOrderAndSkip(t *testing.T) {
 	defer func() { holeDeadline = old }()
 	var mu sync.Mutex
 	var got []byte
-	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() })
+	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() }, nil)
 	done := make(chan struct{})
 	defer close(done)
 	go r.run(done)
@@ -167,7 +168,7 @@ func TestStripedAckMarksLossByLaneOrder(t *testing.T) {
 	// The receiver has first, first+2 (lane 0) and first+3 (lane 1): it
 	// misses first+1 (lane 0, a later lane-0 piece arrived: lost) and
 	// first+4, first+5 (lane 1, nothing later arrived: maybe in flight).
-	r := newReorderBuffer(func([]byte, bool) {})
+	r := newReorderBuffer(func([]byte, bool) {}, nil)
 	for _, d := range []uint32{0, 2, 3} {
 		r.push(first+d, first, []byte{0})
 	}
@@ -203,7 +204,7 @@ func TestStripedAckMarksLossByLaneOrder(t *testing.T) {
 func TestReorderBufferResyncsOnRestart(t *testing.T) {
 	var mu sync.Mutex
 	var got []byte
-	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() })
+	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() }, nil)
 	r.push(1_000_000, 1_000_000, []byte{1})
 	r.push(1_000_001, 1_000_000, []byte{2})
 	r.push(5, 5, []byte{3}) // the sender restarted at a random seq
@@ -221,7 +222,7 @@ func TestReorderBufferResyncsOnRestart(t *testing.T) {
 func TestReorderBufferStartsAtSenderLow(t *testing.T) {
 	var mu sync.Mutex
 	var got []byte
-	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() })
+	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() }, nil)
 	r.push(101, 100, []byte{2}) // 100 was lost on the way
 	r.push(102, 100, []byte{3})
 	time.Sleep(20 * time.Millisecond)
@@ -268,4 +269,43 @@ func TestSenderGivesUpOnAGoneReceiver(t *testing.T) {
 	if q.low != q.seq+1 || q.gaveUp != 3 {
 		t.Fatalf("low=%d seq=%d gaveUp=%d: the stale pieces still hold the window", q.low, q.seq, q.gaveUp)
 	}
+}
+
+// A stripe made and stopped leaves nothing behind: the delivery goroutine of its reorder buffer used to wait on
+// a channel nobody closed, holding the buffer's ring (and the stripe) for the life of the process.
+func TestStoppedStripeIsReleased(t *testing.T) {
+	runtime.GC()
+	before := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		st := NewStripedTransport(nil)
+		_ = st.Stop()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > before {
+		t.Fatalf("goroutines %d -> %d after 20 stripes were made and stopped", before, got)
+	}
+}
+
+// A full out must not hold the reorder buffer's lock once the stripe has stopped.
+func TestReorderBufferDoesNotBlockAfterStop(t *testing.T) {
+	done := make(chan struct{})
+	block := make(chan struct{})
+	r := newReorderBuffer(func([]byte, bool) { <-block }, done)
+	close(done)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for i := 0; i < 3*cap(r.out); i++ {
+			r.push(uint32(i), 0, []byte{1})
+		}
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("push blocked on a full out after the stripe stopped")
+	}
+	close(block)
 }
