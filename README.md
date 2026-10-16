@@ -1,6 +1,30 @@
-# OpenFlux
+<p align="center">
+  <img src="docs/images/icon.png" width="120" alt="OpenFlux">
+</p>
 
-**English** | [Русский](README.ru.md)
+<h1 align="center">OpenFlux</h1>
+
+<p align="center">
+  A tunnel that rides on ordinary web services, with pluggable transports and two exit-node backends.
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/p1neappleXpress/OpenFlux?display_name=tag&color=4F7CFF"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
+  <img alt="Go" src="https://img.shields.io/badge/core-Go-00ADD8">
+</p>
+
+<p align="center">
+  <b>English</b> · <a href="README.ru.md">Русский</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/p1neappleXpress/OpenFlux">Core</a> · <a href="https://github.com/p1neappleXpress/OpenFluxDesktop">Desktop</a> · <a href="https://github.com/p1neappleXpress/OpenFluxAndroid">Android</a> · <a href="https://testflight.apple.com/join/BwnAcdus">iOS (TestFlight; the App Store release is coming)</a>
+</p>
+
+<p align="center">
+  <img src="docs/images/phones-3.png" alt="The OpenFlux apps on a phone" width="620">
+</p>
 
 Network stack research tool. IPv4 TCP/UDP tunnel with pluggable transports
 (including a signed JS scripting engine for writing new ones), a batched +
@@ -39,21 +63,11 @@ The original code is provided **as is**, **without any warranties**.
 | **Windows** | build from source | CLI client (SOCKS5, or `--inbound=tun` via Wintun - needs administrator) / exit node (`l4`, or `l3` via QEMU - see docs) |
 | **Desktop** | [OpenFluxDesktop releases](https://github.com/p1neappleXpress/OpenFluxDesktop) | Windows/macOS/Linux: full tunnel or SOCKS5/HTTP proxy, multi-transport sessions, encryption, an in-app node-deployment wizard over SSH |
 | **Android** | [OpenFluxAndroid releases](https://github.com/p1neappleXpress/OpenFluxAndroid) | System-wide VPN or local SOCKS5, multi-transport sessions with failover, encryption, captcha handling in a built-in browser |
-| **Android** | [OpenFlux-Android releases](https://github.com/damnurmum/OpenFlux-Android/releases/latest) | Fork: system-wide VPN or SOCKS5 proxy, multi-transport sessions, captcha handling, phone as exit node |
 | **iOS**     | [TestFlight beta](https://testflight.apple.com/join/BwnAcdus) | System-wide VPN via Network Extension |
 
 > **iOS app** built by [@saharev1](https://github.com/saharev1) - full iOS client,
 > TestFlight pipeline, system VPN support, DNS-over-TLS, and many stability fixes.
 > HUGE thanks!
->
-> **OpenFlux-Android** built by [@damnurmum](https://github.com/damnurmum) - an
-> Android client with a system-wide VPN and a local SOCKS5 proxy mode, connection
-> profiles, multi-transport sessions with failover (direct included), SmartCaptcha
-> and login handling in a WebView (the exit node's too, passed through the tunnel
-> from its address), the phone as an l4 exit node, Kill Switch and per-app and
-> per-domain routing. Also contributed end-to-end encryption (#38), the Mail.ru
-> transport (#60) and session resilience with exit captcha handling (#93) to this
-> repository. HUGE thanks!
 >
 > **OpenFluxAndroid and OpenFluxDesktop** run a Compose Multiplatform app and a
 > shared module (multi-transport sessions, encryption, the built-in browser for
@@ -65,6 +79,10 @@ The original code is provided **as is**, **without any warranties**.
 > **Android app** - [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid),
 > **desktop app** - [p1neappleXpress/OpenFluxDesktop](https://github.com/p1neappleXpress/OpenFluxDesktop),
 > the module they share - [p1neappleXpress/OpenFluxClientShared](https://github.com/p1neappleXpress/OpenFluxClientShared).
+
+<p align="center">
+  <img src="docs/images/desktop-home.png" alt="The desktop app" width="760">
+</p>
 
 ## How it works
 
