@@ -48,6 +48,7 @@ const (
 // Old batched-only or legacy-only peers therefore keep working, and
 // updated peers converge on batching.
 type CodecTransport struct {
+	gate compressGate // the batch flush loop only
 	Transport
 
 	preferred bool // true: batched
@@ -309,7 +310,7 @@ func (c *CodecTransport) flushLoop() {
 			}
 			timer.Stop()
 		}
-		c.write(encodeBatch(batch))
+		c.write(encodeBatchGated(batch, &c.gate))
 	}
 }
 

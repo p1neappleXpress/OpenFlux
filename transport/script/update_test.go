@@ -145,7 +145,12 @@ func TestCheckUpdateBlocksAndErrors(t *testing.T) {
 	if rep := check(); rep.Status != UpdateBlocked || rep.Code != CodeNeedsNewerApp {
 		t.Fatalf("api too new: %+v", rep)
 	}
-	set(IndexChannel{Version: "1.1.0", PublicKey: "00" + r.pubHex()[2:]})
+	// A key that differs from the signer's: not "00..." when the signer's own key happens to start with it (1 in 256).
+	other := "00"
+	if r.pubHex()[:2] == "00" {
+		other = "01"
+	}
+	set(IndexChannel{Version: "1.1.0", PublicKey: other + r.pubHex()[2:]})
 	if rep := check(); rep.Status != UpdateBlocked || rep.Code != CodeKeyChanged {
 		t.Fatalf("announced key change: %+v", rep)
 	}

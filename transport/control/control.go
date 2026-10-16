@@ -87,13 +87,21 @@ type ControlTail struct {
 
 // Encode serializes the envelope into a 78-byte slice.
 func (e *Envelope) Encode() ([]byte, error) {
+	return e.AppendTo(make([]byte, 0, EnvelopeSize))
+}
+
+// AppendTo serializes the envelope onto dst, so a packet can be built in a
+// single buffer: the envelope, then the payload appended after it.
+func (e *Envelope) AppendTo(dst []byte) ([]byte, error) {
 	if e.Kind != KindHello && e.Kind != KindIPv4 && e.Kind != KindControl {
 		return nil, fmt.Errorf("control: unknown kind 0x%02x", e.Kind)
 	}
 	if e.Role != RoleClient && e.Role != RoleExit {
 		return nil, fmt.Errorf("control: unknown role 0x%02x", e.Role)
 	}
-	out := make([]byte, EnvelopeSize)
+	base := len(dst)
+	dst = append(dst, make([]byte, EnvelopeSize)...)
+	out := dst[base : base+EnvelopeSize]
 	copy(out[0:4], Magic[:])
 	out[4] = byte(e.Kind)
 	out[5] = byte(e.Role)
@@ -123,7 +131,7 @@ func (e *Envelope) Encode() ([]byte, error) {
 		binary.BigEndian.PutUint16(out[72:74], e.Control.PayloadLen)
 		// 74..77 reserved zero
 	}
-	return out, nil
+	return dst, nil
 }
 
 // Decode parses a complete packet (envelope + payload) into an Envelope.

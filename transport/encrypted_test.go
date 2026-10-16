@@ -106,3 +106,49 @@ func TestEncryptedTransportRequiresStrongSecret(t *testing.T) {
 		t.Fatal("short secret was accepted")
 	}
 }
+
+func TestMasterKeyIsDerivedOncePerSecretAndContext(t *testing.T) {
+	secret := "master-key-cache-test-secret-0123456789"
+	before := scryptRuns.Load()
+	var enc []*EncryptedTransport
+	for i := 0; i < 4; i++ {
+		e, err := NewEncryptedTransport(&fakeTransport{}, secret, "cache-ctx-a", i%2 == 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		enc = append(enc, e)
+	}
+	if got := scryptRuns.Load() - before; got != 1 {
+		t.Fatalf("scrypt ran %d times for one secret and context, want 1", got)
+	}
+	if _, err := NewEncryptedTransport(&fakeTransport{}, secret, "cache-ctx-b", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := scryptRuns.Load() - before; got != 2 {
+		t.Fatalf("a new context must derive its own key: %d runs", got)
+	}
+	// Cached keys still interoperate: client seals, exit opens.
+	client := &fakeTransport{loopback: true}
+	exit := &fakeTransport{}
+	c, _ := NewEncryptedTransport(client, secret, "cache-ctx-a", false)
+	x, _ := NewEncryptedTransport(exit, secret, "cache-ctx-a", true)
+	var got []byte
+	x.Receive(func(p []byte) { got = append([]byte(nil), p...) })
+	if err := c.Send([]byte("hello through the cache")); err != nil {
+		t.Fatal(err)
+	}
+	exit.mu.Lock()
+	cb := exit.cb
+	exit.mu.Unlock()
+	client.mu.Lock()
+	wire := client.sent[0]
+	client.mu.Unlock()
+	if cb == nil {
+		t.Fatal("exit has no receive callback")
+	}
+	cb(wire)
+	if string(got) != "hello through the cache" {
+		t.Fatalf("exit read %q", got)
+	}
+	_ = enc
+}

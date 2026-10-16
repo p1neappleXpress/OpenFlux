@@ -58,6 +58,10 @@ func TestInstallOnVDS(t *testing.T) {
 	}
 	script := release("node-v1.0.1", os.Getenv("OPENFLUX_TEST_CORE_SHA"))
 	gh := newFakeReleases(t, os.Getenv("OPENFLUX_TEST_CORE_FILE"), release)
+	// GitHub's paths are this script's repository: the fork follows its own releases.
+	if m := regexp.MustCompile(`(?m)^RELEASE_REPO="([^"]+)"$`).FindSubmatch(body); m != nil {
+		gh.repo = "/" + string(m[1]) + "/"
+	}
 	gh.add("node-v1.0.1", gh.good)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/node-install.sh", func(w http.ResponseWriter, _ *http.Request) { w.Write(script) })
@@ -134,7 +138,7 @@ func TestInstallOnVDS(t *testing.T) {
 		{Type: "mailru", URL: "https://cloud.mail.ru/public/AbCd/EfGhIjKlM"},
 		{Type: "cupsonline", URL: "WyJyb29tLTEiLCJyb29tLTIiXQ"},
 	}
-	plan, err := c.Plan(Channel{ID: id, Transports: volga, AutoUpdate: true})
+	plan, err := c.Plan(Channel{ID: id, Transports: volga, AutoUpdate: true}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +151,11 @@ func TestInstallOnVDS(t *testing.T) {
 		t.Fatalf("plan actions: %s", actions)
 	}
 	key, _ := NewKey()
-	ch := Channel{ID: id, Transports: volga, Key: key, Port: plan.Port, AutoUpdate: true}
+	cookies, signedIn, err := CookieStore(os.Getenv("OPENFLUX_TEST_DOC"), "Session_id=test-login-value; spravka=pass")
+	if err != nil || !signedIn {
+		t.Fatalf("CookieStore: %v %v", signedIn, err)
+	}
+	ch := Channel{ID: id, Transports: volga, Key: key, Port: plan.Port, Cookies: cookies, AutoUpdate: true}
 
 	if err := c.Apply(ch, "wrong-password"); !errors.Is(err, ErrSudoPassword) {
 		t.Fatalf("wrong sudo password: got %v", err)
@@ -170,14 +178,74 @@ func TestInstallOnVDS(t *testing.T) {
 	if out, _, _ := c.run("ps -eo args", nil); strings.Contains(string(out), key) {
 		t.Fatal("channel key visible in the process list")
 	}
-	if _, err := c.Plan(Channel{ID: id, Transports: volga}); err == nil {
+	if out, _, _ := c.run("stat -c '%a %U' /var/lib/openflux-node/"+id+"/cookies.json", nil); strings.TrimSpace(string(out)) != "600 openflux-node" {
+		t.Fatalf("cookies.json: %q", out)
+	}
+	if out, _, _ := c.run("sudo -S -p '' cat /var/lib/openflux-node/"+id+"/cookies.json", []byte(userPass+"\n")); !strings.Contains(string(out), "test-login-value") {
+		t.Fatalf("cookies.json content: %q", out)
+	}
+	if out, _, _ := c.run("ps -eo args; sudo -S -p '' journalctl -u openflux-node@"+id+" --no-pager", []byte(userPass+"\n")); strings.Contains(string(out), "test-login-value") {
+		t.Fatal("the Yandex login leaked into ps or the node's log")
+	}
+	fresh, _, _ := CookieStore(os.Getenv("OPENFLUX_TEST_DOC"), "Session_id=renewed-login")
+	if err := c.SetCookies(id, fresh, userPass); err != nil {
+		t.Fatal(err)
+	}
+	if out, _, _ := c.run("sudo -S -p '' cat /var/lib/openflux-node/"+id+"/cookies.json", []byte(userPass+"\n")); !strings.Contains(string(out), "renewed-login") {
+		t.Fatalf("set-cookies did not replace the login: %q", out)
+	}
+	// The running channel's documents: read them, change them, and the key,
+	// port, sign-in and encryption context stay.
+	rootRead := func(path string) string {
+		out, _, _ := c.run("sudo -S -p '' cat "+path, []byte(userPass+"\n"))
+		return strings.TrimSpace(string(out))
+	}
+	info, err := c.Show(id, userPass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Channel != id || info.State != "active" || info.Port != plan.Port || info.Context != os.Getenv("OPENFLUX_TEST_DOC") ||
+		len(info.Transports) != 3 || info.Transports[0].Type != "vyandex" {
+		t.Fatalf("show: %+v", info)
+	}
+	keyBefore := rootRead("/etc/openflux-node/" + id + "/encryption-key")
+	board := "https://boards.yandex.ru/whiteboard/?hash=0123456789abcdef0123456789abcdef"
+	// The first document (the context's source) goes, a board comes.
+	if err := c.SetTransports(id, []ChannelTransport{volga[1], {Type: "boards", URL: board}}, "", userPass); err != nil {
+		t.Fatal(err)
+	}
+	info, err = c.Show(id, userPass)
+	if err != nil || info.State != "active" || info.Port != plan.Port || info.Context != os.Getenv("OPENFLUX_TEST_DOC") ||
+		len(info.Transports) != 2 || info.Transports[0] != volga[1] || info.Transports[1] != (ChannelTransport{Type: "boards", URL: board}) {
+		t.Fatalf("show after set-transports: %+v %v", info, err)
+	}
+	if rootRead("/etc/openflux-node/"+id+"/encryption-key") != keyBefore {
+		t.Fatal("set-transports changed the channel key")
+	}
+	if !strings.Contains(rootRead("/var/lib/openflux-node/"+id+"/cookies.json"), "renewed-login") {
+		t.Fatal("set-transports dropped the Yandex sign-in")
+	}
+	if out, _, _ := c.run("ls /etc/openflux-node/"+id+"/ 2>/dev/null | grep -c prev", nil); strings.TrimSpace(string(out)) != "0" {
+		t.Fatalf("the previous node.conf was left behind: %s", out)
+	}
+	if err := c.SetTransports(id, nil, "", userPass); err == nil {
+		t.Fatal("a channel without documents must be refused")
+	}
+	if err := c.SetTransports(id, volga, "", userPass); err != nil { // back, for the rest of the test
+		t.Fatal(err)
+	}
+	if info, err = c.Show(id, userPass); err != nil || len(info.Transports) != 3 || info.State != "active" {
+		t.Fatalf("show after the documents came back: %+v %v", info, err)
+	}
+
+	if _, err := c.Plan(Channel{ID: id, Transports: volga}, true); err == nil {
 		t.Fatal("planning an existing channel must fail")
 	}
-	again, err := c.Plan(Channel{ID: "other", Port: plan.Port})
+	again, err := c.Plan(Channel{ID: "other", Port: plan.Port}, false)
 	if err == nil {
 		t.Fatalf("the channel's port must count as taken: %+v", again)
 	}
-	next, err := c.Plan(Channel{ID: "other"})
+	next, err := c.Plan(Channel{ID: "other"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +313,7 @@ func TestInstallOnVDS(t *testing.T) {
 		t.Fatalf("autoupdate on: %s", out)
 	}
 	// An app with an older pinned script must not take the server back.
-	older, err := c.Plan(Channel{ID: "other"})
+	older, err := c.Plan(Channel{ID: "other"}, false)
 	if err != nil || older.Core != "node-v1.1.0" {
 		t.Fatalf("plan after an update: %+v %v", older, err)
 	}
@@ -255,7 +323,7 @@ func TestInstallOnVDS(t *testing.T) {
 	if err := c.FetchScript(Script{URL: base + "/other-install.sh", SHA256: ScriptHash(otherRepo)}); err != nil {
 		t.Fatal(err)
 	}
-	switched, err := c.Plan(Channel{ID: "other"})
+	switched, err := c.Plan(Channel{ID: "other"}, false)
 	if err != nil || switched.Core != "node-v1.0.1" || !strings.Contains(strings.Join(switched.Actions, "\n"), "someone/OpenFlux") {
 		t.Fatalf("plan from another repository: %+v %v", switched, err)
 	}
@@ -276,7 +344,7 @@ func TestInstallOnVDS(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"first", "second"} {
-		p, err := c.Plan(Channel{ID: name, AutoUpdate: true})
+		p, err := c.Plan(Channel{ID: name, AutoUpdate: true}, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -324,6 +392,8 @@ type fakeReleases struct {
 	cores     map[string][]byte
 	pre       map[string]bool
 	order     []string
+	// repo is the repository's path ("/owner/OpenFlux/") the script asks for.
+	repo string
 }
 
 func newFakeReleases(t *testing.T, coreFile string, script func(version, core string) []byte) *fakeReleases {
@@ -356,7 +426,10 @@ func (f *fakeReleases) prerelease(tag string, core []byte) {
 func (f *fakeReleases) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	const repo = "/p1neappleXpress/OpenFlux/"
+	repo := f.repo
+	if repo == "" {
+		repo = "/p1neappleXpress/OpenFlux/"
+	}
 	p := r.URL.Path
 	switch {
 	case p == "/repos"+repo+"releases":

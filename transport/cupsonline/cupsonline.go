@@ -3,16 +3,18 @@ package cupsonline
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,11 +75,28 @@ type CupsonlineConfig struct {
 	MaxCursors      int
 	BatchTimeout    time.Duration
 
-	// SendInterval is the least time between two messages on one channel.
-	// cups.online throttles inbound, and firing messages back to back stalls
-	// the write and drops the connection, so the transport paces itself below
-	// that. Four channels each send at this rate.
+	// SendInterval is the least time between two messages on one channel: a
+	// floor against micro-bursts, not the main throttle. On the striped wire
+	// the pace is set by SendWindow (ack feedback), so this only keeps two
+	// messages from leaving the same instant.
 	SendInterval time.Duration
+	// StreamResyncAfter gives up a packet whose rest has not come for this
+	// long: a message of the sender's batch was lost, and the stream would
+	// stay out of sync. 0 waits forever.
+	StreamResyncAfter time.Duration
+
+	// SendWindow is how many cursor RPCs a striped lane keeps in flight
+	// before it waits for a reply. cups.online relays a room only so fast
+	// (benchmarked ~130-200 KB/s delivered per room, the shard decides);
+	// firing faster than that is dropped silently from the relay fan-out, so
+	// a lane with no feedback wastes most of what it sends (measured 71% loss
+	// at the old 12 ms cadence) and the stripe then spends retransmissions on
+	// the drops and stalls the tunnel's TCP head-of-line. Bounding the RPCs in
+	// flight makes a slow room (or a slow uplink) push back instead: the lane
+	// sends again only once the server has answered, so it self-paces to each
+	// room's true rate with no relay loss. 3 was the knee in the live sweep
+	// (2 underran, 4 began to overrun); 0 turns the gate off.
+	SendWindow int
 
 	SendQueueSize int
 
@@ -93,6 +112,8 @@ type CupsonlineConfig struct {
 	RoomCreatePause time.Duration
 
 	StatsInterval time.Duration
+	// Network the rooms' sockets dial through (TransportConfig.Network).
+	Network string
 }
 
 func DefaultCupsonlineConfig() CupsonlineConfig {
@@ -113,15 +134,21 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 
 		BatchMaxPackets: 256,
 		BatchMaxBytes:   22000,
-		// 8192 байт данных → 2 байта заголовка → ~684 курсора → провод ~34 KB;
-		// проверено: сервер принимает без ошибок.
-		MaxMessageData: 8192,
-		MaxCursors:     1000,
-		BatchTimeout:   2 * time.Millisecond,
-		// 12ms (~83 msg/s per channel) — calibrated by bench_tune.py:
-		// 8192B@12ms = 447 KB/s per lane (2.8× vs old 4096@18ms=159 KB/s);
-		// 10ms triggers 403.
+		// 12288 bytes of data → ~2050 cursor integers → ~38 KB on the wire;
+		// the live relay bench delivers 0% loss up to here, ~200 KB/s per
+		// room (vs 134 at 8192), while 16000 trips the server's 1009
+		// "message too big". The far side reassembles by the length prefix,
+		// so a peer that still chunks at 8192 interops.
+		MaxMessageData: 12288,
+		// 12288 data bytes pack into ~1025 cursor integers; the live server
+		// takes well over 2000 in one message, so this headroom is safe.
+		MaxCursors:   1100,
+		BatchTimeout: 2 * time.Millisecond,
 		SendInterval: 12 * time.Millisecond,
+		SendWindow:   3,
+		// The old (unstriped) wire: a batch arrives as a burst of messages
+		// SendInterval apart, well under a second even for the largest packet.
+		StreamResyncAfter: 2 * time.Second,
 
 		// В очереди кадры кодека (до ~8 KB), а не IP-пакеты: очередь длиннее
 		// — это уже не буфер, а секунды задержки.
@@ -136,7 +163,7 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		// помещается и режется на сообщения при отправке.
 		MaxPayloadBytes: 65535,
 
-		NumRooms:        4,
+		NumRooms:        8,
 		RoomCreatePause: 500 * time.Millisecond,
 
 		StatsInterval: 5 * time.Second,
@@ -381,24 +408,31 @@ func fmtUptime(d time.Duration) string {
 // parseRoomList pulls room uuids out of --url: the packed base64 list the
 // exit node prints, bare or as ?rooms=, or a single ?room=.
 func parseRoomList(rawURL string) []string {
+	ids, _ := parseRooms(rawURL)
+	return ids
+}
+
+// parseRooms is parseRoomList plus whether the list is in the striped format
+// (transport.PackRooms): a single ?room= (a phpbox exit) never is.
+func parseRooms(rawURL string) ([]string, bool) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
-		return nil
+		return nil, false
 	}
 	if u, err := url.Parse(rawURL); err == nil {
 		q := u.Query()
 		if packed := q.Get("rooms"); packed != "" {
-			if ids, err := unpackRooms(packed); err == nil {
-				return ids
+			if ids, striped, err := transport.UnpackRooms(packed); err == nil {
+				return ids, striped
 			}
 		} else if single := q.Get("room"); single != "" {
-			return []string{single}
+			return []string{single}, false
 		}
 	}
-	if ids, err := unpackRooms(rawURL); err == nil {
-		return ids
+	if ids, striped, err := transport.UnpackRooms(rawURL); err == nil {
+		return ids, striped
 	}
-	return nil
+	return nil, false
 }
 
 func createRooms(ctx context.Context, baseURL string, n int, pause time.Duration) ([]*cupsAuth, error) {
@@ -466,7 +500,7 @@ func CreateRoomList(ctx context.Context) (string, error) {
 	for i, a := range auths {
 		ids[i] = a.roomUUID
 	}
-	return packRooms(ids), nil
+	return transport.PackRooms(ids, stripeNewRooms()), nil
 }
 
 // CreateRoom creates one room and returns its uuid: what a phpbox exit, which
@@ -486,22 +520,23 @@ func CreateRoom(ctx context.Context) (string, error) {
 	return auths[0].roomUUID, nil
 }
 
-func packRooms(ids []string) string {
-	raw, _ := json.Marshal(ids)
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
+// packRooms packs a list in the old, unstriped format.
+func packRooms(ids []string) string { return transport.PackRooms(ids, false) }
 
 func unpackRooms(s string) ([]string, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return nil, fmt.Errorf("base64 decode: %w", err)
-	}
-	var ids []string
-	if err := json.Unmarshal(raw, &ids); err != nil {
-		return nil, fmt.Errorf("json decode: %w", err)
-	}
-	return ids, nil
+	ids, _, err := transport.UnpackRooms(s)
+	return ids, err
 }
+
+func envInt(name string) int {
+	n, _ := strconv.Atoi(os.Getenv(name))
+	return n
+}
+
+// stripeNewRooms: rooms an exit or the wizard creates now get the striped
+// list, unless CUPS_STRIPE=0 asks for the old wire (for peers older than
+// 0.7.1).
+func stripeNewRooms() bool { return os.Getenv("CUPS_STRIPE") != "0" }
 
 // sleepCtx waits for d, or less if ctx ends first; it reports whether the
 // whole wait went by.
@@ -529,6 +564,7 @@ type channelStats struct {
 	batchesRecv atomic.Uint64
 	reconnects  atomic.Uint64
 	dropped     atomic.Uint64
+	rpcErrors   atomic.Uint64 // the server turned a message down
 }
 
 // ---- WS ----
@@ -568,8 +604,26 @@ type cupsWS struct {
 	// Touched only by the read goroutine, and reset on every reconnect - a
 	// packet split across a drop is lost, like on any link.
 	recvBufs map[string][]byte
+	// recvSince is when each member's pending part of a packet began.
+	recvSince map[string]time.Time
 
 	sendQueue chan []byte
+
+	// pull, when set, makes this room a stripe lane: sendLoop takes pieces
+	// from the stripe instead of sendQueue (see pullLoop). wake says the
+	// stripe has something for it, or that an in-flight RPC was answered.
+	pull atomic.Pointer[func(max int) [][]byte]
+	wake chan struct{}
+	// inflight counts cursor RPCs sent on this socket and not yet answered;
+	// dataIDs are their command ids. The puller waits while inflight reaches
+	// the window (see pullLoop); a reply decrements it (see handleReply).
+	// Both are reset with the socket.
+	window   int
+	inflight atomic.Int64
+	dataIDs  sync.Map
+	// framed: on the striped wire every message carries whole packets only
+	// (see pullLoop), so it is read on its own, without a stream buffer.
+	framed bool
 
 	stats *channelStats
 }
@@ -729,8 +783,12 @@ func (w *cupsWS) connectAndServe() error {
 		header.Add("Cookie", c.Name+"="+c.Value)
 	}
 
+	dial := netbind.DialContextFor(w.config.Network)
+	if w.framed {
+		dial = dialLane(dial)
+	}
 	dialer := websocket.Dialer{
-		NetDialContext:   netbind.DialContext,
+		NetDialContext:   dial,
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
 		ReadBufferSize:   w.config.ReadBufferSize,
 		WriteBufferSize:  w.config.WriteBufferSize,
@@ -756,6 +814,12 @@ func (w *cupsWS) connectAndServe() error {
 	conn.SetReadLimit(int64(w.config.MaxMessageBytes))
 	// Fresh socket, fresh stream: drop any half-assembled packet from before.
 	w.recvBufs = nil
+	w.recvSince = nil
+	// The replies to RPCs sent on the old socket will never come; start the
+	// in-flight count and its ids clean so the puller isn't stuck at the
+	// window forever.
+	w.inflight.Store(0)
+	w.dataIDs.Range(func(k, _ any) bool { w.dataIDs.Delete(k); return true })
 
 	if err := w.writeJSON(map[string]interface{}{
 		"id": 1, "connect": map[string]interface{}{"token": a.connToken, "name": "js"},
@@ -775,6 +839,10 @@ func (w *cupsWS) connectAndServe() error {
 	}
 	w.connected.Store(true)
 	w.markAlive()
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
 	utils.Debugf("[CUPS] WS ready: %s", a.roomUUID)
 
 	kaStop := make(chan struct{})
@@ -813,6 +881,10 @@ func (w *cupsWS) keepAliveLoop(stop chan struct{}) {
 }
 
 func (w *cupsWS) sendLoop() {
+	if src := w.pull.Load(); src != nil {
+		w.pullLoop(*src)
+		return
+	}
 	batch := make([][]byte, 0, w.config.BatchMaxPackets)
 	totalBytes := 0
 	timer := time.NewTimer(w.config.BatchTimeout)
@@ -892,6 +964,141 @@ func (w *cupsWS) sendBatch(batch [][]byte) error {
 	return nil
 }
 
+// cupsNow is the receive clock; tests move it.
+var cupsNow = time.Now
+
+// pullLoop is sendLoop for a stripe lane. Right before each message may leave
+// (SendInterval after the last one) it takes from the stripe as many pieces
+// as fit in one message, so what the room cannot carry yet waits in the
+// stripe's queue, where CoDel sees it, and a piece's send time is when it
+// really leaves - the stripe's loss detection and round trip go by it.
+//
+// Every message carries whole pieces only ([len u16][piece]...): the server
+// may turn a message down or lose it when a room sends near its limit, and a
+// piece cut across two messages would then throw the far side's reading of
+// the rest of the stream out of step. This way a lost message costs exactly
+// its pieces, which the stripe resends. A piece is at most one message
+// (stripePieceBytes), so the one that does not fit opens the next message.
+func (w *cupsWS) pullLoop(src func(max int) [][]byte) {
+	var hdr [2]byte
+	var next []byte // a pulled piece that did not fit the last message
+	buf := make([]byte, 0, w.config.MaxMessageData)
+	idle := time.NewTimer(time.Hour)
+	defer idle.Stop()
+	add := func(p []byte) bool {
+		if len(buf)+2+len(p) > w.config.MaxMessageData {
+			return false
+		}
+		binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+		buf = append(buf, hdr[:]...)
+		buf = append(buf, p...)
+		w.stats.packetsSent.Add(1)
+		w.stats.bytesSent.Add(uint64(len(p)))
+		return true
+	}
+	for w.ctx.Err() == nil {
+		if !w.connected.Load() {
+			if !sleepCtx(w.ctx, 50*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		// Ack gate: wait while this room already has its window of RPCs
+		// unanswered, so a slow room (or uplink) holds the data in the
+		// stripe's queue instead of flooding the server with messages it
+		// drops from the relay. A reply (or the stripe) sends to wake.
+		for w.window > 0 && w.inflight.Load() >= int64(w.window) && w.connected.Load() {
+			idle.Reset(lanePollIdle)
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.wake:
+			case <-idle.C:
+			}
+			idle.Stop()
+		}
+		if !w.connected.Load() {
+			continue
+		}
+		if d := w.config.SendInterval - time.Since(w.lastSend); d > 0 {
+			if !sleepCtx(w.ctx, d) {
+				return
+			}
+		}
+		buf = buf[:0]
+		if next != nil && add(next) {
+			next = nil
+		}
+		for next == nil {
+			pieces := src(1)
+			if len(pieces) == 0 {
+				break
+			}
+			for _, p := range pieces {
+				if next != nil || !add(p) {
+					next = p
+				}
+			}
+		}
+		if len(buf) == 0 {
+			if next != nil {
+				// Bigger than a message: the stripe never cuts one so big.
+				w.stats.dropped.Add(1)
+				next = nil
+				continue
+			}
+			idle.Reset(lanePollIdle)
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.wake:
+			case <-idle.C:
+			}
+			idle.Stop()
+			continue
+		}
+		w.lastSend = time.Now()
+		id := w.nextID()
+		w.dataIDs.Store(id, struct{}{})
+		w.inflight.Add(1)
+		if err := w.sendChunkID(buf, id); err != nil {
+			w.dataIDs.Delete(id)
+			w.inflight.Add(-1)
+			w.stats.dropped.Add(1)
+			utils.Debugf("[CUPS] lane send (%s): %v", w.roomUUID, err)
+			continue
+		}
+		w.stats.batchesSent.Add(1)
+	}
+}
+
+// laneSendBuffer caps the kernel's send buffer on a stripe lane's socket, to
+// about two messages (a full one is ~25 KB of cursor JSON). The server takes
+// a room's messages only so fast; with the default buffer hundreds of KB sat
+// in the socket, the stripe saw round trips of seconds, resent on timeout
+// what was only queued, and the resends queued too. Small, the write blocks
+// instead, the lane's clock slows to what the server takes, and the backlog
+// stays in the stripe's queue where CoDel manages it.
+const laneSendBuffer = 64 << 10
+
+// dialLane is dial with laneSendBuffer on the socket.
+func dialLane(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetWriteBuffer(laneSendBuffer)
+		}
+		return c, nil
+	}
+}
+
+// lanePollIdle is how long an idle stripe lane sleeps before it asks the
+// stripe again without being woken (acks and resends wake it too).
+const lanePollIdle = 50 * time.Millisecond
+
 // pace waits out the rest of SendInterval since the last message, so the
 // channel never floods the server. Returns errStopped if the transport is
 // stopped while waiting.
@@ -912,6 +1119,12 @@ func (w *cupsWS) pace() error {
 // packed into cursor integers. The length lets the peer strip the zero
 // padding exactly before stitching the byte stream back.
 func (w *cupsWS) sendChunk(chunk []byte) error {
+	return w.sendChunkID(chunk, w.nextID())
+}
+
+// sendChunkID is sendChunk with the command id chosen by the caller, so the
+// striped puller can track the id it just put in flight.
+func (w *cupsWS) sendChunkID(chunk []byte, id int64) error {
 	payload := make([]byte, 2+len(chunk))
 	binary.BigEndian.PutUint16(payload[:2], uint16(len(chunk)))
 	copy(payload[2:], chunk)
@@ -926,7 +1139,7 @@ func (w *cupsWS) sendChunk(chunk []byte) error {
 				"user":    w.auth().userUUID,
 			},
 		},
-		"id": w.nextID(),
+		"id": id,
 	}
 	return w.writeJSON(msg)
 }
@@ -1013,6 +1226,28 @@ func (w *cupsWS) handleReply(raw []byte) {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return
 	}
+	// A reply to one of our cursor RPCs (ok or error) frees a slot in the
+	// ack gate and wakes the puller. Keepalive and handshake replies carry
+	// ids too but are not in dataIDs, so they're left alone.
+	if idf, ok := obj["id"].(float64); ok {
+		if _, had := w.dataIDs.LoadAndDelete(int64(idf)); had {
+			if w.inflight.Add(-1) < 0 {
+				w.inflight.Store(0)
+			}
+			select {
+			case w.wake <- struct{}{}:
+			default:
+			}
+		}
+	}
+	if e, ok := obj["error"]; ok {
+		// A message of ours the server would not take (it never reached the
+		// peer): the stripe resends its pieces; worth seeing when it happens.
+		if n := w.stats.rpcErrors.Add(1); n == 1 || n%100 == 0 {
+			utils.Debugf("[CUPS] room %s turned down a message (%d so far): %v", shortRoom(w.roomUUID), n, e)
+		}
+		return
+	}
 	push, ok := obj["push"].(map[string]interface{})
 	if !ok {
 		return
@@ -1062,11 +1297,30 @@ func (w *cupsWS) handleReply(raw []byte) {
 		return
 	}
 	chunk := decoded[2 : 2+dataLen]
+	if w.framed {
+		w.readWhole(chunk)
+		return
+	}
 
 	// Append to the running stream and pull out whole packets; a packet split
 	// across messages completes once the rest of it arrives.
 	if w.recvBufs == nil {
 		w.recvBufs = make(map[string][]byte)
+		w.recvSince = make(map[string]time.Time)
+	}
+	now := cupsNow()
+	// A packet whose rest never came (a message of the sender's batch was
+	// lost) would hold the stream out of sync until some length happened to
+	// line it up again, and everything the sender sent meanwhile was lost.
+	// A batch comes as a burst of messages a pacing interval apart, so a part
+	// still waiting after StreamResyncAfter is given up and this message
+	// starts the stream afresh: the first message of every batch begins at a
+	// packet boundary.
+	pending := len(w.recvBufs[sender]) > 0
+	if pending && w.config.StreamResyncAfter > 0 && now.Sub(w.recvSince[sender]) > w.config.StreamResyncAfter {
+		utils.Debugf("[CUPS] recv %s: %d bytes of a packet never completed, starting the stream afresh", w.roomUUID, len(w.recvBufs[sender]))
+		delete(w.recvBufs, sender)
+		pending = false
 	}
 	buf := append(w.recvBufs[sender], chunk...)
 	adv, count, total := 0, 0, 0
@@ -1095,12 +1349,41 @@ func (w *cupsWS) handleReply(raw []byte) {
 	switch {
 	case len(rest) == 0:
 		delete(w.recvBufs, sender)
+		delete(w.recvSince, sender)
 	case len(rest) > w.config.MaxPayloadBytes+w.config.MaxMessageData:
 		// A stream that never yields a packet must not grow without bound.
 		utils.Debugf("[CUPS] recv stream out of sync (%s), resetting", w.roomUUID)
 		delete(w.recvBufs, sender)
+		delete(w.recvSince, sender)
 	default:
 		w.recvBufs[sender] = rest
+		// A new part of a packet starts its clock; the rest of the same one keeps it.
+		if !pending || count > 0 {
+			w.recvSince[sender] = now
+		}
+	}
+	if count > 0 {
+		w.stats.packetsRecv.Add(uint64(count))
+		w.stats.bytesRecv.Add(uint64(total))
+		w.stats.batchesRecv.Add(1)
+	}
+}
+
+// readWhole hands on the packets of one message on the striped wire, where a
+// message holds whole packets only (pullLoop).
+func (w *cupsWS) readWhole(chunk []byte) {
+	count, total := 0, 0
+	for len(chunk) >= 2 {
+		ln := int(binary.BigEndian.Uint16(chunk))
+		if ln == 0 || 2+ln > len(chunk) {
+			break
+		}
+		if w.onData != nil {
+			w.onData(chunk[2 : 2+ln])
+		}
+		chunk = chunk[2+ln:]
+		count++
+		total += ln
 	}
 	if count > 0 {
 		w.stats.packetsRecv.Add(uint64(count))
@@ -1130,6 +1413,10 @@ type CupsonlineTransport struct {
 	config    CupsonlineConfig
 	isClient  bool
 	clientErr error
+	// striped: the rooms are the lanes of a stripe (the list says so, or an
+	// exit creates new rooms); otherwise frames go round-robin, the old wire.
+	striped bool
+	stripe  atomic.Pointer[transport.StripedTransport]
 
 	// roomList is the packed list of the rooms this transport keeps
 	// channels to, as clients need it in --url; "" until Start got them.
@@ -1148,6 +1435,10 @@ type CupsonlineTransport struct {
 	statsStart time.Time
 }
 
+// IsClient reports whether the transport joins an exit's rooms rather than
+// creating its own.
+func (t *CupsonlineTransport) IsClient() bool { return t.isClient }
+
 func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClient bool) *CupsonlineTransport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &CupsonlineTransport{
@@ -1159,11 +1450,35 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 		statsStart:    time.Now(),
 	}
 
+	t.config.Network = cfg.Network
 	t.baseURL = baseRoomURL
+	// Measuring knobs: CUPS_SEND_MS (SendInterval), CUPS_MSG_BYTES
+	// (MaxMessageData, at most 12288: the stripe's pieces are cut for it).
+	if ms := envInt("CUPS_SEND_MS"); ms > 0 {
+		t.config.SendInterval = time.Duration(ms) * time.Millisecond
+	}
+	if n := envInt("CUPS_MSG_BYTES"); n >= 2048 && n <= 12288 {
+		t.config.MaxMessageData = n
+	}
+	// CUPS_WINDOW overrides the ack gate's depth (0 turns it off).
+	if s := os.Getenv("CUPS_WINDOW"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+			t.config.SendWindow = n
+		}
+	}
+	// CUPS_ROOMS sets how many rooms a fresh exit creates (= stripe lanes).
+	// Each room relays ~130-200 KB/s, so throughput scales with rooms; the
+	// client follows whatever list the exit prints.
+	if n := envInt("CUPS_ROOMS"); n > 0 && n <= transport.MaxLanes() {
+		t.config.NumRooms = n
+	}
 	// Both roles accept a room list: the client always needs one, and an
 	// exit node given one re-joins those rooms instead of creating new
 	// ones, so a restart doesn't hand the phone a new string every time.
-	t.roomIDs = parseRoomList(rawURL)
+	t.roomIDs, t.striped = parseRooms(rawURL)
+	if len(t.roomIDs) == 0 && !isClient {
+		t.striped = stripeNewRooms()
+	}
 	if isClient && len(t.roomIDs) == 0 {
 		t.clientErr = fmt.Errorf("client mode: --url must contain base64 room list")
 	}
@@ -1205,6 +1520,9 @@ func (t *CupsonlineTransport) Start() error {
 			config:      t.config,
 			ctx:         t.ctx,
 			sendQueue:   make(chan []byte, t.config.SendQueueSize),
+			wake:        make(chan struct{}, 1),
+			window:      t.config.SendWindow,
+			framed:      t.striped,
 			stats:       &channelStats{idx: i, roomUUID: s.id},
 		}
 		// Command ids 1 and 2 are connect and subscribe.
@@ -1219,12 +1537,19 @@ func (t *CupsonlineTransport) Start() error {
 		wss[i] = ws
 	}
 	t.wss = wss
+	if t.striped {
+		// Wires every room in as a lane (sets each one's pull) before the
+		// send loops start, so they come up pulling.
+		if err := t.startStripe(); err != nil {
+			return err
+		}
+	}
 	for _, ws := range wss {
 		go ws.run()
 		go ws.sendLoop()
 	}
 
-	utils.Debugf("[CUPS] transport started: %d channels", len(t.wss))
+	utils.Debugf("[CUPS] transport started: %d channels, striped=%v", len(t.wss), t.striped)
 	t.SetConnected(true)
 
 	go t.statsLoop()
@@ -1282,7 +1607,7 @@ func (t *CupsonlineTransport) enterRooms() ([]roomSlot, error) {
 		ids[i] = a.roomUUID
 	}
 	fmt.Printf("\n=== COPY THIS TO CLIENT ===\n")
-	fmt.Printf("%s\n", packRooms(ids))
+	fmt.Printf("%s\n", transport.PackRooms(ids, t.striped))
 	fmt.Printf("===========================\n")
 	fmt.Printf("Save it and pass it back as --url to reuse these rooms after a restart.\n\n")
 	t.setRoomList(ids)
@@ -1307,7 +1632,7 @@ func (t *CupsonlineTransport) OnRoomList(f func(packed string)) {
 }
 
 func (t *CupsonlineTransport) setRoomList(ids []string) {
-	packed := packRooms(ids)
+	packed := transport.PackRooms(ids, t.striped)
 	t.roomsMu.Lock()
 	changed := packed != t.roomList
 	t.roomList = packed
@@ -1345,6 +1670,9 @@ func (t *CupsonlineTransport) joinListed() []roomSlot {
 func (t *CupsonlineTransport) Stop() error {
 	t.cancel()
 	t.SetConnected(false)
+	if st := t.stripe.Load(); st != nil {
+		_ = st.Stop()
+	}
 	return t.BaseTransport.Stop()
 }
 
@@ -1358,6 +1686,9 @@ func (t *CupsonlineTransport) Stop() error {
 func (t *CupsonlineTransport) Send(data []byte) error {
 	if len(data) > t.config.MaxPayloadBytes {
 		return fmt.Errorf("cups: посылка %d байт больше предела %d", len(data), t.config.MaxPayloadBytes)
+	}
+	if st := t.stripe.Load(); st != nil {
+		return st.Send(data)
 	}
 	ws := t.pickRoom()
 	if ws == nil {
@@ -1443,6 +1774,8 @@ func (t *CupsonlineTransport) statsLoop() {
 	defer tick.Stop()
 
 	lastSent := make([]uint64, len(t.wss))
+
+	lastMsgs := make([]uint64, len(t.wss))
 	lastRecv := make([]uint64, len(t.wss))
 	lastBytesSent := make([]uint64, len(t.wss))
 	lastBytesRecv := make([]uint64, len(t.wss))
@@ -1475,8 +1808,16 @@ func (t *CupsonlineTransport) statsLoop() {
 				totalBytesSent += bs
 				totalBytesRecv += br
 
-				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  drop=%d  reconn=%d  conn=%v",
+				msgs := ws.stats.batchesSent.Load()
+				dM := msgs - lastMsgs[i]
+				lastMsgs[i] = msgs
+				avgMsg := 0.0
+				if dM > 0 {
+					avgMsg = float64(dBS) / float64(dM)
+				}
+				utils.Debugf("[CH-%02d %s] msgs=%.1f/s avg=%.0fB inflight=%d  tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  drop=%d  reconn=%d  conn=%v",
 					i, shortRoom(ws.roomUUID),
+					float64(dM)/t.config.StatsInterval.Seconds(), avgMsg, ws.inflight.Load(),
 					dS/uint64(t.config.StatsInterval.Seconds()),
 					float64(dBS)/t.config.StatsInterval.Seconds()/1024,
 					dR/uint64(t.config.StatsInterval.Seconds()),
@@ -1584,3 +1925,14 @@ func (t *CupsonlineTransport) ApplyCookies(values map[string]string) error {
 	}
 	return nil
 }
+
+// SetNumRooms sets how many rooms (avito: room pairs) an exit with no --url
+// creates, before Start. A group of carriers gives each lane one.
+func (t *CupsonlineTransport) SetNumRooms(n int) {
+	if n > 0 {
+		t.config.NumRooms = n
+	}
+}
+
+// StripeOptions are the settings for a stripe over this carrier's rooms.
+func StripeOptions() transport.StripeOptions { return stripeOptions }

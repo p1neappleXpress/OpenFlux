@@ -133,7 +133,7 @@ func NodeConfig(name, documentURL, key, dial string) Config {
 		Context:   documentURL,
 		Transports: []Transport{
 			{Type: "vyandex", URL: documentURL, Priority: 100},
-			{Type: "direct", Dial: dial, Priority: 50},
+			{Type: "direct", Dial: dial, Priority: 110},
 		},
 	}
 }

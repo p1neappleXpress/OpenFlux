@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -63,9 +64,16 @@ type TCPTunnel struct {
 	startTime   time.Time
 	packetCount atomic.Uint64
 	stopOnce    sync.Once
+	cc          string // the congestion control new connections use
+	ptbMu       sync.Mutex
+	ptbLast     map[[12]byte]time.Time // the last ICMP fragmentation-needed per flow
 	stopCh      chan struct{}
 	udpFlows    atomic.Int32
+	err         error
 }
+
+// Err reports why the tunnel could not be set up, or nil.
+func (t *TCPTunnel) Err() error { return t.err }
 
 var (
 	TCPBufMin     = 4 * 1024 * 1024
@@ -139,12 +147,20 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 
 	TuneTCP(t.gvisorStack)
 
-	tunnelEP := NewTunnelLinkEndpoint()
-	if n, ok := trans.(transport.PeerParameterProvider); ok {
-		if p, ready := n.PeerParameters(); ready {
-			tunnelEP.SetMTU(uint32(min(1500, p.MaxPacketSize)))
-		}
+	// Detect loss only by duplicate ACKs and the RTO, without RACK-TLP. The
+	// document relay delivers every message in order but sometimes holds them
+	// for hundreds of milliseconds; RACK-TLP takes each hold for a loss and
+	// halves the window, and gVisor never undoes that, which kept uploads
+	// through the tunnel at ~100 KB/s.
+	recovery := tcpip.TCPRecovery(0)
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		utils.Debugf("[TUNNEL] disable RACK-TLP: %v", err)
 	}
+
+	t.cc = wantedCC(trans)
+	setCC(t.gvisorStack, t.cc)
+	tunnelEP := NewTunnelLinkEndpoint()
+	tunnelEP.SetMTU(uint32(tunnelMTU(trans)))
 	// "->" points towards the internet and "<-" back towards the device on
 	// both sides, as in the L3 and utun logs, so one flow reads the same in
 	// the client's and the exit's log.
@@ -156,13 +172,34 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 		network.LogPacket("TUNNEL", toPeer, data)
 		if err := trans.Send(data); err != nil {
 			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
+			t.refused(err, data)
+		}
+	}
+	if fs, ok := trans.(transport.FillSender); ok {
+		tunnelEP.onOutgoingFill = func(size int, fill func(dst []byte)) {
+			if utils.Level() >= utils.LevelPackets {
+				// Packet logging wants the bytes: take the plain path.
+				buf := make([]byte, size)
+				fill(buf)
+				tunnelEP.onOutgoingPacket(buf)
+				return
+			}
+			var written []byte
+			if err := fs.SendFill(size, func(dst []byte) { fill(dst); written = dst }); err != nil {
+				utils.Debugf("[TUNNEL] trans.SendFill error: %v", err)
+				t.refused(err, written)
+			}
 		}
 	}
 	t.tunnelEP = tunnelEP
 
 	tunnelNIC := tcpip.NICID(1)
 	if err := t.gvisorStack.CreateNIC(tunnelNIC, tunnelEP); err != nil {
-		utils.Debugf("[TUNNEL] CreateNIC tunnel error: %v", err)
+		// Without the NIC nothing is forwarded; Err reports it so an exit
+		// does not stay up looking healthy.
+		t.err = fmt.Errorf("tunnel: create NIC: %v", err)
+		utils.Infof("[TUNNEL] %v", t.err)
+		return t
 	}
 
 	if isExitNode {
@@ -177,6 +214,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	})
 
 	utils.SafeGo("tunnel.printStats", t.printStats)
+	utils.SafeGo("tunnel.watchMTU", func() { t.watchMTU(trans) })
 	return t
 }
 
@@ -214,6 +252,7 @@ func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 	local := gonet.NewUDPConn(&wq, ep)
+	noteUDPBypassesUpstream()
 	remote, err := net.DialTimeout("udp", dest, 10*time.Second)
 	if err != nil {
 		utils.Debugf("[EXIT] UDP dial %s failed: %v", dest, err)
@@ -273,7 +312,7 @@ func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	local := gonet.NewTCPConn(&wq, ep)
 
 	utils.SafeGo("exit.flow", func() {
-		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+		remote, err := dialExitTCP(dest)
 		if err != nil {
 			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
 			local.Close()
@@ -410,18 +449,39 @@ func (t *TCPTunnel) Close() {
 func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var lastRetrans, lastQueueWaits, lastSendRetries uint64
 
 	for {
 		select {
 		case <-t.stopCh:
 			return
 		case <-ticker.C:
-			tcp := t.gvisorStack.Stats().TCP
-			utils.Packetf("[STATS] uptime=%v mode=%s established=%d segs=%d retrans=%d fastRetx=%d sackRec=%d tlp=%d timeouts=%d spuriousRTO=%d",
-				time.Since(t.startTime).Round(time.Second), t.exitMode.String(),
-				tcp.CurrentEstablished.Value(), tcp.SegmentsSent.Value(), tcp.Retransmits.Value(),
-				tcp.FastRetransmit.Value(), tcp.SACKRecovery.Value(), tcp.TLPRecovery.Value(),
-				tcp.Timeouts.Value(), tcp.SpuriousRTORecovery.Value())
+			stats := t.gvisorStack.Stats()
+			carrier := t.transport.Stats()
+			retrans := stats.TCP.Retransmits.Value()
+			message := fmt.Sprintf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d queue_waits=%d send_retries=%d",
+				time.Since(t.startTime).Round(time.Second),
+				t.exitMode.String(),
+				t.packetCount.Load(),
+				stats.TCP.CurrentConnected.Value(),
+				stats.TCP.CurrentEstablished.Value(),
+				retrans, carrier.QueueWaits, carrier.SendRetries,
+			)
+			if utils.DebugEnabled() {
+				tc := stats.TCP
+				utils.Debugf("[STATS] tcp: sent=%d recv=%d invalid=%d retrans=%d fastRetrans=%d fastRecovery=%d sackRecovery=%d tlp=%d timeouts=%d slowStartRetrans=%d resets=%d/%d sendErrors=%d | drops=%d nic-rx-drops=%d",
+					tc.SegmentsSent.Value(), tc.ValidSegmentsReceived.Value(), tc.InvalidSegmentsReceived.Value(),
+					tc.Retransmits.Value(), tc.FastRetransmit.Value(), tc.FastRecovery.Value(), tc.SACKRecovery.Value(),
+					tc.TLPRecovery.Value(), tc.Timeouts.Value(), tc.SlowStartRetransmits.Value(),
+					tc.ResetsSent.Value(), tc.ResetsReceived.Value(), tc.SegmentSendErrors.Value(),
+					stats.DroppedPackets.Value(), stats.NICs.Rx.Packets.Value())
+			}
+			if retrans > lastRetrans || carrier.QueueWaits > lastQueueWaits || carrier.SendRetries > lastSendRetries {
+				utils.Infof("%s", message)
+			} else {
+				utils.Debugf("%s", message)
+			}
+			lastRetrans, lastQueueWaits, lastSendRetries = retrans, carrier.QueueWaits, carrier.SendRetries
 			t.logBusiestFlow()
 		}
 	}
@@ -449,3 +509,125 @@ func (t *TCPTunnel) logBusiestFlow() {
 }
 
 func SetLocalIP(ip string) error { return l3.SetLocalIP(ip) }
+
+// tunnelMTU is the MTU of the tunnel's interface: what the carriers can move
+// (transport.CarrierMTUer; 1500 when they say nothing) within the packet limit
+// the peer accepts. Every layer between the stack and the wire works per
+// packet, so a carrier that moves large packets as easily as small ones makes
+// the whole pipeline several times cheaper per byte. Each side advertises its
+// own MSS, so a peer that keeps 1500 simply keeps getting 1460-byte segments.
+// OPENFLUX_TUNNEL_MTU forces a value.
+func tunnelMTU(trans transport.Transport) int {
+	if n, err := strconv.Atoi(os.Getenv("OPENFLUX_TUNNEL_MTU")); err == nil && n >= 1280 && n <= 65000 {
+		return n
+	}
+	mtu := transport.DefaultCarrierMTU
+	if c, ok := trans.(transport.CarrierMTUer); ok {
+		mtu = c.CarrierMTU()
+	}
+	if n, ok := trans.(transport.PeerParameterProvider); ok {
+		if p, ready := n.PeerParameters(); ready {
+			mtu = min(mtu, p.MaxPacketSize)
+		}
+	}
+	return max(min(mtu, 65000), 1280)
+}
+
+// watchMTU follows the carrier set: a carrier added later that cannot take
+// large packets lowers the MTU for the connections opened from then on, and
+// the peer's limit becomes known once the handshake is done.
+func (t *TCPTunnel) watchMTU(trans transport.Transport) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-tick.C:
+			if want := uint32(tunnelMTU(trans)); want != t.tunnelEP.MTU() {
+				utils.Infof("[TUNNEL] MTU %d -> %d", t.tunnelEP.MTU(), want)
+				t.tunnelEP.SetMTU(want)
+			}
+			if want := wantedCC(trans); want != t.cc {
+				utils.Infof("[TUNNEL] TCP congestion control %s -> %s for new connections", t.cc, want)
+				t.cc = want
+				setCC(t.gvisorStack, want)
+			}
+		}
+	}
+}
+
+// refused answers a packet the transport would not take because no live carrier
+// moves one that large (transport.PacketTooLargeError): the stack gets an ICMP
+// "fragmentation needed" for it, as from a router with a smaller MTU, and the
+// connection retransmits in smaller segments. orig is the packet as the stack
+// wrote it; it is only read here.
+func (t *TCPTunnel) refused(err error, orig []byte) {
+	var big *transport.PacketTooLargeError
+	if !errors.As(err, &big) || len(orig) < header.IPv4MinimumSize {
+		return
+	}
+	icmp := buildFragNeeded(orig, big.Limit)
+	if icmp == nil {
+		return
+	}
+	if !t.ptbDue(orig) {
+		return
+	}
+	utils.Debugf("[TUNNEL] packet of %d bytes does not fit the live carriers (%d): telling the stack", len(orig), big.Limit)
+	// Not on this goroutine: the stack holds the connection's lock while it
+	// writes the packet, and the ICMP is delivered to that connection.
+	go t.tunnelEP.InjectInbound(icmp)
+}
+
+// buildFragNeeded builds the ICMPv4 destination-unreachable / fragmentation
+// needed that a router with the given MTU would answer orig with: from the
+// packet's destination to its source, quoting its header and first 8 bytes.
+func buildFragNeeded(orig []byte, mtu int) []byte {
+	ip := header.IPv4(orig)
+	ihl := int(ip.HeaderLength())
+	if orig[0]>>4 != 4 || ihl < header.IPv4MinimumSize || len(orig) < ihl {
+		return nil
+	}
+	quote := orig[:min(len(orig), ihl+8)]
+	out := make([]byte, header.IPv4MinimumSize+header.ICMPv4MinimumSize+len(quote))
+	h := header.IPv4(out)
+	h.Encode(&header.IPv4Fields{
+		TotalLength: uint16(len(out)),
+		TTL:         64,
+		Protocol:    uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr:     ip.DestinationAddress(),
+		DstAddr:     ip.SourceAddress(),
+	})
+	h.SetChecksum(^h.CalculateChecksum())
+	icmp := header.ICMPv4(h.Payload())
+	icmp.SetType(header.ICMPv4DstUnreachable)
+	icmp.SetCode(header.ICMPv4FragmentationNeeded)
+	icmp.SetMTU(uint16(min(mtu, 65535)))
+	copy(icmp.Payload(), quote)
+	icmp.SetChecksum(0)
+	icmp.SetChecksum(header.ICMPv4Checksum(icmp, 0))
+	return out
+}
+
+// ptbDue limits the answers to a flow: its first refused packet is answered at
+// once, the rest of that window (hundreds of segments) only every 20 ms, which
+// the stack needs once to lower its segment size.
+func (t *TCPTunnel) ptbDue(orig []byte) bool {
+	var key [12]byte
+	copy(key[:8], orig[12:20])
+	if ihl := int(orig[0]&15) * 4; ihl >= 20 && len(orig) >= ihl+4 {
+		copy(key[8:], orig[ihl:ihl+4])
+	}
+	now := time.Now()
+	t.ptbMu.Lock()
+	defer t.ptbMu.Unlock()
+	if t.ptbLast == nil || len(t.ptbLast) > 1024 {
+		t.ptbLast = make(map[[12]byte]time.Time)
+	}
+	if now.Sub(t.ptbLast[key]) < 20*time.Millisecond {
+		return false
+	}
+	t.ptbLast[key] = now
+	return true
+}

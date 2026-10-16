@@ -375,7 +375,7 @@ func RollbackPackage(dir, file, pubkeyHex string) UpdateReport {
 		rep.Code = CodeInstallFailed
 		return rep
 	}
-	rep.Status, rep.Latest = UpdateInstalled, p.Manifest.Version
+	rep.Status, rep.Latest, rep.Wire = UpdateInstalled, p.Manifest.Version, p.Manifest.EffectiveWire()
 	return rep
 }
 

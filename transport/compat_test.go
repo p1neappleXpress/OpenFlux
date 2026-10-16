@@ -279,6 +279,22 @@ func TestSessionClassicCompat(t *testing.T) {
 		ex := compatSession(t, b, "ctx", nil, true, true, CodecBatched)
 		roundTrip(t, cl, ex, 5*time.Second)
 	})
+	t.Run("a several-carrier exit serves a classic client on any of them", func(t *testing.T) {
+		// A wizard node: mailru, cupsonline and direct; the iOS app speaks
+		// classic on the mailru document.
+		_, idle := asyncPair()
+		a, b := asyncPair()
+		cl := oldClassic(t, a, CodecBatched, "ctx", false)
+		ex := compatSession(t, idle, "ctx", nil, true, true, CodecBatched)
+		if err := ex.AddTransport("mailru", b, compatSecret, "ctx", 90); err != nil {
+			t.Fatal(err)
+		}
+		roundTrip(t, cl, ex, 5*time.Second, func() {
+			if m := ex.Mode(); m != "classic" {
+				t.Errorf("exit mode %q", m)
+			}
+		})
+	})
 	t.Run("a Session-only exit does not serve classic clients", func(t *testing.T) {
 		a, b := asyncPair()
 		cl := oldClassic(t, a, CodecBatched, "ctx", false)

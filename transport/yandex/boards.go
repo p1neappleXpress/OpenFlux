@@ -239,7 +239,7 @@ func (t *BoardsTransport) authorize(hash, name string) (boardsInfo, error) {
 	jar := t.jar()
 	client := &http.Client{
 		Jar:       jar,
-		Transport: carrierTransport(),
+		Transport: carrierTransport(t.network()),
 		Timeout:   15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -505,7 +505,7 @@ func (t *BoardsTransport) connectAndServe(info boardsInfo) error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
-		NetDialContext:   dialIPv4First,
+		NetDialContext: dialIPv4FirstOn(t.network()),
 	}
 	utils.Debugf("[BOARDS] dial %s", wsURL)
 	conn, resp, err := dialer.Dial(wsURL, header)
@@ -1079,4 +1079,12 @@ func (t *BoardsTransport) ApplyCookies(values map[string]string) error {
 		_ = s.Conn.Close()
 	}
 	return nil
+}
+
+// network is the network this carrier dials through (TransportConfig.Network).
+func (t *BoardsTransport) network() string {
+	if t.BaseTransport == nil {
+		return ""
+	}
+	return t.GetConfig().Network
 }

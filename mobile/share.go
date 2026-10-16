@@ -65,7 +65,7 @@ func ExitShareLink(host, name string) (string, error) {
 				return "", errors.New("direct: нет адреса, по которому клиенты смогут подключиться")
 			}
 			t.Dial = net.JoinHostPort(host, port)
-		case "cupsonline":
+		case "cupsonline", "avito":
 			// Started without a room list, the exit creates its rooms at
 			// start; clients need that list to join them.
 			if t.URL == "" {
@@ -78,7 +78,7 @@ func ExitShareLink(host, name string) (string, error) {
 				}
 			}
 			if t.URL == "" {
-				appendLog("[ANDROID] Cups: комнаты ещё не созданы, в ссылку не попали")
+				appendLog(fmt.Sprintf("[ANDROID] %s: комнаты ещё не созданы, в ссылку не попали", t.Type))
 				continue
 			}
 		}

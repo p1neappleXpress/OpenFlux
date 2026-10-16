@@ -1,7 +1,6 @@
 package script
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,13 +53,51 @@ func jsCall(t *testing.T, vm *goja.Runtime, name string, args ...interface{}) go
 	return out
 }
 
-func TestParityMailruSaveChanges(t *testing.T) {
-	vm := loadJS(t, "js/mailru.js")
-	for _, id := range []string{"1234567890123", "1234567890", "12345", "ab", "a", ""} {
-		want := string(mailru.BuildSaveChanges(id))
-		got := jsCall(t, vm, "buildSaveChanges", id).String()
-		if got != want {
-			t.Errorf("user %q:\n js : %s\n go : %s", id, got, want)
+// What the JS transport hands to the engine for a chat broadcast (emit) equals
+// what the native one delivers: only our-tagged frames from other participants,
+// base64-decoded, in order, with the server's echo of our own chat and bad
+// base64 skipped. This is what lets a JS client and a native exit (or the
+// reverse) interoperate over the chat data path.
+func TestParityMailruChatData(t *testing.T) {
+	cases := []struct {
+		frame, own string
+	}{
+		// a peer's tagged packet
+		{`42["message",{"type":"message","messages":[{"message":"OFX1aGVsbG8=","useridoriginal":"peer"}]}]`, "me"},
+		// the server's echo of our own chat: skipped
+		{`42["message",{"type":"message","messages":[{"message":"OFX1aGVsbG8=","useridoriginal":"me"}]}]`, "me"},
+		// a human's chat (no tag) mixed with a tagged peer frame
+		{`42["message",{"type":"message","messages":[{"message":"hi there","useridoriginal":"peer"},{"message":"OFX1b25l","useridoriginal":"peer"}]}]`, "me"},
+		// several tagged entries, one not base64 (skipped)
+		{`42["message",{"type":"message","messages":[{"message":"OFX1YQ==","useridoriginal":"peer"},{"message":"OFX1!!bad","useridoriginal":"peer"},{"message":"OFX1Yg==","useridoriginal":"peer"}]}]`, "me"},
+		// empty ownID: nothing is treated as self-echo
+		{`42["message",{"type":"message","messages":[{"message":"OFX1dHdv","useridoriginal":"me"}]}]`, ""},
+		// not a chat broadcast
+		{`42["message",{"type":"auth","result":1}]`, "me"},
+		{`3`, "me"},
+	}
+	for _, c := range cases {
+		vm := loadJS(t, "js/mailru.js")
+		if err := vm.Set("ownID", c.own); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		if err := vm.Set("emit", func(call goja.FunctionCall) goja.Value {
+			var b []byte
+			_ = vm.ExportTo(call.Argument(0), &b)
+			got = append(got, string(b))
+			return goja.Undefined()
+		}); err != nil {
+			t.Fatal(err)
+		}
+		jsCall(t, vm, "handleMessage", c.frame)
+
+		var want []string
+		for _, b := range mailru.DecodeChatData([]byte(c.frame), c.own) {
+			want = append(want, string(b))
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("frame %q own %q: js delivered %q, native %q", c.frame, c.own, got, want)
 		}
 	}
 }
@@ -132,72 +169,6 @@ func TestParityYandexExtractBase64(t *testing.T) {
 		got := jsCall(t, vm, "extractBase64", f).String()
 		if got != want {
 			t.Errorf("frame %q: js %q, go %q", f, got, want)
-		}
-	}
-}
-
-func TestParityMailruCursorPayloads(t *testing.T) {
-	vm := loadJS(t, "js/mailru.js")
-	frames := []string{
-		`42["message",{"type":"cursor","cursor":"18;aGVsbG8="}]`,
-		// a batched message: a peer's keep-alive among real entries
-		`42["message",[{"type":"cursor","cursor":"18;---KA---"},{"type":"cursor","cursor":"18;b25l"},{"type":"cursor","cursor":"18;dHdv"}]]`,
-		`42["message",{"type":"cursor","cursor":"18;---KA---"}]`,
-		`42["message",[{"type":"cursor","cursor":"18;YQ=="},{"type":"cursor","cursor":"18;---KA---"},{"type":"cursor","cursor":"18;Yg=="}]]`,
-		`42["message",{"type":"auth","result":1}]`,
-		``,
-	}
-	for _, f := range frames {
-		want := mailru.CursorPayloads(f)
-		var got []string
-		raw, err := json.Marshal(jsCall(t, vm, "cursorPayloads", f).Export())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := json.Unmarshal(raw, &got); err != nil {
-			t.Fatal(err)
-		}
-		if len(want) == 0 && len(got) == 0 {
-			continue
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("frame %q: js %q, go %q", f, got, want)
-		}
-	}
-}
-
-// What the JS transport hands to the engine for a server frame (emit) equals
-// what the native one delivers (every cursor entry decoded, in order, bad
-// base64 skipped).
-func TestParityMailruHandleMessage(t *testing.T) {
-	frames := []string{
-		`42["message",{"type":"cursor","cursor":"18;aGVsbG8="}]`,
-		`42["message",[{"type":"cursor","cursor":"18;---KA---"},{"type":"cursor","cursor":"18;b25l"},{"type":"cursor","cursor":"18;dHdv"}]]`,
-		`42["message",{"type":"cursor","cursor":"18;---KA---"}]`,
-		`42["message",[{"type":"cursor","cursor":"18;!!notbase64!!"},{"type":"cursor","cursor":"18;b2s="}]]`,
-		`3`,
-	}
-	for _, f := range frames {
-		vm := loadJS(t, "js/mailru.js")
-		var got []string
-		if err := vm.Set("emit", func(call goja.FunctionCall) goja.Value {
-			var b []byte
-			_ = vm.ExportTo(call.Argument(0), &b)
-			got = append(got, string(b))
-			return goja.Undefined()
-		}); err != nil {
-			t.Fatal(err)
-		}
-		jsCall(t, vm, "handleMessage", f)
-
-		var want []string
-		for _, p := range mailru.CursorPayloads(f) {
-			if b, err := base64.StdEncoding.DecodeString(p); err == nil {
-				want = append(want, string(b))
-			}
-		}
-		if fmt.Sprint(got) != fmt.Sprint(want) {
-			t.Errorf("frame %q: js delivered %q, native %q", f, got, want)
 		}
 	}
 }

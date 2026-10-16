@@ -42,7 +42,7 @@ type proxyState struct {
 // Android "Маршрутизация" settings tab) of domains to dial directly instead
 // of through the tunnel; pass "" for none.
 func StartProxy(transportType, documentURL, encryptionSecret, codec, maxToken, maxUid, listenAddr, username, password, bypassDomains string) string {
-	if msg := validateClassic(transportType, documentURL, encryptionSecret); msg != "" {
+	if msg := validateClassic(transportType, documentURL, encryptionSecret, false); msg != "" {
 		return msg
 	}
 	return startProxyWith(func() (transport.Transport, error) {

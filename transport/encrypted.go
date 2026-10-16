@@ -206,7 +206,7 @@ func (st *keyStore) key(i int) *contextKeys {
 
 func (st *keyStore) derive(context string) (*contextKeys, error) {
 	salt := sha256.Sum256([]byte("OpenFlux encrypted transport v1\x00" + context))
-	master, err := scrypt.Key([]byte(st.secret), salt[:], 32768, 8, 1, 32)
+	master, err := masterKey(st.secret, context, salt[:])
 	if err != nil {
 		return nil, fmt.Errorf("derive encryption key: %w", err)
 	}
@@ -441,21 +441,36 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 func (e *EncryptedTransport) Send(data []byte) error {
 	r := e.ring
 	keys := r.sendKeys()
-	header := []byte{encryptedMagic[0], encryptedMagic[1], encryptedMagic[2], encryptedVersion, r.sendDir}
-	nonce := make([]byte, keys.send.NonceSize())
+	// The record is built in one buffer: header, nonce, then the sealed data.
+	// A carrier that frames its records itself (HeadroomSender) gets the
+	// buffer with room for its header in front and keeps it.
+	head := 0
+	hs, headroom := e.Transport.(HeadroomSender)
+	if headroom {
+		head = RecordHeadroom
+	}
+	nonceSize := keys.send.NonceSize()
+	need := head + encryptedHeader + nonceSize + len(data) + keys.send.Overhead()
+	var packet []byte
+	if headroom {
+		// The carrier keeps this buffer and returns it to the pool when sent.
+		packet = getBuf(need)[:head+encryptedHeader+nonceSize]
+	} else {
+		packet = make([]byte, head+encryptedHeader+nonceSize, need)
+	}
+	header := packet[head : head+encryptedHeader]
+	header[0], header[1], header[2], header[3], header[4] = encryptedMagic[0], encryptedMagic[1], encryptedMagic[2], encryptedVersion, r.sendDir
+	nonce := packet[head+encryptedHeader : head+encryptedHeader+nonceSize]
 	if _, err := rand.Read(nonce); err != nil {
 		utils.Debugf("[CRYPTO] Send: rand nonce failed: %v", err)
 		e.sendErr.Add(1)
 		return fmt.Errorf("create packet nonce: %w", err)
 	}
-	packet := make([]byte, 0, len(header)+len(nonce)+len(data)+keys.send.Overhead())
-	packet = append(packet, header...)
-	packet = append(packet, nonce...)
 	packet = keys.send.Seal(packet, nonce, data, header)
 
 	if utils.DebugEnabled() {
 		utils.Debugf("[CRYPTO] Send #%d dir=%d plaintext=%d ciphertext=%d nonce=%s ctx=%s",
-			e.sendOK.Load()+1, r.sendDir, len(data), len(packet), hex.EncodeToString(nonce), utils.Sha256Short([]byte(keys.context)))
+			e.sendOK.Load()+1, r.sendDir, len(data), len(packet)-head, hex.EncodeToString(nonce), utils.Sha256Short([]byte(keys.context)))
 	}
 	// Plaintext frames can carry control messages with cookie jars, so
 	// they are dumped only with --sensitive; ciphertext is what the
@@ -467,7 +482,12 @@ func (e *EncryptedTransport) Send(data []byte) error {
 		utils.Debugf("[CRYPTO] Send ciphertext hexdump:\n%s", hex.Dump(packet))
 	}
 
-	err := e.Transport.Send(packet)
+	var err error
+	if headroom {
+		err = hs.SendWithHeadroom(packet)
+	} else {
+		err = e.Transport.Send(packet)
+	}
 	if err != nil {
 		e.sendErr.Add(1)
 		utils.Debugf("[CRYPTO] Send FAILED: %v", err)
@@ -480,7 +500,9 @@ func (e *EncryptedTransport) Send(data []byte) error {
 func (e *EncryptedTransport) Receive(callback func([]byte)) {
 	r := e.ring
 	e.Transport.Receive(func(packet []byte) {
-		utils.Debugf("[CRYPTO] Recv raw %d ciphertext bytes", len(packet))
+		if utils.DebugEnabled() {
+			utils.Debugf("[CRYPTO] Recv raw %d ciphertext bytes", len(packet))
+		}
 		if utils.IsVerbose() {
 			utils.Debugf("[CRYPTO] Recv raw hexdump:\n%s", hex.Dump(packet))
 		}
@@ -593,3 +615,50 @@ func (e *EncryptedTransport) CryptoStats() (sendOK, sendErr, recvOK, recvFail, r
 // minInt is defined in session.go; declared here only if that file is
 // somehow compiled out. Keep a local guard so this file stands alone.
 var _ = minInt
+
+// masterKeys remembers derived master keys by (secret, context). The scrypt
+// behind a master key takes 32 MiB and about a second of one core on a small
+// VPS, and every carrier of a session, every carrier added at the peer's
+// request and every reloaded transport has the same secret and context: only
+// the first one pays. The entry holds what the AEADs it feeds hold anyway.
+// scryptRuns counts real derivations (tests check the cache with it).
+var scryptRuns atomic.Uint64
+
+var masterKeys struct {
+	mu sync.Mutex
+	m  map[[32]byte]*masterEntry
+}
+
+type masterEntry struct {
+	once   sync.Once
+	master []byte
+	err    error
+}
+
+func masterKey(secret, context string, salt []byte) ([]byte, error) {
+	id := sha256.Sum256([]byte(fmt.Sprintf("%d:%s%s", len(secret), secret, context)))
+	masterKeys.mu.Lock()
+	if masterKeys.m == nil || len(masterKeys.m) >= 16 {
+		masterKeys.m = make(map[[32]byte]*masterEntry)
+	}
+	e := masterKeys.m[id]
+	if e == nil {
+		e = &masterEntry{}
+		masterKeys.m[id] = e
+	}
+	masterKeys.mu.Unlock()
+	e.once.Do(func() {
+		scryptRuns.Add(1)
+		e.master, e.err = scrypt.Key([]byte(secret), salt, 32768, 8, 1, 32)
+	})
+	if e.err != nil {
+		// Do not cache a failure.
+		masterKeys.mu.Lock()
+		if masterKeys.m[id] == e {
+			delete(masterKeys.m, id)
+		}
+		masterKeys.mu.Unlock()
+		return nil, e.err
+	}
+	return append([]byte(nil), e.master...), nil
+}

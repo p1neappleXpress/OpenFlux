@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"strconv"
 	"strings"
 
@@ -107,4 +108,13 @@ func registerBootstrapTransports(m *manager.Manager, specs []transportSpec, base
 		}
 	}
 	return nil
+}
+
+// validNetwork reports whether n names a network a carrier can be bound to.
+func validNetwork(n string) bool {
+	switch n {
+	case netbind.NetworkCellular, netbind.NetworkWiFi, netbind.NetworkEthernet:
+		return true
+	}
+	return false
 }

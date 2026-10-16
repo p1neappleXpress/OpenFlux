@@ -36,6 +36,33 @@ func (d *PortDemux) Receive(cb func([]byte)) {
 	d.mu.Unlock()
 }
 
+// OnReliableStream forwards to the transport underneath.
+func (d *PortDemux) OnReliableStream() bool {
+	if c, ok := d.Transport.(StreamCarrierer); ok {
+		return c.OnReliableStream()
+	}
+	return false
+}
+
+// SendFill forwards to the transport underneath when it can take a packet
+// written in place (FillSender), else copies once.
+func (d *PortDemux) SendFill(size int, fill func(dst []byte)) error {
+	if f, ok := d.Transport.(FillSender); ok {
+		return f.SendFill(size, fill)
+	}
+	buf := make([]byte, size)
+	fill(buf)
+	return d.Transport.Send(buf)
+}
+
+// CarrierMTU forwards the carrier packet size of the transport underneath.
+func (d *PortDemux) CarrierMTU() int {
+	if c, ok := d.Transport.(CarrierMTUer); ok {
+		return c.CarrierMTU()
+	}
+	return DefaultCarrierMTU
+}
+
 // Side returns a Transport for the side stack: it sends through the inner
 // transport and receives only the reserved-port traffic.
 func (d *PortDemux) Side() Transport { return sideEnd{d} }

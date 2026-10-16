@@ -33,14 +33,27 @@ const carrierDialTimeout = 10 * time.Second
 var lookupIPAddr = net.DefaultResolver.LookupIPAddr
 
 // dialIPv4First is a DialContext that tries a host's IPv4 addresses before its
-// IPv6 ones. It follows the interface binding of package netbind.
+// IPv6 ones, on the default route (the package's global binding).
 func dialIPv4First(ctx context.Context, network, address string) (net.Conn, error) {
+	return dialIPv4From(ctx, "", network, address)
+}
+
+// dialIPv4FirstOn is dialIPv4First for a carrier bound to a network: the same
+// order, through netbind.DialerFor(bind), so a carrier bound to a network keeps its own
+// interface ("" is the default route).
+func dialIPv4FirstOn(bind string) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialIPv4From(ctx, bind, network, address)
+	}
+}
+
+func dialIPv4From(ctx context.Context, bind, network, address string) (net.Conn, error) {
 	if network != "tcp" {
-		return netbind.DialContext(ctx, network, address)
+		return netbind.DialContextFor(bind)(ctx, network, address)
 	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || net.ParseIP(host) != nil {
-		return netbind.DialContext(ctx, network, address)
+		return netbind.DialContextFor(bind)(ctx, network, address)
 	}
 	addrs, err := lookupIPAddr(ctx, host)
 	if err != nil {
@@ -59,7 +72,7 @@ func dialIPv4First(ctx context.Context, network, address string) (net.Conn, erro
 		if a.IP.To4() != nil {
 			netw = "tcp4"
 		}
-		conn, err := netbind.Dialer(carrierDialTimeout).DialContext(ctx, netw, net.JoinHostPort(a.IP.String(), port))
+		conn, err := netbind.DialerFor(bind, carrierDialTimeout).DialContext(ctx, netw, net.JoinHostPort(a.IP.String(), port))
 		if err == nil {
 			return conn, nil
 		}
@@ -73,12 +86,12 @@ func dialIPv4First(ctx context.Context, network, address string) (net.Conn, erro
 	return nil, firstErr
 }
 
-// carrierTransport is the default HTTP transport dialing through dialIPv4First.
-func carrierTransport() *http.Transport {
+// carrierTransport is the default HTTP transport dialing through dialIPv4FirstOn(bind).
+func carrierTransport(bind string) *http.Transport {
 	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
 		t := dt.Clone()
-		t.DialContext = dialIPv4First
+		t.DialContext = dialIPv4FirstOn(bind)
 		return t
 	}
-	return &http.Transport{DialContext: dialIPv4First, ForceAttemptHTTP2: true}
+	return &http.Transport{DialContext: dialIPv4FirstOn(bind), ForceAttemptHTTP2: true}
 }

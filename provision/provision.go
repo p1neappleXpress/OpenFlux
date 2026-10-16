@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -105,9 +106,35 @@ type Channel struct {
 	Key        string
 	// Port is direct's port; 0 in a plan lets the script pick one.
 	Port int
+	// Cookies is the channel's Yandex sign-in for the node: the core's
+	// cookie store JSON, base64-encoded (see CookieStore). Empty: none.
+	Cookies string
 	// AutoUpdate turns the server's core updater on, or off: it is one
 	// timer for every channel on the server.
 	AutoUpdate bool
+	// Mode is how the node forwards its clients' traffic: ModeL4 (the
+	// default, "" too: TCP streams, no special rights) or ModeL3 (IP
+	// packets: the node gets CAP_NET_RAW and a rule that drops the
+	// kernel's own RSTs for the node's address).
+	Mode string
+}
+
+// The node's two ways of forwarding traffic (node.conf's Mode).
+const (
+	ModeL4 = "l4"
+	ModeL3 = "l3"
+)
+
+// CheckMode returns mode as the script takes it: "l4" or "l3", "" meaning
+// the default (l4).
+func CheckMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", ModeL4:
+		return ModeL4, nil
+	case ModeL3:
+		return ModeL3, nil
+	}
+	return "", errors.New("режим ноды: l4 или l3")
 }
 
 // config is the channel's part of node-install.sh's config, secrets aside.
@@ -116,7 +143,14 @@ func (ch Channel) config() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	mode, err := CheckMode(ch.Mode)
+	if err != nil {
+		return "", err
+	}
 	cfg := "channel=" + ch.ID + "\n" + transportLines(ts)
+	if mode == ModeL3 {
+		cfg += "mode=l3\n"
+	}
 	if ch.Port != 0 {
 		cfg += "port=" + strconv.Itoa(ch.Port) + "\n"
 	}
@@ -295,11 +329,14 @@ func (c *Conn) Probe() (*Probe, error) {
 }
 
 // Plan asks what apply would change: ch without its key, Port 0 lets the
-// script pick one.
-func (c *Conn) Plan(ch Channel) (*Plan, error) {
+// script pick one. withCookies adds the Yandex sign-in step.
+func (c *Conn) Plan(ch Channel, withCookies bool) (*Plan, error) {
 	cfg, err := ch.config()
 	if err != nil {
 		return nil, err
+	}
+	if withCookies {
+		cfg += "cookies=yes\n"
 	}
 	var p Plan
 	if err := c.script_("plan", []byte(cfg), &p); err != nil {
@@ -319,7 +356,108 @@ func (c *Conn) Apply(ch Channel, sudoPassword string) error {
 		return err
 	}
 	cfg += "key=" + ch.Key + "\n"
+	if ch.Cookies != "" {
+		cfg += "cookies=" + ch.Cookies + "\n"
+	}
 	return c.asRoot("apply", cfg, sudoPassword)
+}
+
+// SetCookies replaces an installed channel's Yandex sign-in (base64 cookie
+// store JSON, see CookieStore) and restarts its node.
+func (c *Conn) SetCookies(channel, cookies, sudoPassword string) error {
+	return c.asRoot("set-cookies", "channel="+channel+"\ncookies="+cookies+"\n", sudoPassword)
+}
+
+// CookieStore turns a Cookie header ("a=1; b=2", as the WebView keeps it
+// for the document) into what Channel.Cookies takes: the core's cookie
+// store JSON, keyed by the document URL like the node looks it up, then
+// base64. signedIn reports whether the header holds a Yandex login.
+func CookieStore(documentURL, header string) (cookies string, signedIn bool, err error) {
+	jar := map[string]string{}
+	for _, part := range strings.Split(header, ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || name == "" || strings.ContainsAny(name+value, "\r\n") {
+			continue
+		}
+		jar[name] = value
+	}
+	if len(jar) == 0 {
+		return "", false, errors.New("нет cookies Яндекса")
+	}
+	raw, err := json.Marshal(map[string]map[string]string{documentURL: jar})
+	if err != nil {
+		return "", false, err
+	}
+	_, signedIn = jar["Session_id"]
+	return base64.StdEncoding.EncodeToString(raw), signedIn, nil
+}
+
+// ChannelInfo is an installed channel as node-install.sh show reports it.
+type ChannelInfo struct {
+	Channel string `json:"channel"`
+	// State is systemd's word for the node: active, failed, ...
+	State string `json:"state"`
+	// Port is direct's port.
+	Port int `json:"port"`
+	// Context is the channel's encryption context (node.conf's URL line).
+	// SetTransports keeps it, so the links made for the channel stay valid;
+	// a new link for it must carry it too (ShareLinkContext).
+	Context string `json:"context"`
+	// Transports are the channel's carriers besides direct.
+	Transports []ChannelTransport `json:"transports"`
+	// Mode is how the node forwards traffic: "l4" or "l3" (see Channel.Mode).
+	Mode string `json:"mode"`
+	// Key is the channel's encryption key, read by root over SSH so the
+	// owner can make its link and profile; empty when the installer is older.
+	Key string `json:"key"`
+}
+
+// String omits the key: a ChannelInfo in a log or an error must not carry it.
+func (i ChannelInfo) String() string {
+	return fmt.Sprintf("ChannelInfo{%s %s port=%d mode=%s}", i.Channel, i.State, i.Port, i.Mode)
+}
+
+// Show reads an installed channel's documents, port, state, mode, encryption
+// context and key. It needs root: the node's config is not world-readable.
+func (c *Conn) Show(channel, sudoPassword string) (*ChannelInfo, error) {
+	var info ChannelInfo
+	if err := c.asRootJSON("show", "channel="+channel+"\n", sudoPassword, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// SetTransports replaces the documents of an installed, running channel:
+// some added, some removed. Its key, port, cookies and encryption context
+// stay, so the links handed out keep working; the node restarts on the new
+// config and the old one comes back if it does not start. cookies (see
+// CookieStore) replace the channel's Yandex sign-in when given.
+func (c *Conn) SetTransports(channel string, ts []ChannelTransport, cookies, sudoPassword string) error {
+	return c.SetChannel(channel, ts, "", cookies, sudoPassword)
+}
+
+// SetChannel is SetTransports that can change the node's mode too: mode "l3" or
+// "l4" is written to node.conf, "" keeps the one the channel has.
+func (c *Conn) SetChannel(channel string, ts []ChannelTransport, mode, cookies, sudoPassword string) error {
+	ts, err := CheckTransports(ts)
+	if err != nil {
+		return err
+	}
+	if len(ts) == 0 {
+		return errors.New("нужен хотя бы один документ: без него канал не нужен")
+	}
+	cfg := "channel=" + channel + "\n" + transportLines(ts)
+	if strings.TrimSpace(mode) != "" {
+		m, err := CheckMode(mode)
+		if err != nil {
+			return err
+		}
+		cfg += "mode=" + m + "\n"
+	}
+	if cookies != "" {
+		cfg += "cookies=" + cookies + "\n"
+	}
+	return c.asRoot("set-transports", cfg, sudoPassword)
 }
 
 // Remove stops and deletes the channel; the last one also removes the
@@ -329,6 +467,12 @@ func (c *Conn) Remove(channel, sudoPassword string) error {
 }
 
 func (c *Conn) asRoot(command, cfg, sudoPassword string) error {
+	return c.asRootJSON(command, cfg, sudoPassword, nil)
+}
+
+// asRootJSON runs a root command of the script; into (when not nil) gets the
+// command's JSON answer.
+func (c *Conn) asRootJSON(command, cfg, sudoPassword string, into interface{}) error {
 	if c.script == "" {
 		return errors.New("скрипт установки не загружен")
 	}
@@ -379,6 +523,9 @@ func (c *Conn) asRoot(command, cfg, sudoPassword string) error {
 	}
 	if !res.OK {
 		return fmt.Errorf("%s", res.Error)
+	}
+	if into != nil {
+		return lastJSON(stdout, into)
 	}
 	return nil
 }

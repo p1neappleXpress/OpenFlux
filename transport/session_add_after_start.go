@@ -56,7 +56,7 @@ func (s *Session) AddTransportPostStart(name string, raw Transport, secret, cont
 
 	s.mu.Lock()
 	s.links[name] = link
-	s.order = insertByPriority(s.order, name, priority, s.links)
+	s.order = insertByPriority(s.order, name, link.priority, s.links)
 	s.mu.Unlock()
 
 	utils.Debugf("[SESSION] transport %q added post-start (priority=%d)", name, priority)

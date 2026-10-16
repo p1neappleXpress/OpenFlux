@@ -5,6 +5,408 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+- node-install.sh follows the node-v* releases of p1neappleXpress/OpenFlux, and the node wizard installs it for both sources (`fork` and `official`).
+
+## [0.14.0] / node-v1.7.0 - 2026-10-16 (OpenFluxTeam/OpenFlux)
+
+node-install.sh installs **node-v1.7.0**. The team's stripe groups (p1neappleXpress, `integration/team-0.12`, the CLI release v0.12.1) join the speed work.
+
+### Added
+
+- **Stripe groups** (p1neappleXpress): several carriers of one type (cups.online, Avito) or of mixed types are joined into one
+  stripe, one lane each, with per-stripe RTO and ack settings; `--lanes N` on the command line, `Lanes = N` in a `[Transport]`
+  section, a seamless single-lane Mail.ru carrier (make-before-break rotation), tuned cups and Avito defaults (8 rooms).
+- **Reno on direct.** While the traffic goes over plain TCP streams (direct) the tunnel stack opens new connections with Reno
+  instead of CUBIC: nothing is lost inside such a tunnel, and CUBIC's HyStart took the carrier's delay jitter for congestion and
+  left slow start at half the window the path takes (a single download over a real path: 6-7 MB/s with Reno against 3.5-4.5 with
+  CUBIC; on the rig +20 %). Carriers that drop packets keep CUBIC. The stack follows the carrier that is used, within a second;
+  `OPENFLUX_TCP_CC=reno|cubic` forces one.
+
+### Removed
+
+- **Session bonding** (`--bonding`, `Bonding = yes`, control subtypes 0x30/0x31), replaced by stripe groups. A `.conf` that still
+  says `Bonding = yes` logs that it is ignored; the carriers fail over by priority. `Network =` stays.
+
+## [0.13.1] / node-v1.6.1 - 2026-10-16 (OpenFluxTeam/OpenFlux)
+
+node-install.sh installs **node-v1.6.1**.
+
+### Fixed
+
+- **A restarted exit is taken over by its client at once.** The restarted exit had no client and dropped everything the old
+  one sent; the client noticed only after 30 s of silence («exit silent on every carrier for 30s: handshaking again»), and
+  never when it had not yet learned that its exit answers keepalives. The exit now answers an authenticated packet that
+  arrives without a handshake with a hello (at most one a second) and the client takes it over through the candidate
+  exchange: about 4 s instead of 30 s or never.
+
+## [0.13.0] / node-v1.6.0 - 2026-10-16 (OpenFluxTeam/OpenFlux)
+
+node-install.sh installs **node-v1.6.0**. The speed work of the `speedTest` branch (log: TRANSPORT_PERFORMANCE.md).
+Nothing on the wire changed: old clients and nodes work with new ones, but the gain in the node-to-client direction
+needs the node updated (each side picks the carrier it sends on).
+
+### Added
+
+- **A live direct carrier is used first**, whatever priority the profile gives it (`transport.PreferredCarrier`). Profiles had
+  direct at 50, below every document carrier, so the traffic went through a third party while a straight path worked. When
+  direct stops reaching the peer the next carrier takes over, and takes the traffic back when it returns. `Prefer = no` in a
+  `[Transport]` section or `OPENFLUX_DIRECT_FIRST=0` turn it off. New profiles and nodes give direct priority 110.
+- **Large MTU on direct** (16000, `OPENFLUX_DIRECT_MTU`): the tunnel follows the carriers that are live; a packet that no live
+  carrier moves is refused and the stack gets an ICMP fragmentation-needed, so a connection survives the fall back to a
+  carrier with a smaller limit.
+- `OPENFLUX_PPROF` (pprof endpoint), `cmd/speedbench` and `scripts/speedtest` (the test rig), extended gVisor counters in the debug STATS line.
+
+### Changed
+
+- Much less CPU per byte on the path of every carrier: zstd is tried only where it pays (never for the repeated envelope of TLS
+  traffic on a direct carrier), packets are copied and allocated far less (pooled send buffers, the stack writes straight into the
+  session buffer), the direct carrier writes with one `writev` and reads through a buffer, a lone packet after a pause is not
+  delayed 5 ms, scrypt runs once per key. On a 1-vCPU VPS the exit needs 1.9 s of CPU for 96 MB instead of 12.9 s.
+- Queues are bounded in bytes (512 KB) and the carrier socket has `TCP_NOTSENT_LOWAT` on Linux/Android, so a download does not
+  leave megabytes in front of the next page.
+
+### Fixed
+
+- Telemost's filler frames no longer make a Session peer log that the other side speaks classic mode.
+
+## [0.12.0] / node-v1.5.1 - 2026-10-15 (meepo161/OpenFlux)
+
+node-install.sh installs **node-v1.5.1**: node-v1.5.0 with the 0.7.3 Mail.ru batch.
+
+### Changed
+
+- Merged p1neappleXpress 0.7.3 (section below): the Mail.ru carrier packs up to
+  500 KB into each chat message, because the server cuts a connection after about
+  a dozen messages whatever their size. Only the sender changes, so old clients
+  and nodes keep working with new ones.
+
+## [0.11.0] / node-v1.5.0 - 2026-10-14 (meepo161/OpenFlux)
+
+node-install.sh installs **node-v1.5.0**: the node core with Avito, the 0.7.2
+fixes, ScriptAutoUpdate and everything below.
+
+### Changed
+
+- Merged p1neappleXpress 0.7.2 (section below): an Avito socket that dropped no
+  longer crashes the process; a cups.online or Avito exit on the phone starts
+  without a room list; steadier throughput tests. The «official» node script is
+  pinned at 630a0e5 (node-v1.4.1, the 0.7.2 exit core).
+
+### Added
+
+- **The node wizard installs every transport**: Telemost (a conference link),
+  Avito Code (rooms made at once, no sign-in) and signed `.flux` JS transports
+  (the app sends the package; the node keeps it current, `ScriptAutoUpdate`).
+  `node-install.sh` takes `telemost=`, `avito=` and `script=` lines;
+  `deploy/test/config-test.sh` checks the installer's config and node.conf
+  under the VDS's shell.
+- **Trial channels get Avito too.** A pool without transports (opensub's
+  personal channels) gets cups.online and Avito Code rooms, both made without
+  any sign-in; tried live: a tunnel through rooms made this way carries
+  traffic (about 100 KB/s cups.online, 80 KB/s Avito on one client). Telemost
+  conferences need a Yandex sign-in to be made (401 without one), and the JS
+  whiteboards (MTS-Link, Bitrix24, PRUFFME, Yandex Boards) join an existing
+  board as a guest but cannot make one.
+
+## [0.10.0] - 2026-10-13 (meepo161/OpenFlux)
+
+### Added
+
+- **opensub gives each app links with the transports it runs.** The app lists
+  them in `X-OpenFlux-Transports`; an app without the header gets the set links
+  carried before (yandex, vyandex, boards, mailru, cupsonline), since it drops a
+  link with a type it does not know and the whole location with it. Telemost
+  reaches subscribers this way (`share.Shareable` is the one list), and
+  `provision` takes Telemost conference links.
+
+### Changed
+
+- Merged p1neappleXpress 0.7.1 (section below): the avito carrier, cups.online
+  and avito as stripes with the ack-gated send window and 12 KB messages. The
+  fork's cups.online carrier keeps choosing its network (`--network`), the
+  stripe lanes too, and keeps giving up a half-received packet on the old wire
+  (`StreamResyncAfter`). The «official» node script is pinned at 3652885
+  (node-v1.4.0, the 0.7.1 exit core); the fork's own script still installs
+  node-v1.4.2 until the next fork node release.
+
+## [0.9.0] / node-v1.4.2 - 2026-10-13 (meepo161/OpenFlux)
+
+### Changed
+
+- Merged p1neappleXpress 0.6.0 and 0.6.1 (sections below): the Mail.ru carrier
+  now carries the tunnel over the document's chat channel (the Mail.ru server
+  closes the socket on synthetic cursor writes, so the old path is dead), the
+  scripted Mail.ru carrier connects again, and a node can keep its `.flux`
+  transports updated and self-healing (`--script-auto-update`). The fork's
+  fix that unlocks the document when a second editor joins stays on the new
+  path. Client and node must both run this version for Mail.ru.
+- The «official» script the node wizard offers is pinned at
+  p1neappleXpress c9076e7 (node-v1.3.1).
+
+## [0.8.0] - 2026-10-11 (meepo161/OpenFlux)
+
+### Added
+
+- `node-install.sh show` returns the channel's encryption `key`, read as root
+  over SSH, so the owner's app can make the link and profile of a node that was
+  installed elsewhere (a server screen lists all nodes on it and shares or
+  connects to any). `provision.ChannelInfo.Key`; its `String()` leaves the key out.
+
+## [0.7.0] - 2026-10-11 (meepo161/OpenFlux)
+
+### Added
+
+- The node's mode, l4 or l3, is chosen when a node is made and can be changed on
+  an installed channel. `node-install.sh` takes `mode=l3|l4` (plan, apply,
+  set-transports) and reports `mode` (show, apply, set-transports). l4 stays the
+  default and needs nothing. l3 passes IP packets through raw sockets: the
+  channel's unit gets a drop-in with `AmbientCapabilities=CAP_NET_RAW`, and
+  `l3-rst.sh` adds an iptables rule dropping the kernel's own TCP RSTs from the
+  server's address while an l3 channel runs (and removes it when the last one
+  stops). It needs iptables, iproute2 and systemd 231+, and says so before
+  installing; the rule is host-wide for that address, which the plan states.
+  `provision.Channel.Mode`, `provision.CheckMode`, `provision.Conn.SetChannel`,
+  `ChannelInfo.Mode`; `mobile.NodePlan` / `NodeApply` / `NodeSetTransports`
+  take the mode; the desktop node wizard takes `mode`.
+
+## [0.6.0] - 2026-10-11 (meepo161/OpenFlux)
+
+### Added
+
+- Subscription service `opensub` (`cmd/opensub`, `subscription/`): the owner of
+  nodes sells or gives access to them without handing out documents, keys or
+  SSH. People make an account in the app (login and password, no email; a
+  recovery key shown once), get a trial, pay (a manual provider: the owner
+  marks the order paid) and press "Подключить"; the service answers with the
+  locations built from the owner's node channels (`/etc/openflux/…` channel
+  files), re-read when they change. Keys without an account
+  (`openflux://sub?…`), devices per plan, password change and recovery,
+  account deletion; bcrypt over a SHA-256 prehash, rate limits, a self-signed
+  TLS certificate whose SHA-256 is in the key (pinned by the apps). The owner
+  runs it with `opensub serve` and manages it with `opensub users | grant |
+  ban | key-add | orders | paid …`. The whole design, every user step and edge
+  case: docs/subscriptions.ru.md. Release assets: `opensub-linux-amd64`,
+  `opensub-linux-arm64`.
+- `subscription.Invite`, `subscription.Document`: the key and the subscription
+  document the apps read (profiles are `openflux://v1/…` links, checked with
+  the same reader as imported ones).
+
+## [0.5.1] / node-v1.4.1 - 2026-10-10 (meepo161/OpenFlux)
+
+### Added
+
+- The apps change the documents of a channel already on the server: the node
+  wizard lists the server's channels, "Изменить транспорты" reads one
+  (`node-install.sh show`) and applies the new set in place
+  (`node-install.sh set-transports`). The key, port and encryption context
+  stay, so links handed out keep working; with the channel's profile on the
+  device the wizard builds the new link with the same context, checks the
+  channel and updates the profile. `provision.Conn.Show`,
+  `provision.Conn.SetTransports`, `provision.ShareLinkContext`; the node
+  wizard's `showChannel` / `setTransports`; `mobile.NodeShowChannel`,
+  `mobile.NodeSetTransports`, `mobile.NodeShareLinkContext`.
+
+### Fixed
+
+- Mail.ru Docs: the document server now answers an editor WebSocket that
+  claims to be Chrome with 409 Conflict when the TLS handshake is not
+  Chrome's, so the carrier never joined a document on either side. It
+  presents itself as Firefox, which the server accepts.
+- cups.online: a lost message no longer stalls a member's stream. A part of a
+  packet still waiting after `StreamResyncAfter` (2 s) is given up and the next
+  message starts the stream afresh; before, every later packet of that member
+  (resends too) was lost until a length happened to line the stream up again.
+- `TestInstallOnVDS` (the Node install workflow) answers the fork's own release
+  repository, so the updater steps run against the fake GitHub again.
+
+## [0.5.0] / node-v1.4.0 - 2026-10-10 (meepo161/OpenFlux)
+
+The fork on p1neappleXpress/OpenFlux 0.4.2: its script (JS) transports, Mail.ru and
+Yandex fixes, and the phpbox carrier, with the fork's bonding, node wizard, and
+per-carrier network binding.
+
+### Added
+
+- Adding and removing documents on a node that already runs: `node-install.sh
+  set-transports CONFIG` (`provision` / the apps' node management call it over SSH).
+  The key, the port, the cookies and the encryption context stay, so links already
+  handed out keep working. The node is restarted; if it does not come back up on
+  the new config, the previous one is restored.
+- Script (JS) transports, phpbox carrier and the rest of p1neappleXpress 0.4.0-0.4.2
+  (see the upstream sections below).
+
+### Changed
+
+- Merged p1neappleXpress/OpenFlux 0.4.2 into the fork. The Yandex carriers dial IPv4
+  first, through the carrier's own network binding (`dialIPv4FirstOn`), so bonded
+  carriers keep their interface.
+- The Yandex captcha stays a client job: the check is passed in the app and the
+  cookies reach the exit over the Session (`mobile.OfferExitCookies`), so one
+  carrier's cookies serve the others when a session cookie expires.
+
+## [0.4.0] / node-v1.3.0 - 2026-09-30 (meepo161/OpenFlux)
+
+### Added
+
+- Bonding: a client with `--bonding` (`Bonding = yes` in a .conf) uses all
+  its carriers at once, so documents on several networks (mobile data and
+  Wi-Fi) or several documents on one add their speeds up, and a carrier
+  that drops leaves the rest carrying on. TCP connections spread over the
+  carriers, one carrier each, and move when theirs is lost; UDP (SRT, QUIC)
+  is split packet by packet. The exit agrees by itself; exits before
+  node-v1.3.0 ignore the request and the client routes as before. Three
+  Mail.ru documents, three connections: 0.84 MB/s against 0.59 on one.
+- `Network = cellular|wifi|ethernet` per `[Transport]` binds a carrier to a
+  network: Android through the app (mobile data kept up next to Wi-Fi),
+  Windows by adapter type. The mobile library takes `"network"` per
+  transport, `"bonding"` next to them, and the app's NetworkBinder.
+
+### Fixed
+
+- `.conf` booleans took only true/false: `Bonding = yes` read as off.
+
+## [0.3.3] / node-v1.2.3 - 2026-09-30 (meepo161/OpenFlux)
+
+### Fixed
+
+- Mail.ru carrier: when the second peer joined the document, the editor
+  server locked the document on the first one and, since it never unlocked
+  it, dropped it 30 seconds later (disconnectReason 4007); rejoining, it
+  locked the document on the other peer. The carrier went down every half
+  minute while both peers were on it, and every rejoin stalled traffic for
+  up to 30 seconds, so long uploads such as a stream broke. The carrier now
+  unlocks the document for a joining peer (unLockDocument); a test pair held
+  a two-minute upload at about 4.8 Mbit/s without a drop.
+
+## [0.3.2] / node-v1.2.2 - 2026-09-30 (meepo161/OpenFlux)
+
+### Fixed
+
+- A node set up by the wizard (.conf carriers) or with --transports served
+  Session clients only: a client that speaks classic, such as the iOS app,
+  was dropped on every carrier ("serves Session peers only") and never got
+  through. Such an exit now also serves classic clients on any of its
+  carriers, as a --transport=X exit does; --negotiate stays Session-only.
+  The exit serves one client at a time, and a classic client is answered
+  only while no Session client is active on the channel.
+
+## [0.3.1] / node-v1.2.1 - 2026-09-29 (meepo161/OpenFlux)
+
+### Fixed
+
+- A full packet batch queue now waits for capacity instead of dropping data.
+  A batch rejected by a temporarily full or disconnected carrier is retried
+  in order until it is accepted or the tunnel stops.
+
+### Added
+
+- Tunnel diagnostics report queue waits, carrier send retries and TCP
+  retransmissions every 30 seconds when any of those counters increases.
+
+## [0.3.0] / node-v1.2.0 - 2026-09-29 (meepo161/OpenFlux)
+
+The fork on p1neappleXpress/OpenFlux 0.2.0 (one protocol for every client,
+links made and read by the core) with the node wizard's transport choice
+and self-updating nodes (p1neappleXpress/OpenFlux#125) and the Accounts
+core side (`mobile.OfferExitCookies`). The node core is `node-v1.2.0`.
+
+## [0.2.0] / node-v1.1.0 - 2026-09-28 (meepo161/OpenFlux)
+
+Releases of the meepo161 fork: the core with the node wizard's transport
+choice and self-updating nodes (p1neappleXpress/OpenFlux#125), wired to
+this fork.
+
+### Changed
+
+- `deploy/node-install.sh` installs the core from this fork's `node-v*`
+  releases and its updater follows them (`RELEASE_REPO=meepo161/OpenFlux`).
+- The node wizard (`--node-wizard` `connect`, `mobile.NodeConnect`) takes a
+  `source`: `fork` (default) installs this fork's core, `official` the same
+  script following p1neappleXpress/OpenFlux (`provision.PinnedFor`).
+
+## [0.7.3] - 2026-10-14 (p1neappleXpress/OpenFlux)
+
+### Changed
+
+- **Mail.ru is much faster.** The Mail.ru docs server cuts an anonymous editor after about a dozen
+  chat messages no matter how big they are, so the tunnel now coalesces far more into each message
+  before that cut — end-to-end throughput rises from tens of KB/s to roughly 800 KB/s per burst.
+  Only the Mail.ru carrier changes its default batch size; every other transport is byte-for-byte
+  unchanged, and `OPENFLUX_BATCH_BYTES` still overrides it.
+
+## [0.7.1] - 2026-10-13 (p1neappleXpress/OpenFlux)
+## [0.7.2] - 2026-10-13 (p1neappleXpress/OpenFlux)
+
+### Fixed
+
+- **A cups.online or Avito exit node could not be started on the phone**: the app asked for a document link
+  ("Ссылка на документ не указана"), but an exit of these two given no room list is the one that creates its
+  rooms. It starts now, and the link it shares carries the rooms it created (for Avito the list was left out).
+- **An Avito socket that dropped could crash the whole process** (the exit node, or the app): its reader went on
+  using the connection after it had been cleared, or read the next connection next to that one's own reader.
+  Each reader now keeps to its own socket and is waited for.
+
+## [0.7.1] - 2026-10-13
+
+0.7.0 was cut from a branch that did not carry 0.6.0 and 0.6.1, so it lost the Mail.ru chat-channel fix
+(Mail.ru answered "access deny" 4004 again) and the node's `.flux` auto-updater. 0.7.1 is 0.6.1 plus
+everything in 0.7.0, plus the fixes below.
+
+### Added
+
+- **avito (code.avito.ru) carrier**, and `avito` in share links.
+- **cups.online and avito run as stripes.** Each cups room (each avito room pair) is one lane of a reliable
+  striped link (sequence numbers, reorder, retransmission), so a message the server loses no longer breaks
+  the tunnel's byte stream, and speed adds up across rooms. A fresh exit prints a new room list format
+  (`{"v":2,...}`); an old bare list keeps the old wire, so running nodes and older apps keep working, but
+  an older app cannot use a new list. `CUPS_STRIPE=0` / `AVITO_STRIPE=0` make an exit print the old list.
+  `CUPS_ROOMS` sets how many rooms a fresh cups exit creates (default 4).
+
+### Fixed
+
+- **cups.online crawled at 25-90 KB/s.** The transport fired a message every 12 ms with no feedback; the
+  server relays a room only at ~130-200 KB/s and silently drops the rest from the relay (the send is still
+  acknowledged), so about 70% of what was sent never arrived and the retransmissions stalled the tunnel.
+  A lane now keeps at most 3 messages unanswered and sends the next one when the server answers, so it
+  follows each room's real rate; messages carry 12 KB instead of 8 KB. Through the tunnel, 4 rooms: 20 MB
+  at 424 KB/s (was 90 KB/s), retransmissions 2% instead of more than the data itself. `CUPS_WINDOW`
+  tunes the window (0 turns it off).
+- **avito sent one packet per round trip** (the chunk size never applied); an operation now carries up to
+  256 KB of framed packets, and its send/read loops stop with their socket instead of outliving a reconnect.
+- **A striped cups lane corrupted frames**: it kept slices of a receive buffer the socket reused.
+
+## [0.4.2] - 2026-10-07 (p1neappleXpress/OpenFlux)
+## [0.6.1] - 2026-10-13 (p1neappleXpress/OpenFlux)
+
+### Fixed
+
+- **The Mail.ru carrier dropped every connection with "access deny" (code 4004).** The current Mail.ru editor
+  server (R7/OnlyOffice 2026.2.1.2268) validates cursor and `saveChanges` writes against the live document
+  model and closes the socket on any synthetic one, so the transport's old trick of stuffing tunnel bytes into
+  the cursor field stopped working entirely. The data path now rides the document's **chat channel**
+  (`type:"message"`), which the server relays verbatim to the other participant without validating it against
+  the document: tunnelled bytes are tagged and base64-encoded there, the server's echo of our own chat and a
+  human's chat are skipped on receive, and the old cursor keep-alive and `saveChanges` "editor activity" are
+  gone (the Socket.IO ping/pong keeps the socket up). Both the native transport and its scripted (`.flux`)
+  port carry data this way now.
+- **The scripted Mail.ru carrier could not connect at all (HTTP 409 on the WebSocket upgrade).** `ws.open`
+  now offers permessage-deflate when a script asks for it (`{compress: true}`) — Mail.ru's nginx rejects the
+  upgrade without it — and sends `Accept-Language`, the same two fixes the native transport already carried.
+
+## [0.6.0] - 2026-10-12 (p1neappleXpress/OpenFlux)
+
+### Added
+
+- **A node can keep its scripted (`.flux`) transports current and self-heal, with no restart.** The new
+  `--script-auto-update` flag turns on a headless updater — the counterpart of the app's updater for a CLI or
+  exit node that has no GUI. It checks each `.flux` carrier's author feed on the usual schedule and installs
+  an update when the core vouches for it (first-party key, same wire); and when a carrier keeps failing to
+  connect it walks a recovery ladder: check for a newer package now, then roll back to the previous one, then
+  fall back to the native transport of the same service. An applied or rolled-back package is **hot-swapped**
+  into the live session, so only that one carrier blinks while it reconnects — the handshake, the other
+  carriers and the packet flow stay up. `--script-update-channel` selects `stable` or `nightly`. Off by
+  default, so node behaviour is unchanged unless asked for.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed
@@ -120,7 +522,7 @@ Hotfix for 0.4.1: Mail.ru Docs.
 
 Exit nodes that carry Mail.ru need `node-v1.2.2`.
 
-## [0.4.1] - 2026-10-07
+## [0.4.1] - 2026-10-07 (p1neappleXpress/OpenFlux)
 
 Hotfix for 0.4.0, found testing the release between a Windows client and a Linux L3 exit.
 
@@ -142,7 +544,7 @@ Hotfix for 0.4.0, found testing the release between a Windows client and a Linux
   the ignored traffic stays visible as `noct=` in `[L3-STATS]`. Nothing but tunnel flows ever
   reached the transport.
 
-## [0.4.0] - 2026-10-07
+## [0.4.0] - 2026-10-07 (p1neappleXpress/OpenFlux)
 
 ### Added
 
@@ -251,7 +653,7 @@ Hotfix for 0.4.0, found testing the release between a Windows client and a Linux
   are read with size limits.
 - Every GitHub Action is pinned to a commit SHA.
 
-## [0.3.0] - 2026-10-01
+## [0.3.0] - 2026-10-01 (p1neappleXpress/OpenFlux)
 
 ### Added
 
@@ -421,7 +823,7 @@ Hotfix for 0.4.0, found testing the release between a Windows client and a Linux
   channel does not stay up. An app with an older pinned script no longer
   downgrades a server the updater has moved on.
 
-## [0.2.0] - 2026-09-28
+## [0.2.0] - 2026-09-28 (p1neappleXpress/OpenFlux)
 
 Every client now behaves alike: peers of different builds and modes find
 each other instead of dropping every packet in silence. The node wizard
@@ -483,7 +885,7 @@ each other instead of dropping every packet in silence. The node wizard
 - `utils.Infof` reaches the apps' log screens.
 - A Session stopped each carrier twice.
 
-## [0.1.0] - 2026-09-27
+## [0.1.0] - 2026-09-27 (p1neappleXpress/OpenFlux)
 
 First release from the current `main` line (encrypted-logging + the
 maintainer's multi-transport work folded together) and the first cut by

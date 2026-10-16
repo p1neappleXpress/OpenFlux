@@ -113,8 +113,16 @@ func testL4UDPDatagramRoundTrip(t *testing.T, codec string) {
 	client := NewTCPTunnelMode(clientTransport, false, ExitModeL4)
 	defer exit.Close()
 	defer client.Close()
-	if codec == "negotiated" && (client.tunnelEP.MTU() != 1280 || exit.tunnelEP.MTU() != 1280) {
-		t.Fatal("negotiated MTU not applied to gVisor")
+	if codec == "negotiated" {
+		// The negotiated MTU is applied when the codec handshake completes,
+		// which runs beside Start: wait for it rather than race it.
+		deadline := time.Now().Add(5 * time.Second)
+		for (client.tunnelEP.MTU() != 1280 || exit.tunnelEP.MTU() != 1280) && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if client.tunnelEP.MTU() != 1280 || exit.tunnelEP.MTU() != 1280 {
+			t.Fatal("negotiated MTU not applied to gVisor")
+		}
 	}
 
 	dest := net.JoinHostPort(localIP.String(), fmt.Sprintf("%d", echo.LocalAddr().(*net.UDPAddr).Port))

@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -9,6 +10,8 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
+
+var errTestBuild = errors.New("rebuild failed")
 
 // fakeTransport is a minimal in-process Transport.
 type fakeTransport struct {
@@ -56,6 +59,56 @@ func TestManagerAddRemoveTransport(t *testing.T) {
 		t.Fatalf("after remove: %v", got)
 	}
 	_ = sess.Stop()
+}
+
+func TestManagerReloadWith(t *testing.T) {
+	sess, err := transport.NewSession(transport.PeerParameters{
+		Capabilities:  control.CapabilityIPv4 | control.CapabilityTCP,
+		MaxPacketSize: 1500,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Stop() }()
+	m := New(sess, nil, "test-secret-long-enough", "test-ctx")
+
+	old := &fakeTransport{}
+	_ = old.Start() // live
+	if err := m.Add("mailru", "script", old, 100, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// A successful reload swaps the raw transport, stops the old one, and keeps
+	// the carrier in place.
+	neu := &fakeTransport{}
+	if err := m.ReloadWith("mailru", func() (transport.Transport, error) { return neu, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if m.entries["mailru"].Raw != transport.Transport(neu) {
+		t.Fatal("entry raw not swapped to the rebuilt transport")
+	}
+	if old.IsConnected() {
+		t.Fatal("old transport was not stopped on reload")
+	}
+	if got := m.Transports(); len(got) != 1 || got[0] != "mailru" {
+		t.Fatalf("carrier set changed across reload: %v", got)
+	}
+
+	// A build failure leaves the running transport untouched.
+	keep := m.entries["mailru"].Raw
+	if err := m.ReloadWith("mailru", func() (transport.Transport, error) {
+		return nil, errTestBuild
+	}); err == nil {
+		t.Fatal("expected a build error to propagate")
+	}
+	if m.entries["mailru"].Raw != keep {
+		t.Fatal("a failed rebuild must not replace the running transport")
+	}
+
+	// Reloading an unknown carrier errors.
+	if err := m.ReloadWith("nope", func() (transport.Transport, error) { return &fakeTransport{}, nil }); err == nil {
+		t.Fatal("expected an error reloading an unknown transport")
+	}
 }
 
 func TestManagerCookieExchangerPerTransport(t *testing.T) {

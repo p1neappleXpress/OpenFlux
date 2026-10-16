@@ -6,3 +6,6 @@ deploy/node-install.sh text eol=lf
 # JvmPlatformServicesScriptTest's "valid" assertion failing only on the
 # Windows leg of OpenFluxDesktop's nightly CI).
 transport/script/js/** -text
+# Shell scripts run inside Linux images and on Linux hosts: a Windows
+# checkout must not turn their line endings into CRLF.
+*.sh text eol=lf

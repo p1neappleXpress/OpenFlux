@@ -363,9 +363,13 @@ func TestInteropCupsJSExitNativeClient(t *testing.T) {
 	deliver(t, exit, clientGot, down, 60*time.Second)
 }
 
-// A native exit's rooms, joined by a JS client.
+// A native exit's rooms, joined by a JS client. The JS transport speaks the
+// unstriped wire, so the exit is asked for the old list (CUPS_STRIPE=0); a
+// striped list is one the JS client must refuse
+// (TestInteropCupsJSClientRefusesStripedList).
 func TestInteropCupsNativeExitJSClient(t *testing.T) {
 	fake := newCupsFake(t)
+	t.Setenv("CUPS_STRIPE", "0")
 	exit := cupsonline.NewCupsonlineTransport("", transport.DefaultConfig(), false)
 	listCh := make(chan string, 4)
 	exit.OnRoomList(func(p string) { listCh <- p })
@@ -405,6 +409,24 @@ func TestInteropCupsJSClientWithoutRoomsDoesNotCreateAny(t *testing.T) {
 	if err := client.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = client.Stop() })
+	time.Sleep(1500 * time.Millisecond)
+	if fake.created != 0 {
+		t.Fatalf("a client created %d rooms", fake.created)
+	}
+	if state, _ := client.LastState(); state != "dead" {
+		t.Fatalf("state %q, want dead", state)
+	}
+}
+
+// A striped room list (a 0.7.1+ native exit) is not one the unstriped JS
+// transport can speak: it must fail rather than join the rooms and send the
+// exit frames it would misread.
+func TestInteropCupsJSClientRefusesStripedList(t *testing.T) {
+	fake := newCupsFake(t)
+	list := transport.PackRooms([]string{"0b3c6d1e-1111-2222-3333-444455556666"}, true)
+	client := jsCups(t, fake, list, false)
+	_ = client.Start()
 	t.Cleanup(func() { _ = client.Stop() })
 	time.Sleep(1500 * time.Millisecond)
 	if fake.created != 0 {

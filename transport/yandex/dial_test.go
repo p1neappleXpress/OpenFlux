@@ -108,7 +108,7 @@ func TestDialIPv4FirstLeavesLiteralsAlone(t *testing.T) {
 // Every client of the carriers must go through the dialer; a plain
 // http.Client{} would quietly bring the IPv6-first dial back.
 func TestCarrierTransportDialsIPv4First(t *testing.T) {
-	tr := carrierTransport()
+	tr := carrierTransport("")
 	if tr.DialContext == nil {
 		t.Fatal("carrier transport has no DialContext")
 	}

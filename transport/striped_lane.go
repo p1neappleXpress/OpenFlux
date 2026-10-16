@@ -51,6 +51,79 @@ type laneState struct {
 	busyAt    time.Time // the last window that carried traffic
 	limitedAt time.Time // the last window the rate held the lane back
 	rampUntil time.Time
+
+	deadAfter time.Duration // 0: deadAfterDefault
+	noPace    bool          // StripeOptions.NoPacing
+
+	// The delay-based window (StripeOptions.LaneWindow), for lanes that lose
+	// nothing but queue: how many pieces may be sent and not yet acked, grown
+	// while the lane's round trip stays near its best and cut once the
+	// carrier's queue shows up in it. A slow lane then holds few pieces and a
+	// fast one many, so lanes of very different speed add up.
+	winOn     bool
+	win       float64
+	slowStart bool
+	baseRTT   time.Duration
+	baseAt    time.Time
+	lrtt      time.Duration
+	cutAt     time.Time
+}
+
+const (
+	laneWinMin  = 8
+	laneWinMax  = 4096
+	laneWinInit = 24
+)
+
+// winRoom is how many more pieces the lane may take now, given how many it
+// has in flight; a large number when the window is off.
+func (l *laneState) winRoom(inflight int) int {
+	if !l.winOn {
+		return math.MaxInt32
+	}
+	if l.win == 0 {
+		l.win, l.slowStart = laneWinInit, true
+	}
+	if r := int(l.win) - inflight; r > 0 {
+		return r
+	}
+	return 0
+}
+
+// winSample feeds the window one round trip of the lane (a piece sent once
+// and acked).
+func (l *laneState) winSample(d time.Duration, now time.Time) {
+	if !l.winOn {
+		return
+	}
+	if l.win == 0 {
+		l.win, l.slowStart = laneWinInit, true
+	}
+	if l.baseRTT == 0 || d < l.baseRTT || now.Sub(l.baseAt) > 20*time.Second {
+		l.baseRTT, l.baseAt = d, now
+	}
+	if l.lrtt == 0 {
+		l.lrtt = d
+	} else {
+		l.lrtt = (7*l.lrtt + d) / 8
+	}
+	grow := l.baseRTT*2 + 80*time.Millisecond
+	switch {
+	case l.lrtt <= grow && l.slowStart:
+		l.win++ // doubles per round trip
+	case l.lrtt <= l.baseRTT+l.baseRTT/2+60*time.Millisecond:
+		l.slowStart = false
+		l.win += 1 / l.win // one piece per round trip
+	case l.lrtt > l.baseRTT*3+150*time.Millisecond:
+		l.slowStart = false
+		if now.Sub(l.cutAt) > l.baseRTT {
+			l.cutAt = now
+			l.win *= 0.90
+		}
+	default:
+		l.slowStart = false
+	}
+	l.win = math.Min(math.Max(l.win, laneWinMin), laneWinMax)
 }
 
 // pacingOn: STRIPE_PACE=0 lets every lane send all its clock allows.
@@ -92,7 +165,7 @@ func (l *laneState) allow(now time.Time) int {
 	if !l.started {
 		l.start(now)
 	}
-	if !pacingOn {
+	if !pacingOn || l.noPace {
 		return math.MaxInt32
 	}
 	l.tokens += l.rate * now.Sub(l.tokenAt).Seconds()
@@ -133,8 +206,14 @@ func (l *laneState) lostOne() {
 // forwarding it (a subscription that never started or broke). Such a lane
 // only gets a probe now and then until something arrives again.
 func (l *laneState) dead(now time.Time) bool {
-	return l.started && l.unanswered >= 20 && now.Sub(l.deliveredAt) > 600*time.Millisecond
+	after := l.deadAfter
+	if after <= 0 {
+		after = deadAfterDefault
+	}
+	return l.started && l.unanswered >= 20 && now.Sub(l.deliveredAt) > after
 }
+
+const deadAfterDefault = 600 * time.Millisecond
 
 // pace adjusts the rate after a window that lost loss of what it sent.
 func (l *laneState) pace(loss float64, now time.Time) {

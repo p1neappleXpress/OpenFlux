@@ -42,6 +42,10 @@ const (
 	// predate these ignore them, which the Session detects and tolerates.
 	SubtypeLinkPing Subtype = 0x20
 	SubtypeLinkPong Subtype = 0x21
+
+	// 0x30 and 0x31 were the Session bonding offer and ack (node-v1.3.0 to
+	// node-v1.5.x); bonding is gone, peers that still send them are ignored.
+	// Do not reuse them.
 )
 
 // ControlPacket is a decoded control message: subtype, flags, payload.

@@ -39,18 +39,6 @@ func TestCursorPayloadsBatch(t *testing.T) {
 	}
 }
 
-func TestHandleMessageDeliversEveryPacketOfABatch(t *testing.T) {
-	tr := NewMailruDocsTransport("Vuri/test", transport.DefaultConfig())
-	var got []string
-	tr.Receive(func(b []byte) { got = append(got, string(b)) })
-	msg := `42["message",{"type":"cursor","messages":[` + cursorEntry("---KA---") + "," +
-		cursorEntry(b64("first")) + "," + cursorEntry(b64("second")) + `]}]`
-	tr.handleMessage(&DocSession{}, []byte(msg))
-	if !reflect.DeepEqual(got, []string{"first", "second"}) {
-		t.Fatalf("delivered %v, want [first second]", got)
-	}
-}
-
 // A scheduled reconnect that is already waiting makes a second one a no-op.
 func TestSecondReconnectWhileOneIsWaitingReturnsAtOnce(t *testing.T) {
 	tr := NewMailruDocsTransport("AbCdEfGh1/IjKlMnOp2", transport.DefaultConfig())

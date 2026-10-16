@@ -75,7 +75,7 @@ func appendLog(message string) {
 // "legacy" (per-packet LZ4; both peers must agree). It returns an empty
 // string on success and a user-readable error on failure.
 func Start(transportType, documentURL, encryptionSecret, codec, maxToken, maxUid string) string {
-	if msg := validateClassic(transportType, documentURL, encryptionSecret); msg != "" {
+	if msg := validateClassic(transportType, documentURL, encryptionSecret, false); msg != "" {
 		return msg
 	}
 	return startPacket(func() (transport.Transport, error) {
@@ -151,8 +151,11 @@ func startPacket(build func() (transport.Transport, error)) string {
 	return ""
 }
 
-func validateClassic(transportType, documentURL, encryptionSecret string) string {
-	if transportType != "oneme" && documentURL == "" {
+// validateClassic checks a classic profile before it starts. exit is the
+// phone as the exit node: a cups.online or Avito exit started without a room
+// list creates its rooms, and ExitShareLink hands their list to clients.
+func validateClassic(transportType, documentURL, encryptionSecret string, exit bool) string {
+	if transportType != "oneme" && documentURL == "" && !(exit && createsRooms(transportType)) {
 		return "Ссылка на документ не указана"
 	}
 	if encryptionSecret != "" && utils.SecretChars(encryptionSecret) < utils.MinSecretChars {

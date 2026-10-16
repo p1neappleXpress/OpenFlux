@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,10 @@ type TransportConfig struct {
 	ReconnectMultiplier  float64
 	MaxQueueSize         int
 	KeepAliveInterval    time.Duration
+	// Network the carrier dials through (netbind): "" is the default
+	// route, or netbind.NetworkCellular, NetworkWiFi, NetworkEthernet, so
+	// a Session's carriers may leave through different networks.
+	Network string
 }
 
 type Transport interface {
@@ -29,8 +34,88 @@ type TransportStats struct {
 	PacketsSent   uint64
 	PacketsRecv   uint64
 	Reconnects    uint64
+	QueueWaits    uint64
+	SendRetries   uint64
 	Connected     bool
 	Uptime        time.Duration
+}
+
+// BatchSizeHinter is an optional interface a transport implements to raise the
+// default coalescing batch size for its carrier. A carrier capped by the number
+// of messages per connection rather than by bytes wants each message as large
+// as possible: the Mail.ru docs chat channel, for instance, is cut by the
+// server's anti-abuse after ~12 messages regardless of their size, so a small
+// batch wastes most of the per-connection budget. newLink passes the hint to
+// NewBatchedTransport; OPENFLUX_BATCH_BYTES still overrides it.
+type BatchSizeHinter interface {
+	PreferredBatchBytes() int
+}
+
+// CheapBytesCarrier is an optional interface for a carrier whose bytes cost
+// little next to the CPU spent compressing them (a plain TCP connection, as
+// opposed to a document in somebody else's cloud that moves a few hundred
+// KB/s). The batching layer then compresses only batches that shrink by a
+// good margin, and at the fastest level.
+type CheapBytesCarrier interface {
+	CheapBytes() bool
+}
+
+// PreferredCarrier is an optional interface for a carrier that goes straight to
+// the peer (a plain TCP connection to the exit) as opposed to one that goes
+// through somebody else's service. A Session sends over such a carrier
+// whenever it is live, whatever priority the profile gives it: the profiles
+// rank the document carriers above direct, which was meant as the backup
+// for when they are blocked, but a path that works is better than any relay,
+// faster and without the relay's rate limits. When it stops reaching the
+// peer the next carrier takes over, and takes the traffic back when it
+// returns. It changes nothing on the wire and nothing the peer must agree on.
+type PreferredCarrier interface {
+	Preferred() bool
+}
+
+// preferredBoost lifts a PreferredCarrier above every priority a profile sets.
+const preferredBoost = 1000
+
+// DefaultCarrierMTU is the IP packet size a carrier is assumed to move without
+// trouble when it says nothing: what a stack gets on an ordinary network.
+const DefaultCarrierMTU = 1500
+
+// CarrierMTUer is an optional interface for a carrier that moves large IP
+// packets as easily as small ones (a TCP stream): the tunnel stack then runs
+// a larger MTU, which divides the per-packet work of the whole pipeline.
+// A Session reports the smallest value over its carriers.
+type CarrierMTUer interface {
+	CarrierMTU() int
+}
+
+// StreamCarrierer is an optional interface for a transport whose data goes over reliable,
+// ordered byte streams (direct TCP) at the moment. The tunnel stack then runs the TCP
+// that suits a path that never loses a packet: Reno, which does not leave slow start on
+// the jitter of the carrier the way CUBIC's HyStart does (+50-70 % on a single download
+// over a real path), instead of CUBIC, which suits carriers that drop packets.
+type StreamCarrierer interface {
+	OnReliableStream() bool
+}
+
+// RecordHeadroom is the room a HeadroomSender wants in front of a record.
+const RecordHeadroom = 2
+
+// HeadroomSender is an optional interface of a carrier that puts a small
+// header in front of every record (DirectTransport: a 2-byte length). The
+// caller builds the record with RecordHeadroom spare bytes in front, the
+// carrier fills them in and keeps the buffer: one copy of the record less on
+// the way to the socket. The carrier owns buf from the call on, also when it
+// returns an error it is free to have dropped it.
+type HeadroomSender interface {
+	SendWithHeadroom(buf []byte) error
+}
+
+// FillSender is an optional interface of a transport that can have a packet
+// written straight into the buffer it is going to send: the caller says how
+// big the IPv4 packet is and fill copies it into dst. The tunnel stack uses it
+// to skip the intermediate copy of every packet it emits.
+type FillSender interface {
+	SendFill(size int, fill func(dst []byte)) error
 }
 
 func DefaultConfig() TransportConfig {
@@ -164,4 +249,14 @@ func (b *BaseTransport) RecordReconnect() {
 
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config
+}
+
+// PacketTooLargeError is what Send answers for an IPv4 packet that no live
+// carrier of the session can move: Limit is the largest size one can. The
+// tunnel stack turns it into an ICMP "fragmentation needed", after which the
+// connection carries on with smaller segments.
+type PacketTooLargeError struct{ Limit int }
+
+func (e *PacketTooLargeError) Error() string {
+	return fmt.Sprintf("session: packet exceeds what the live carriers move (%d bytes)", e.Limit)
 }

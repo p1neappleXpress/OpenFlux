@@ -31,14 +31,33 @@
 #                                                 script installed)
 #        node-install.sh upgrade                  (run as root: move every
 #                                                 channel to this core)
+#        node-install.sh set-cookies CONFIG_FILE  (run as root: replace a
+#                                                 channel's Yandex login)
+#        node-install.sh set-transports CONFIG_FILE (run as root: add or
+#                                                 remove the documents of a
+#                                                 running channel; key, port
+#                                                 and encryption context stay)
+#        node-install.sh show CONFIG_FILE         (run as root: a channel's
+#                                                 documents, port, state and
+#                                                 encryption context)
 #        node-install.sh update                   (run as root, by the timer:
 #                                                 move every channel to the
 #                                                 newest node-v* release)
 #        node-install.sh autoupdate on|off        (run as root: the updater)
 # The config is "key=value" lines: channel, key, port, the transports
-# (vyandex= or its old name url=: a Yandex document; mailru=: a Mail.ru
-# public document; cupsonline=: the packed room list) and autoupdate=yes|no.
-# apply and remove take it from a 0600 temp file, which they delete after reading, so that
+# (vyandex= or its old name url=: a Yandex document; yandex=: a Yandex
+# document through the older Yandex Docs transport; boards=: a Yandex board
+# open to guests; mailru=: a Mail.ru
+# public document; cupsonline=: the packed room list; telemost=: a Yandex
+# Telemost conference; avito=: Avito Code's packed room list; script=: a .flux
+# JS transport, one line each, "ID,PUBKEY,PARAMETER,SETTINGS,PACKAGE": the
+# package id, the author's key (hex), the primary parameter (unpadded
+# base64url), the settings its wizard saved, the .flux (base64; empty keeps the
+# one on the server)), autoupdate=yes|no,
+# and optionally cookies: the channel's Yandex sign-in as the core's cookie store JSON,
+# base64-encoded. It goes to /var/lib/openflux-node/<channel>/cookies.json
+# (0600, owned by the node user) and is never printed. apply and remove
+# take it from a 0600 temp file, which they delete after reading, so that
 # stdin stays free for `sudo -S` (a wrong sudo password would otherwise make
 # sudo read the config as further password attempts). Secrets never appear
 # in arguments, so they stay out of ps and shell history.
@@ -50,10 +69,10 @@
 set -u
 umask 077
 
-CORE_VERSION="node-v1.3.1"
-SHA_amd64="94f0fbd2f7f60763bf6c4be0623e928ce878f846e33308dd41bc8d735e7b69b0"
-SHA_arm64="dcf1fbf57bf535483c15b0aa0bd8bf6a3bc34248c1992db79b7ceeb818172f69"
-SHA_arm="c19b474aa03e5a77bd8a1d31672bc324a9678a87de333a71f384ae2d1c6c888f"
+CORE_VERSION="node-v1.7.0"
+SHA_amd64="13fd9eed6d970243dde0b95834e42b83fe81cfe5e69a7fd3056e864c66b20c8f"
+SHA_arm64="e38e0368e34afd8a0f94780d35008b34a44e1a08bec7a0778f15d29b464e50f9"
+SHA_arm="9dbf93a73a8266052e112215ece19586973d1da9db2ded68957f766e0af5d96d"
 # The repository this script and its core come from: the core is one of its
 # node-v* releases, and the updater follows them (UPDATE_CONF may override
 # that with a "repo=owner/name" line).
@@ -256,7 +275,10 @@ pick_port() {
 
 # ---- input ------------------------------------------------------------------
 
-CHANNEL=""; URL=""; MAILRU=""; CUPS=""; KEY=""; PORT=""; AUTOUPDATE=""
+CHANNEL=""; URL=""; YANDEX=""; MAILRU=""; BOARDS=""; CUPS=""; KEY=""; PORT=""; COOKIES=""; AUTOUPDATE=""; MODE=""
+TELEMOST=""; AVITO=""; SCRIPTS=""
+NL='
+'
 
 # read_config [FILE]: reads stdin, or FILE and then deletes it.
 read_config() {
@@ -271,11 +293,18 @@ read_config() {
             channel=*) CHANNEL=${line#channel=} ;;
             url=*) URL=${line#url=} ;;
             vyandex=*) URL=${line#vyandex=} ;;
+            yandex=*) YANDEX=${line#yandex=} ;;
             mailru=*) MAILRU=${line#mailru=} ;;
+            boards=*) BOARDS=${line#boards=} ;;
             cupsonline=*) CUPS=${line#cupsonline=} ;;
+            telemost=*) TELEMOST=${line#telemost=} ;;
+            avito=*) AVITO=${line#avito=} ;;
+            script=*) SCRIPTS="$SCRIPTS${line#script=}$NL" ;;
             key=*) KEY=${line#key=} ;;
             port=*) PORT=${line#port=} ;;
+            cookies=*) COOKIES=${line#cookies=} ;;
             autoupdate=*) AUTOUPDATE=${line#autoupdate=} ;;
+            mode=*) MODE=${line#mode=} ;;
             "") ;;
             *) fail input "неизвестная строка конфигурации" ;;
         esac
@@ -287,8 +316,17 @@ valid_key() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{64}$'; }
 valid_url() {
     printf '%s' "$1" | grep -Eq '^https://(docs|disk)\.yandex\.(ru|com|by|kz|uz)/edit/d/[A-Za-z0-9_-]{16,200}$'
 }
+valid_yandex() {
+    printf '%s' "$1" | grep -Eq '^https://(docs|disk)\.yandex\.(ru|com|by|kz|uz)/(edit/d/[A-Za-z0-9_-]{16,200}|i/[A-Za-z0-9_-]{6,64})$'
+}
+valid_boards() {
+    printf '%s' "$1" | grep -Eq '^https://boards\.yandex\.ru/whiteboard/\?hash=[0-9a-f]{32}$'
+}
 valid_mailru() {
     printf '%s' "$1" | grep -Eq '^https://cloud\.mail\.ru/public/[A-Za-z0-9_-]{2,64}/[A-Za-z0-9_-]{2,128}$'
+}
+valid_telemost() {
+    printf '%s' "$1" | grep -Eq '^https://telemost\.yandex\.ru/j/[0-9]{6,32}$'
 }
 # The cups.online room list: base64url of a JSON list of room ids.
 valid_rooms() { [ ${#1} -ge 8 ] && [ ${#1} -le 4096 ] && printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_-]+$'; }
@@ -299,17 +337,72 @@ valid_port() {
 # check_transports: validates the chosen transports (plan and apply).
 check_transports() {
     [ -z "$URL" ] || valid_url "$URL" || fail input "адрес документа должен быть вида https://docs.yandex.ru/edit/d/..."
+    [ -z "$YANDEX" ] || valid_yandex "$YANDEX" || fail input "адрес документа Yandex Docs должен быть вида https://docs.yandex.ru/edit/d/..."
     [ -z "$MAILRU" ] || valid_mailru "$MAILRU" || fail input "ссылка Mail.ru должна быть вида https://cloud.mail.ru/public/..."
+    [ -z "$BOARDS" ] || valid_boards "$BOARDS" || fail input "ссылка на доску должна быть вида https://boards.yandex.ru/whiteboard/?hash=..."
     [ -z "$CUPS" ] || valid_rooms "$CUPS" || fail input "неверный список комнат cups.online"
+    [ -z "$TELEMOST" ] || valid_telemost "$TELEMOST" || fail input "ссылка на Телемост должна быть вида https://telemost.yandex.ru/j/..."
+    [ -z "$AVITO" ] || valid_rooms "$AVITO" || fail input "неверный список комнат Avito"
+    check_scripts
+    [ -z "$COOKIES" ] || [ -n "$URL" ] || [ -n "$YANDEX" ] || fail input "вход в Яндекс нужен только каналу с документом Яндекса"
     case "$AUTOUPDATE" in ""|yes|no) ;; *) fail input "autoupdate: yes или no" ;; esac
+    case "$MODE" in ""|l4|l3) ;; *) fail input "режим ноды: l4 или l3" ;; esac
 }
+
+# b64url_decode TEXT: unpadded base64url to what it encodes.
+b64url_decode() {
+    b=$(printf '%s' "$1" | tr '_-' '/+')
+    case $((${#b} % 4)) in 2) b="$b==" ;; 3) b="$b=" ;; esac
+    printf '%s' "$b" | base64 -d 2>/dev/null
+}
+
+# script_field LINE N: the Nth field of a script= line.
+script_field() { printf '%s' "$1" | cut -d, -f"$2"; }
+
+# check_scripts: each script= line is a package id once, the author's key, a
+# parameter that fits a node.conf line, settings and a package in base64.
+check_scripts() {
+    seen=" "
+    set -f
+    old_ifs=$IFS
+    IFS=$NL
+    for line in $SCRIPTS; do
+        IFS=$old_ifs
+        id=$(script_field "$line" 1)
+        printf '%s' "$id" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' || fail input "JS-транспорт: неверный идентификатор пакета"
+        case "$seen" in *" $id "*) fail input "JS-транспорт $id выбран дважды" ;; esac
+        seen="$seen$id "
+        valid_key "$(script_field "$line" 2)" || fail input "JS-транспорт $id: нужен ключ автора (64 hex)"
+        param=$(script_field "$line" 3)
+        # Lengths by ${#}: a large {m,n} makes some greps blow up compiling the pattern.
+        # grep sees no line in an empty value: those are checked by -z.
+        [ -z "$param" ] || { [ ${#param} -le 5600 ] && printf '%s' "$param" | grep -Eq '^[A-Za-z0-9_-]+$'; } || fail input "JS-транспорт $id: неверный параметр"
+        value=$(b64url_decode "$param")
+        case "$value" in *"#"*|*";"*|*"$NL"*|*"$(printf '\r')"*) fail input "JS-транспорт $id: параметр не помещается в node.conf" ;; esac
+        settings=$(script_field "$line" 4)
+        [ -z "$settings" ] || { [ ${#settings} -le 16384 ] && printf '%s' "$settings" | grep -Eq '^[A-Za-z0-9+/_=-]+$'; } || fail input "JS-транспорт $id: неверные настройки"
+        pkg=$(script_field "$line" 5)
+        [ -z "$pkg" ] || printf '%s' "$pkg" | grep -Eq '^[A-Za-z0-9+/=]+$' || fail input "JS-транспорт $id: пакет не в base64"
+        IFS=$NL
+    done
+    IFS=$old_ifs
+    set +f
+}
+
+# script_ids: the packages of the script= lines, one per line, in order.
+script_ids() { printf '%s' "$SCRIPTS" | cut -d, -f1; }
 
 # transport_names: the channel's transports for people, primary first.
 transport_names() {
     names=""
     [ -n "$URL" ] && names="Яндекс Документ"
+    [ -n "$YANDEX" ] && names="${names:+$names, }Yandex Docs"
     [ -n "$MAILRU" ] && names="${names:+$names, }Mail.ru Документ"
+    [ -n "$TELEMOST" ] && names="${names:+$names, }Яндекс Телемост"
+    [ -n "$BOARDS" ] && names="${names:+$names, }Яндекс Доска"
+    [ -n "$AVITO" ] && names="${names:+$names, }Avito"
     [ -n "$CUPS" ] && names="${names:+$names, }cups.online"
+    for id in $(script_ids); do names="${names:+$names, }JS: $id"; done
     printf '%s' "$names"
 }
 
@@ -317,7 +410,39 @@ transport_names() {
 # pickSessionContext does: the highest-priority transport's URL, cups.online
 # aside. "" leaves node.conf without a URL line (the core's "http://#").
 session_context() {
-    if [ -n "$URL" ]; then printf '%s' "$URL"; elif [ -n "$MAILRU" ]; then printf '%s' "$MAILRU"; fi
+    if [ -n "$URL" ]; then printf '%s' "$URL"
+    elif [ -n "$YANDEX" ]; then printf '%s' "$YANDEX"
+    elif [ -n "$MAILRU" ]; then printf '%s' "$MAILRU"
+    elif [ -n "$TELEMOST" ]; then printf '%s' "$TELEMOST"
+    elif [ -n "$BOARDS" ]; then printf '%s' "$BOARDS"
+    elif [ -n "$AVITO" ]; then printf '%s' "$AVITO"
+    else
+        # The scripts share one priority: the first with a parameter, as the core picks.
+        for line in $SCRIPTS; do
+            value=$(b64url_decode "$(script_field "$line" 3)")
+            [ -n "$value" ] && { printf '%s' "$value"; break; }
+        done
+    fi
+}
+
+# write_cookies: decodes COOKIES into the channel's cookie store, which the
+# node loads at start. Needs the node user to exist.
+write_cookies() {
+    printf '%s' "$COOKIES" | grep -Eq '^[A-Za-z0-9+/]+={0,2}$' || return 1
+    [ ${#COOKIES} -le 65536 ] || return 1
+    dir="$STATE_ROOT/$CHANNEL"
+    # umask 077 would make the parent 0700 and lock the node user out of
+    # its own state directory (systemd only creates it when missing).
+    mkdir -p "$STATE_ROOT" && chmod 0755 "$STATE_ROOT" || return 1
+    mkdir -p "$dir" || return 1
+    tmp="$dir/.cookies.json.new"
+    if have base64; then
+        printf '%s' "$COOKIES" | base64 -d > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    else
+        printf '%s' "$COOKIES" | openssl base64 -d -A > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    fi
+    head -c 1 "$tmp" | grep -q '{' || { rm -f "$tmp"; return 1; }
+    chown "$NODE_USER:$NODE_USER" "$dir" "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$dir/cookies.json"
 }
 
 check_channel() {
@@ -374,6 +499,11 @@ cmd_plan() {
     fi
     set -- "$@" "Создать $CONF_ROOT/$CHANNEL: node.conf и ключ шифрования канала (права 0640)"
     [ -f "$UNIT_FILE" ] || set -- "$@" "Установить шаблон systemd $UNIT_FILE"
+    if [ "$MODE" = l3 ]; then
+        l3_ready plan
+        set -- "$@" "Режим l3: каналу даётся CAP_NET_RAW, а пока он работает, исходящие TCP-RST ядра с адреса сервера отбрасываются правилом iptables. Это касается и других сервисов на этом адресе"
+    fi
+    [ -n "$SCRIPTS" ] && set -- "$@" "Положить пакеты JS-транспортов в $STATE_ROOT/$CHANNEL/scripts: нода сама обновляет их из каталога транспортов"
     names=$(transport_names)
     if [ -n "$names" ]; then
         set -- "$@" "Запустить openflux-node@$CHANNEL: $names и direct на порту $PORT/tcp (резерв)"
@@ -401,7 +531,7 @@ cmd_plan() {
 }
 
 # Rollback state for apply: what this run created.
-CREATED_USER=0; CREATED_UNIT=0; CREATED_BIN=0; CREATED_CONF=0; CREATED_FW=""; STARTED=0
+CREATED_USER=0; CREATED_UNIT=0; CREATED_BIN=0; CREATED_CONF=0; CREATED_FW=""; STARTED=0; CREATED_L3=0
 
 rollback() {
     [ "$STARTED" = 1 ] && unit_stop "openflux-node@$CHANNEL"
@@ -409,6 +539,7 @@ rollback() {
         ufw) ufw delete allow "$PORT/tcp" >/dev/null 2>&1 ;;
         firewalld) firewall-cmd --permanent --remove-port="$PORT/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 ;;
     esac
+    [ "$CREATED_L3" = 1 ] && set_channel_mode "$CHANNEL" l4 && systemctl daemon-reload >/dev/null 2>&1
     [ "$CREATED_CONF" = 1 ] && rm -rf "${CONF_ROOT:?}/$CHANNEL" "${STATE_ROOT:?}/$CHANNEL"
     [ "$CREATED_UNIT" = 1 ] && rm -f "$UNIT_FILE" && systemctl daemon-reload >/dev/null 2>&1
     [ "$CREATED_BIN" = 1 ] && rm -f "$BIN_DIR/openflux-$CORE_VERSION"
@@ -481,6 +612,88 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 WantedBy=multi-user.target
 EOF
     chmod 0644 "$UNIT_FILE"
+}
+
+# ---- l3: the node forwards IP packets ------------------------------------
+#
+# Mode = l3 sends clients' packets out through raw sockets, which needs
+# CAP_NET_RAW, and the kernel must not answer the replies with its own RSTs:
+# while an l3 channel runs, outbound TCP RSTs from the node's address are
+# dropped. That is host-wide for the address (other services on it lose
+# their RSTs, nothing else), which is why l4 is the default.
+
+L3_HELPER="/opt/openflux-node/l3-rst.sh"
+
+# l3_dropin_file CHANNEL: the per-channel systemd drop-in that makes it l3.
+l3_dropin_file() { printf '/etc/systemd/system/openflux-node@%s.service.d/l3.conf' "$1"; }
+
+# systemd_new_enough: the "+" prefix (a command that runs as root even in a
+# sandboxed unit) needs systemd 231.
+systemd_new_enough() {
+    v=$(systemctl --version 2>/dev/null | sed -n '1s/^systemd \([0-9]*\).*/\1/p')
+    [ -n "$v" ] && [ "$v" -ge 231 ]
+}
+
+# l3_ready: what l3 needs of the server; the reason on stderr-less failure via fail.
+l3_ready() { # STEP
+    have iptables || fail "$1" "для режима l3 нужен iptables, а его на сервере нет"
+    have ip || fail "$1" "для режима l3 нужна команда ip (iproute2)"
+    systemd_new_enough || fail "$1" "для режима l3 нужен systemd 231 или новее"
+}
+
+write_l3_helper() {
+    mkdir -p "$(dirname "$L3_HELPER")"
+    cat > "$L3_HELPER" <<'EOF'
+#!/bin/sh
+# Managed by OpenFlux node-install.sh: drops the kernel's own TCP RSTs for the
+# node's address while an l3 channel runs (the node answers those packets itself).
+ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
+[ -n "$ip" ] || exit 0
+rule="OUTPUT -p tcp --tcp-flags RST RST -s $ip -j DROP"
+case "$1" in
+    add) iptables -C $rule 2>/dev/null || iptables -A $rule ;;
+    del)
+        # Another l3 channel still running keeps the rule.
+        for d in /etc/systemd/system/openflux-node@*.service.d/l3.conf; do
+            [ -f "$d" ] || continue
+            ch=${d#/etc/systemd/system/openflux-node@}; ch=${ch%.service.d/l3.conf}
+            [ "$ch" = "$2" ] && continue
+            systemctl is-active --quiet "openflux-node@$ch" && exit 0
+        done
+        iptables -C $rule 2>/dev/null && iptables -D $rule ;;
+esac
+exit 0
+EOF
+    chmod 0755 "$L3_HELPER"
+}
+
+# set_channel_mode CHANNEL MODE: makes the channel's unit l3 or plain l4 (the caller reloads systemd).
+set_channel_mode() {
+    f=$(l3_dropin_file "$1")
+    if [ "$2" = l3 ]; then
+        write_l3_helper
+        mkdir -p "$(dirname "$f")"
+        cat > "$f" <<EOF
+$MARKER
+# This channel forwards IP packets (Mode = l3).
+[Service]
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+ExecStartPre=+$L3_HELPER add %i
+ExecStopPost=+$L3_HELPER del %i
+EOF
+        chmod 0644 "$f"
+    else
+        [ -f "$f" ] && grep -qF "$MARKER" "$f" && rm -f "$f"
+        rmdir "$(dirname "$f")" 2>/dev/null
+    fi
+    return 0
+}
+
+# channel_mode CHANNEL: l3 or l4, as the channel's node.conf says.
+channel_mode() {
+    m=$(sed -n 's/^Mode = //p' "$CONF_ROOT/$1/node.conf" 2>/dev/null | head -n 1)
+    [ "$m" = l3 ] && printf l3 || printf l4
 }
 
 # script_core FILE: the CORE_VERSION a copy of this script pins.
@@ -563,16 +776,97 @@ write_node_conf() {
     cat <<EOF
 # OpenFlux node channel $CHANNEL, written by node-install.sh
 Role = exit
-Mode = l4
+Mode = ${MODE:-l4}
 EncryptionKeyFile = $CONF_ROOT/$CHANNEL/encryption-key
 CookieStore = $STATE_ROOT/$CHANNEL/cookies.json
 EOF
-    context=$(session_context)
+    # set-transports keeps the channel's context: links already handed out were made with it.
+    if [ "${CONTEXT_KEEP:-}" = 1 ]; then context=$KEPT_CONTEXT; else context=$(session_context); fi
     [ -n "$context" ] && printf 'URL = %s\n' "$context"
+    [ -n "$SCRIPTS" ] && printf 'ScriptAutoUpdate = yes\n'
     [ -n "$URL" ] && printf '\n[Transport vyandex]\nType = vyandex\nPriority = 100\nURL = %s\n' "$URL"
+    [ -n "$YANDEX" ] && printf '\n[Transport yandex]\nType = yandex\nPriority = 95\nURL = %s\n' "$YANDEX"
     [ -n "$MAILRU" ] && printf '\n[Transport mailru]\nType = mailru\nPriority = 90\nURL = %s\n' "$MAILRU"
+    [ -n "$TELEMOST" ] && printf '\n[Transport telemost]\nType = telemost\nPriority = 85\nURL = %s\n' "$TELEMOST"
+    [ -n "$BOARDS" ] && printf '\n[Transport boards]\nType = boards\nPriority = 80\nURL = %s\n' "$BOARDS"
+    [ -n "$AVITO" ] && printf '\n[Transport avito]\nType = avito\nPriority = 75\nURL = %s\n' "$AVITO"
     [ -n "$CUPS" ] && printf '\n[Transport cupsonline]\nType = cupsonline\nPriority = 70\nURL = %s\n' "$CUPS"
-    printf '\n[Transport direct]\nType = direct\nPriority = 50\nListen = 0.0.0.0:%s\n' "$PORT"
+    write_script_sections
+    printf '\n[Transport direct]\nType = direct\nPriority = 110\nListen = 0.0.0.0:%s\n' "$PORT"
+}
+
+# write_script_sections: a [Transport script], [Transport script-2], ... per
+# script= line, named as the apps name them, each running its package from
+# the channel's state directory, where the node's updater keeps it current.
+write_script_sections() {
+    n=0
+    set -f
+    old_ifs=$IFS
+    IFS=$NL
+    for line in $SCRIPTS; do
+        IFS=$old_ifs
+        n=$((n + 1))
+        name=script
+        [ "$n" -gt 1 ] && name="script-$n"
+        id=$(script_field "$line" 1)
+        printf '\n[Transport %s]\nType = script\nPriority = 60\nName = %s\nPath = %s\nPubkey = %s\n' \
+            "$name" "$id" "$STATE_ROOT/$CHANNEL/scripts/$id.flux" "$(script_field "$line" 2)"
+        value=$(b64url_decode "$(script_field "$line" 3)")
+        [ -n "$value" ] && printf 'URL = %s\n' "$value"
+        settings=$(script_field "$line" 4)
+        [ -n "$settings" ] && printf 'Params = %s\n' "$settings"
+        IFS=$NL
+    done
+    IFS=$old_ifs
+    set +f
+}
+
+# install_scripts: writes the packages the config carries into the channel's
+# state directory (owned by the node user, so its updater can replace them).
+# A line without a package keeps the file already there. Returns 1 with
+# SCRIPT_ERROR set when it cannot.
+install_scripts() {
+    sdir="$STATE_ROOT/$CHANNEL/scripts"
+    [ -n "$SCRIPTS" ] || return 0
+    mkdir -p "$sdir" || { SCRIPT_ERROR="не удалось создать $sdir"; return 1; }
+    set -f
+    old_ifs=$IFS
+    IFS=$NL
+    for line in $SCRIPTS; do
+        IFS=$old_ifs
+        id=$(script_field "$line" 1)
+        pkg=$(script_field "$line" 5)
+        if [ -n "$pkg" ]; then
+            if ! printf '%s' "$pkg" | base64 -d > "$sdir/.$id.flux.tmp" 2>/dev/null || [ ! -s "$sdir/.$id.flux.tmp" ]; then
+                rm -f "$sdir/.$id.flux.tmp"
+                SCRIPT_ERROR="пакет JS-транспорта $id не распаковался"
+                IFS=$old_ifs; set +f
+                return 1
+            fi
+            mv -f "$sdir/.$id.flux.tmp" "$sdir/$id.flux"
+        elif [ ! -s "$sdir/$id.flux" ]; then
+            SCRIPT_ERROR="пакета JS-транспорта $id нет на сервере: передайте его"
+            IFS=$old_ifs; set +f
+            return 1
+        fi
+        IFS=$NL
+    done
+    IFS=$old_ifs
+    set +f
+    chown -R "$NODE_USER:$NODE_USER" "$sdir" && chmod 0750 "$sdir"
+}
+
+# prune_scripts: removes packages the channel no longer runs.
+prune_scripts() {
+    sdir="$STATE_ROOT/$CHANNEL/scripts"
+    [ -d "$sdir" ] || return 0
+    keep=" $(script_ids | tr '\n' ' ') "
+    for f in "$sdir"/*.flux; do
+        [ -e "$f" ] || continue
+        id=${f##*/}
+        id=${id%.flux}
+        case "$keep" in *" $id "*) ;; *) rm -f "$f" ;; esac
+    done
 }
 
 cmd_apply() {
@@ -582,6 +876,7 @@ cmd_apply() {
     valid_key "$KEY" || fail input "ключ канала должен быть 64 hex-символа"
     check_transports
     valid_port "$PORT" || fail input "не указан порт из плана"
+    [ -z "$COOKIES" ] || printf '%s' "$COOKIES" | grep -Eq '^[A-Za-z0-9+/]+={0,2}$' || fail input "cookies должны быть в base64"
     arch=$(detect_arch)
     [ -n "$arch" ] || fail apply "архитектура $(uname -m) не поддерживается"
     [ -d "$CONF_ROOT/$CHANNEL" ] && fail apply "канал $CHANNEL уже существует на сервере"
@@ -620,10 +915,19 @@ cmd_apply() {
     # The node's state directory (systemd before 235 does not make it).
     mkdir -p "$STATE_ROOT/$CHANNEL" && chmod 0755 "$STATE_ROOT" && chown "$NODE_USER:$NODE_USER" "$STATE_ROOT/$CHANNEL" \
         && chmod 0750 "$STATE_ROOT/$CHANNEL" || apply_fail config "не удалось создать $STATE_ROOT/$CHANNEL"
+    if [ -n "$COOKIES" ]; then
+        write_cookies || apply_fail cookies "не удалось сохранить вход в Яндекс на сервере"
+    fi
+    install_scripts || apply_fail scripts "$SCRIPT_ERROR"
 
     if [ ! -f "$UNIT_FILE" ]; then
         write_unit
         CREATED_UNIT=1
+    fi
+    if [ "$MODE" = l3 ]; then
+        l3_ready apply
+        set_channel_mode "$CHANNEL" l3
+        CREATED_L3=1
     fi
     systemctl daemon-reload || apply_fail systemd "systemctl daemon-reload не удался"
 
@@ -651,13 +955,17 @@ cmd_apply() {
     autoupdate=false
     apply_autoupdate
     autoupdate_on && autoupdate=true
-    printf '{"ok":true,"channel":"%s","port":%s,"core":"%s","autoupdate":%s}\n' "$CHANNEL" "$PORT" "$(core_to_use)" "$autoupdate"
+    printf '{"ok":true,"channel":"%s","port":%s,"core":"%s","autoupdate":%s,"mode":"%s"}\n' "$CHANNEL" "$PORT" "$(core_to_use)" "$autoupdate" "${MODE:-l4}"
 }
 
 # remove_channel CHANNEL: stops the channel, closes its firewall port and
 # deletes its config and state.
 remove_channel() {
     unit_stop "openflux-node@$1"
+    if [ -f "$(l3_dropin_file "$1")" ]; then
+        set_channel_mode "$1" l4
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
     if [ -f "$CONF_ROOT/$1/firewall" ]; then
         read -r kind port < "$CONF_ROOT/$1/firewall"
         case "$kind" in
@@ -869,6 +1177,125 @@ cmd_update() {
         "$latest" "$(json_escape "${prev#openflux-}")" "$(json_list "$@")"
 }
 
+# set-cookies: replaces a channel's Yandex sign-in and restarts it.
+cmd_set_cookies() {
+    [ "$(id -u)" = 0 ] || fail set-cookies "нужны права root (sudo)"
+    read_config "$@"
+    check_channel
+    [ -d "$CONF_ROOT/$CHANNEL" ] || fail set-cookies "канала $CHANNEL нет на сервере"
+    [ -n "$COOKIES" ] || fail set-cookies "нет cookies"
+    write_cookies || fail set-cookies "не удалось сохранить вход в Яндекс на сервере"
+    systemctl restart "openflux-node@$CHANNEL" || fail set-cookies "не удалось перезапустить openflux-node@$CHANNEL"
+    printf '{"ok":true,"channel":"%s"}\n' "$CHANNEL"
+}
+
+# set-transports CONFIG_FILE: changes the transports of a channel that already
+# runs (add or remove a document). The key, the port, the cookies and the
+# encryption context stay, so the links handed out keep working; the node is
+# restarted, and if it does not come back the old node.conf is put back.
+cmd_set_transports() {
+    [ "$(id -u)" = 0 ] || fail set-transports "нужны права root (sudo)"
+    read_config "$@"
+    check_channel
+    dir="$CONF_ROOT/$CHANNEL"
+    [ -f "$dir/node.conf" ] || fail set-transports "канала $CHANNEL нет на сервере"
+    KEY=$(cat "$dir/encryption-key" 2>/dev/null)
+    # The direct transport's listen port is what the node runs on; the port file mirrors it.
+    PORT=$(sed -n 's/^Listen = [^:]*:\([0-9]*\)$/\1/p' "$dir/node.conf" | tail -n 1)
+    valid_key "$KEY" || fail set-transports "ключ канала $CHANNEL не читается"
+    valid_port "$PORT" || fail set-transports "порт канала $CHANNEL не читается"
+    printf '%s\n' "$PORT" > "$dir/port" && chown "root:$NODE_USER" "$dir/port" && chmod 0644 "$dir/port"
+    check_transports
+    [ -n "$URL$YANDEX$MAILRU$BOARDS$CUPS$TELEMOST$AVITO$SCRIPTS" ] || fail input "нужен хотя бы один документ: без него канал не нужен"
+
+    # The context is the URL line before the first [Transport] section.
+    KEPT_CONTEXT=$(awk '/^\[/{exit} /^URL = /{sub(/^URL = /,""); print; exit}' "$dir/node.conf")
+    CONTEXT_KEEP=1
+    PREV_MODE=$(channel_mode "$CHANNEL")
+    [ -n "$MODE" ] || MODE=$PREV_MODE
+    [ "$MODE" = l3 ] && l3_ready set-transports
+    cp -p "$dir/node.conf" "$dir/node.conf.prev" || fail set-transports "не удалось сохранить прежний node.conf"
+    tmp=$(mktemp "$dir/.node.conf.XXXXXX") || fail set-transports "не удалось создать временный файл"
+    write_node_conf > "$tmp" && chown "root:$NODE_USER" "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$dir/node.conf" \
+        || { rm -f "$tmp"; fail set-transports "не удалось записать node.conf"; }
+    [ -n "$COOKIES" ] && { write_cookies || fail set-transports "не удалось сохранить вход в Яндекс на сервере"; }
+    if ! install_scripts; then
+        set_transports_rollback
+        fail set-transports "$SCRIPT_ERROR"
+    fi
+    if [ "$MODE" != "$PREV_MODE" ]; then
+        set_channel_mode "$CHANNEL" "$MODE"
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
+
+    if ! systemctl restart "openflux-node@$CHANNEL" >/dev/null 2>&1; then
+        set_transports_rollback
+        fail set-transports "не удалось перезапустить openflux-node@$CHANNEL"
+    fi
+    sleep 4
+    if ! systemctl is-active --quiet "openflux-node@$CHANNEL"; then
+        logs=$(journalctl -u "openflux-node@$CHANNEL" -n 8 -o cat --no-pager 2>/dev/null | tail -n 8)
+        set_transports_rollback
+        fail set-transports "нода не поднялась с новыми транспортами, вернули прежние: $logs"
+    fi
+    rm -f "$dir/node.conf.prev"
+    prune_scripts
+    printf '{"ok":true,"channel":"%s","transports":"%s","mode":"%s"}\n' "$CHANNEL" "$(json_escape "$(transport_names)")" "$MODE"
+}
+
+# show CONFIG_FILE: one channel's documents, port, state, mode, encryption
+# context and key, read from its node.conf (root: the files are not
+# world-readable). The key goes only to the root who asks over SSH: the
+# owner's app builds the channel's link and profile from it.
+cmd_show() {
+    [ "$(id -u)" = 0 ] || fail show "нужны права root (sudo)"
+    read_config "$@"
+    check_channel
+    dir="$CONF_ROOT/$CHANNEL"
+    [ -f "$dir/node.conf" ] || fail show "канала $CHANNEL нет на сервере"
+    port=$(sed -n 's/^Listen = [^:]*:\([0-9]*\)$/\1/p' "$dir/node.conf" | tail -n 1)
+    context=$(awk '/^\[/{exit} /^URL = /{sub(/^URL = /,""); print; exit}' "$dir/node.conf")
+    state=$(systemctl is-active "openflux-node@$CHANNEL" 2>/dev/null)
+    key=$(cat "$dir/encryption-key" 2>/dev/null)
+    valid_key "$key" || key=""
+    printf '{"ok":true,"channel":"%s","state":"%s","port":%s,"context":"%s","mode":"%s","key":"%s","transports":[' \
+        "$CHANNEL" "$(json_escape "$state")" "${port:-0}" "$(json_escape "$context")" "$(channel_mode "$CHANNEL")" "$key"
+    first=1
+    awk '
+        function flush() { if (type != "") print type "|" url "|" name "|" pubkey "|" params; type = ""; url = ""; name = ""; pubkey = ""; params = "" }
+        /^\[Transport /          { flush(); section = 1; next }
+        /^\[/                    { flush(); section = 0; next }
+        section && /^Type = /    { sub(/^Type = /, ""); type = $0; next }
+        section && /^URL = /     { sub(/^URL = /, ""); url = $0; next }
+        section && /^Name = /    { sub(/^Name = /, ""); name = $0; next }
+        section && /^Pubkey = /  { sub(/^Pubkey = /, ""); pubkey = $0; next }
+        section && /^Params = /  { sub(/^Params = /, ""); params = $0; next }
+        END                      { flush() }
+    ' "$dir/node.conf" | while IFS='|' read -r type url name pubkey params; do
+        [ "$type" = direct ] && continue
+        [ "$first" = 1 ] || printf ','
+        first=0
+        if [ "$type" = script ]; then
+            printf '{"type":"script","url":"%s","script":"%s","pubkey":"%s","params":"%s"}' \
+                "$(json_escape "$url")" "$(json_escape "$name")" "$(json_escape "$pubkey")" "$(json_escape "$params")"
+        else
+            printf '{"type":"%s","url":"%s"}' "$(json_escape "$type")" "$(json_escape "$url")"
+        fi
+    done
+    printf ']}\n'
+}
+
+# set_transports_rollback: the previous node.conf back, and the node restarted on it.
+set_transports_rollback() {
+    dir="$CONF_ROOT/$CHANNEL"
+    [ -f "$dir/node.conf.prev" ] && mv -f "$dir/node.conf.prev" "$dir/node.conf"
+    if [ -n "${PREV_MODE:-}" ]; then
+        set_channel_mode "$CHANNEL" "$PREV_MODE"
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
+    systemctl restart "openflux-node@$CHANNEL" >/dev/null 2>&1
+}
+
 # autoupdate on|off: turns the core updater on or off for the whole server,
 # e.g. on channels installed before the wizard offered it.
 cmd_autoupdate() {
@@ -903,7 +1330,10 @@ case "${1:-}" in
     list) cmd_list ;;
     status) cmd_status ;;
     upgrade) cmd_upgrade ;;
+    set-cookies) shift; cmd_set_cookies "$@" ;;
+    set-transports) shift; cmd_set_transports "$@" ;;
+    show) shift; cmd_show "$@" ;;
     update) cmd_update ;;
     autoupdate) shift; cmd_autoupdate "$@" ;;
-    *) fail usage "usage: node-install.sh probe|plan|apply|remove|list|uninstall|status|upgrade|update|autoupdate" ;;
+    *) fail usage "usage: node-install.sh probe|plan|apply|remove|list|uninstall|status|upgrade|set-cookies|set-transports|show|update|autoupdate" ;;
 esac

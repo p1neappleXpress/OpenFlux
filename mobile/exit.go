@@ -28,6 +28,12 @@ var exitNode = struct {
 
 type roomLister interface{ RoomList() string }
 
+// createsRooms: carriers whose exit, started without a room list, creates
+// rooms of its own (their list becomes the clients' --url).
+func createsRooms(transportType string) bool {
+	return transportType == "cupsonline" || transportType == "avito"
+}
+
 // addExitRoom remembers raw for ExitShareLink when its rooms are known only
 // once it runs. Called while the exit's transports are built.
 func addExitRoom(name string, raw transport.Transport) {
@@ -46,7 +52,7 @@ func addExitRoom(name string, raw transport.Transport) {
 // StartExit starts the exit node in classic single-transport mode; the
 // arguments are those of Start. Returns "" or a user-readable error.
 func StartExit(transportType, documentURL, encryptionSecret, codec, maxToken, maxUid string) string {
-	if msg := validateClassic(transportType, documentURL, encryptionSecret); msg != "" {
+	if msg := validateClassic(transportType, documentURL, encryptionSecret, true); msg != "" {
 		return msg
 	}
 	return startExitWith(func() (transport.Transport, error) {
