@@ -105,6 +105,10 @@ type DirectTransport struct {
 	// Exit-mode listener.
 	listener net.Listener
 
+	// Exit mode: accepted connections that have not sent their first record
+	// yet. Guarded by mu.
+	pending map[net.Conn]struct{}
+
 	// Stats not tracked by BaseTransport directly.
 	reconnects atomic.Uint64
 	drops      atomic.Uint64
@@ -126,6 +130,7 @@ func NewDirectTransport(base TransportConfig, cfg DirectConfig) *DirectTransport
 		config:        cfg,
 		done:          make(chan struct{}),
 		queue:         make(chan []byte, base.MaxQueueSize),
+		pending:       make(map[net.Conn]struct{}),
 	}
 	utils.Debugf("[DIRECT] created: isExit=%v listen=%q dial=%q handshakeTimeout=%v readTimeout=%v keepAlive=%v maxRecord=%d queueCap=%d",
 		cfg.IsExit, cfg.ListenAddr, cfg.DialAddr, cfg.HandshakeTimeout, cfg.ReadTimeout,
@@ -185,6 +190,10 @@ func (t *DirectTransport) Stop() error {
 		utils.Debugf("[DIRECT] Stop: closing active conn %s", connDesc(t.conn))
 		_ = t.conn.Close()
 		t.conn = nil
+	}
+	for c := range t.pending {
+		_ = c.Close()
+		delete(t.pending, c)
 	}
 	t.mu.Unlock()
 	t.SetConnected(false)
@@ -248,6 +257,13 @@ func (t *DirectTransport) Drops() uint64 { return t.drops.Load() }
 
 // ---- exit mode ----
 
+// maxPendingDirectConns caps accepted connections still waiting for their
+// first record; more are closed right away.
+const maxPendingDirectConns = 8
+
+// acceptLoop serves every accepted connection on its own goroutine. A new
+// connection becomes the active one only after its first valid record, so a
+// silent connection (a stale peer, a port scanner) cannot hold the exit.
 func (t *DirectTransport) acceptLoop() {
 	utils.Debugf("[DIRECT] acceptLoop: started on %s", t.listener.Addr().String())
 	for {
@@ -271,8 +287,26 @@ func (t *DirectTransport) acceptLoop() {
 			continue
 		}
 		utils.Debugf("[DIRECT] acceptLoop: ACCEPTED %s", connDesc(conn))
-		t.serveConn(conn)
-		utils.Debugf("[DIRECT] acceptLoop: serveConn returned, looping back")
+		t.mu.Lock()
+		select {
+		case <-t.done:
+			t.mu.Unlock()
+			_ = conn.Close()
+			return
+		default:
+		}
+		full := len(t.pending) >= maxPendingDirectConns
+		if !full {
+			t.pending[conn] = struct{}{}
+		}
+		t.mu.Unlock()
+		if full {
+			utils.Debugf("[DIRECT] acceptLoop: %d connections already pending, closing %s",
+				maxPendingDirectConns, connDesc(conn))
+			_ = conn.Close()
+			continue
+		}
+		go t.serveConn(conn, false)
 	}
 }
 
@@ -306,7 +340,7 @@ func (t *DirectTransport) dialLoop() {
 			utils.Debugf("[DIRECT] dialLoop: CONNECTED to %s in %v (local=%s remote=%s)",
 				t.config.DialAddr, elapsed, connDesc(conn),
 				conn.RemoteAddr().String())
-			t.serveConn(conn)
+			t.serveConn(conn, true)
 			t.reconnects.Add(1)
 			utils.Debugf("[DIRECT] dialLoop: serveConn returned (reconnects=%d)", t.reconnects.Load())
 			delay = t.config.ReconnectMinDelay
@@ -331,8 +365,12 @@ func (t *DirectTransport) dialLoop() {
 
 // ---- shared conn lifecycle ----
 
-func (t *DirectTransport) serveConn(conn net.Conn) {
-	utils.Debugf("[DIRECT] serveConn: begin %s", connDesc(conn))
+// serveConn reads records from conn. An active conn (client mode) is the
+// transport's connection from the start; an exit's accepted conn is pending
+// until its first valid record, which must arrive within HandshakeTimeout,
+// and then replaces the previous active conn.
+func (t *DirectTransport) serveConn(conn net.Conn, active bool) {
+	utils.Debugf("[DIRECT] serveConn: begin %s active=%v", connDesc(conn), active)
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 		if t.config.KeepAliveInterval > 0 {
@@ -342,20 +380,25 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 		}
 	}
 
-	t.mu.Lock()
-	t.conn = conn
-	t.mu.Unlock()
-	t.SetConnected(true)
-	utils.Debugf("[DIRECT] serveConn: connected=%v", t.IsConnected())
+	if active {
+		t.mu.Lock()
+		t.conn = conn
+		t.SetConnected(true)
+		t.mu.Unlock()
+		utils.Debugf("[DIRECT] serveConn: connected=%v", t.IsConnected())
+	} else if t.config.HandshakeTimeout > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(t.config.HandshakeTimeout))
+	}
 
 	defer func() {
 		utils.Debugf("[DIRECT] serveConn: tearing down %s", connDesc(conn))
 		t.mu.Lock()
+		delete(t.pending, conn)
 		if t.conn == conn {
 			t.conn = nil
+			t.SetConnected(false)
 		}
 		t.mu.Unlock()
-		t.SetConnected(false)
 		_ = conn.Close()
 	}()
 
@@ -368,7 +411,7 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 		default:
 		}
 
-		if t.config.ReadTimeout > 0 {
+		if active && t.config.ReadTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(t.config.ReadTimeout))
 		}
 		utils.Debugf("[DIRECT] serveConn: waiting for 2-byte header")
@@ -399,6 +442,14 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 			utils.Debugf("[DIRECT] serveConn: record hexdump:\n%s", hex.Dump(buf[:n]))
 		}
 
+		if !active {
+			if !t.activate(conn) {
+				return
+			}
+			active = true
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 		t.RecordReceive(n)
@@ -406,6 +457,30 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 		t.recordsIn.Add(1)
 		t.CallReceive(pkt)
 	}
+}
+
+// activate makes a pending exit conn the active one and closes the previous
+// active conn. It reports false once the transport is stopping.
+func (t *DirectTransport) activate(conn net.Conn) bool {
+	t.mu.Lock()
+	delete(t.pending, conn)
+	select {
+	case <-t.done:
+		t.mu.Unlock()
+		return false
+	default:
+	}
+	old := t.conn
+	t.conn = conn
+	t.SetConnected(true)
+	t.mu.Unlock()
+	if old != nil {
+		utils.Debugf("[DIRECT] activate: %s replaces %s", connDesc(conn), connDesc(old))
+		_ = old.Close()
+	} else {
+		utils.Debugf("[DIRECT] activate: %s is active", connDesc(conn))
+	}
+	return true
 }
 
 // ---- writer ----
