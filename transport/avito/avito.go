@@ -56,6 +56,14 @@ type AvitoConfig struct {
 	NumRooms        int
 	RoomCreatePause time.Duration
 
+	// After a 429 (or a 403 on the WebSocket) every request of the transport
+	// waits: Retry-After when given, otherwise ThrottleMinDelay doubling up
+	// to ThrottleMaxDelay.
+	// Room creation gives up after MaxThrottled such answers.
+	ThrottleMinDelay time.Duration
+	ThrottleMaxDelay time.Duration
+	MaxThrottled     int
+
 	StatsInterval time.Duration
 }
 
@@ -88,6 +96,10 @@ func DefaultAvitoConfig() AvitoConfig {
 		NumRooms:        envKB("AVITO_ROOMS", 8), // room PAIRS = stripe lanes
 		RoomCreatePause: 300 * time.Millisecond,
 
+		ThrottleMinDelay: 2 * time.Second,
+		ThrottleMaxDelay: 60 * time.Second,
+		MaxThrottled:     6,
+
 		StatsInterval: 5 * time.Second,
 	}
 }
@@ -97,7 +109,125 @@ var (
 	errRefused  = errors.New("refused")
 	errNoRoom   = errors.New("avito: нет подключённой комнаты")
 	errStopped  = errors.New("avito: транспорт остановлен")
+
+	errForbidden = errors.New("avito: Avito отклонил запрос (403), вероятно, из-за User-Agent или IP")
+	errThrottled = errors.New("avito: Avito ограничивает частоту запросов (429)")
 )
+
+// maxRetryAfter caps a Retry-After value from the server.
+const maxRetryAfter = 10 * time.Minute
+
+// statusError is a non-200 answer from Avito.
+type statusError struct {
+	what       string
+	code       int
+	retryAfter time.Duration // from Retry-After; 0 when absent
+	body       string
+}
+
+func (e *statusError) Error() string {
+	if e.body == "" {
+		return fmt.Sprintf("%s status %d", e.what, e.code)
+	}
+	return fmt.Sprintf("%s status %d: %s", e.what, e.code, e.body)
+}
+
+// parseRetryAfter reads Retry-After as seconds or an HTTP date.
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if s, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	if at, err := http.ParseTime(v); err == nil {
+		if d := time.Until(at); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// pause is a backoff shared by every request of one transport, so after a
+// 429 (or a 403 on the WebSocket) no room asks Avito again before it ends.
+type pause struct {
+	mu    sync.Mutex
+	until time.Time
+	last  time.Duration
+}
+
+// extend pauses for d, or, when d is 0, for twice the previous pause (min to
+// max); while a pause is running a d of 0 leaves it as is, so rooms failing
+// together double it once. It returns the pause applied.
+func (p *pause) extend(d, minD, maxD time.Duration) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		d = min(d, maxRetryAfter)
+	} else if left := time.Until(p.until); left > 0 {
+		return left
+	} else {
+		d = minD
+		if p.last > 0 {
+			d = min(p.last*2, maxD)
+		}
+	}
+	p.last = d
+	if u := time.Now().Add(d); u.After(p.until) {
+		p.until = u
+	}
+	return d
+}
+
+// reset restarts the doubling after a successful request.
+func (p *pause) reset() {
+	p.mu.Lock()
+	p.last = 0
+	p.mu.Unlock()
+}
+
+// wait sleeps until the pause ends; false once ctx is done.
+func (p *pause) wait(ctx context.Context) bool {
+	p.mu.Lock()
+	d := time.Until(p.until)
+	p.mu.Unlock()
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	return sleepCtx(ctx, d)
+}
+
+// createRoomPaced is createRoom under the shared pause: a 429 pauses and
+// retries (at most cfg.MaxThrottled times per *throttled counter), a 403 is
+// returned at once as errForbidden.
+func createRoomPaced(ctx context.Context, cookies string, p *pause, cfg AvitoConfig, throttled *int) (string, error) {
+	for {
+		if !p.wait(ctx) {
+			return "", errStopped
+		}
+		id, err := createRoom(ctx, cookies)
+		var se *statusError
+		if !errors.As(err, &se) {
+			if err == nil {
+				p.reset()
+			}
+			return id, err
+		}
+		switch se.code {
+		case http.StatusForbidden:
+			return "", fmt.Errorf("%w: %v", errForbidden, err)
+		case http.StatusTooManyRequests:
+			if *throttled >= cfg.MaxThrottled {
+				return "", fmt.Errorf("%w: %v", errThrottled, err)
+			}
+			*throttled++
+			d := p.extend(se.retryAfter, cfg.ThrottleMinDelay, cfg.ThrottleMaxDelay)
+			utils.Debugf("[AVITO] POST room: 429, pausing %v", d)
+		default:
+			return "", err
+		}
+	}
+}
 
 func createRoom(ctx context.Context, cookies string) (string, error) {
 	jar, _ := cookiejar.New(nil)
@@ -115,7 +245,12 @@ func createRoom(ctx context.Context, cookies string) (string, error) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("POST room status %d: %s", resp.StatusCode, truncate(body, 200))
+		return "", &statusError{
+			what:       "POST room",
+			code:       resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			body:       truncate(body, 200),
+		}
 	}
 	var result struct {
 		Room struct {
@@ -169,6 +304,7 @@ type avitoWS struct {
 	onData    func([]byte)
 	sendQueue chan []byte
 	stats     *channelStats
+	pause     *pause // shared by all rooms of the transport
 
 	// Striped wire (see stripe.go): an op carries a run of framed pieces
 	// ([len u32][piece]...) instead of one packet; pull, when set, makes the
@@ -204,8 +340,16 @@ func (w *avitoWS) dial() (*websocket.Conn, error) {
 		ReadBufferSize:   w.config.ReadBufferSize,
 		WriteBufferSize:  w.config.WriteBufferSize,
 	}
-	conn, _, err := dialer.DialContext(w.ctx, wsURL, header)
+	conn, resp, err := dialer.DialContext(w.ctx, wsURL, header)
 	if err != nil {
+		if errors.Is(err, websocket.ErrBadHandshake) && resp != nil &&
+			(resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests) {
+			err = &statusError{
+				what:       "ws handshake",
+				code:       resp.StatusCode,
+				retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			}
+		}
 		return nil, fmt.Errorf("dial: %w", err)
 	}
 	return conn, nil
@@ -299,6 +443,9 @@ func (w *avitoWS) subscribe() error {
 func (w *avitoWS) run() {
 	delay := w.config.ReconnectMinDelay
 	for w.ctx.Err() == nil {
+		if !w.pause.wait(w.ctx) {
+			return
+		}
 		err := w.connectAndServe()
 		w.connected.Store(false)
 		if w.ctx.Err() != nil {
@@ -306,6 +453,13 @@ func (w *avitoWS) run() {
 		}
 		utils.Debugf("[AVITO] ws error (%s): %v", w.roomID[:8], err)
 		w.stats.reconnects.Add(1)
+		// A 403/429 handshake pauses every room of the transport, and this
+		// one goes on from the longest delay.
+		var se *statusError
+		if errors.As(err, &se) {
+			w.pause.extend(se.retryAfter, w.config.ThrottleMinDelay, w.config.ThrottleMaxDelay)
+			delay = w.config.ReconnectMaxDelay
+		}
 		if !sleepCtx(w.ctx, delay) {
 			return
 		}
@@ -335,6 +489,7 @@ func (w *avitoWS) connectAndServe() error {
 	if err := w.subscribe(); err != nil {
 		return err
 	}
+	w.pause.reset()
 	w.connected.Store(true)
 	utils.Debugf("[AVITO] WS ready: %s ver=%d docLen=%d", w.roomID[:8], w.ver, w.docLen)
 
@@ -549,6 +704,8 @@ type AvitoTransport struct {
 	rxWss []*avitoWS
 	rr    atomic.Uint32
 
+	pause pause
+
 	statsStart time.Time
 }
 
@@ -637,6 +794,7 @@ func (t *AvitoTransport) Start() error {
 				stats:     &channelStats{idx: i, roomID: id},
 				framed:    t.striped,
 				wake:      make(chan struct{}, 1),
+				pause:     &t.pause,
 			}
 			ws.onData = onData
 			wss[i] = ws
@@ -681,15 +839,21 @@ func (t *AvitoTransport) enterRooms() ([]string, error) {
 	// Exit mode: create 2*NumRooms (half tx, half rx).
 	total := t.config.NumRooms * 2
 	ids := make([]string, 0, total)
-	for i := 0; i < total; i++ {
+	throttled := 0
+	var fatal error // 403 or too many 429s: stop creating rooms
+	for i := 0; i < total && fatal == nil; i++ {
 		if t.ctx.Err() != nil {
 			return nil, errStopped
 		}
 		var roomID string
 		var lastErr error
 		for attempt := 0; attempt < 5; attempt++ {
-			roomID, lastErr = createRoom(t.ctx, t.cookies)
+			roomID, lastErr = createRoomPaced(t.ctx, t.cookies, &t.pause, t.config, &throttled)
 			if lastErr == nil {
+				break
+			}
+			if errors.Is(lastErr, errForbidden) || errors.Is(lastErr, errThrottled) {
+				fatal = lastErr
 				break
 			}
 			wait := t.config.RoomCreatePause * time.Duration(1<<uint(attempt))
@@ -714,6 +878,9 @@ func (t *AvitoTransport) enterRooms() ([]string, error) {
 		}
 	}
 	if len(ids) == 0 {
+		if fatal != nil {
+			return nil, fatal
+		}
 		return nil, fmt.Errorf("could not create any room")
 	}
 
@@ -890,8 +1057,10 @@ func CreateRoomList(ctx context.Context, cookies string) (string, error) {
 	cfg := DefaultAvitoConfig()
 	total := cfg.NumRooms * 2
 	ids := make([]string, 0, total)
+	var p pause
+	throttled := 0
 	for i := 0; i < total; i++ {
-		id, err := createRoom(ctx, cookies)
+		id, err := createRoomPaced(ctx, cookies, &p, cfg, &throttled)
 		if err != nil {
 			if len(ids) > 0 {
 				break
