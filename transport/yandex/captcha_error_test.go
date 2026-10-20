@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -51,4 +52,70 @@ func TestFetchDocInfoLoginPageReturnsSentinel(t *testing.T) {
 	if !errors.Is(err, ErrLoginRequired) {
 		t.Fatalf("expected ErrLoginRequired, got %v", err)
 	}
+}
+
+// powFailHandler redirects /doc (and the boards /whiteboard/) to captchaURL
+// and answers everything else with 403, so the internal PoW solver fails.
+func powFailHandler(captchaURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/doc", "/whiteboard/":
+			http.Redirect(w, r, captchaURL, http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusForbidden)
+		}
+	}
+}
+
+// checkPoWFailErr wants ErrCaptchaRequired with the solver's cause kept.
+func checkPoWFailErr(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrCaptchaRequired) {
+		t.Fatalf("expected ErrCaptchaRequired, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "captcha showcaptcha status 403") {
+		t.Fatalf("solver cause lost: %v", err)
+	}
+}
+
+// A redirect to showcaptchafast whose PoW solve fails must still be returned
+// as ErrCaptchaRequired, so the external solver is asked.
+func TestFetchDocInfoFailedPoWReturnsSentinel(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		powFailHandler(srv.URL+"/showcaptchafast?test=1")(w, r)
+	}))
+	defer srv.Close()
+
+	tr := &YandexDocsTransport{url: srv.URL + "/doc"}
+	_, err := tr.fetchDocInfo(srv.URL+"/doc", "0000000001")
+	checkPoWFailErr(t, err)
+}
+
+// Same for the Volga (vyandex) document authorization.
+func TestAuthorizeWithJarFailedPoWReturnsSentinel(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		powFailHandler(srv.URL+"/showcaptchafast?test=1")(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := authorizeWithJar(srv.URL+"/doc", nil)
+	checkPoWFailErr(t, err)
+}
+
+// Same for the boards authorization.
+func TestBoardsAuthorizeFailedPoWReturnsSentinel(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		powFailHandler(srv.URL+"/showcaptchafast?test=1")(w, r)
+	}))
+	defer srv.Close()
+
+	old := boardsBaseURL
+	boardsBaseURL = srv.URL
+	t.Cleanup(func() { boardsBaseURL = old })
+
+	_, err := (&BoardsTransport{}).authorize("testhash", "guest")
+	checkPoWFailErr(t, err)
 }

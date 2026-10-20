@@ -240,7 +240,7 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 			if strings.Contains(loc, "showcaptchafast") {
 				utils.Debugf("[VOLGA] captcha required, solving...")
 				if _, cerr := solveCaptcha(docURL, jar, volgaUserAgent); cerr != nil {
-					return nil, fmt.Errorf("captcha solve: %w", cerr)
+					return nil, fmt.Errorf("%w: captcha solve: %w", ErrCaptchaRequired, cerr)
 				}
 				utils.Debugf("[VOLGA] captcha solved, retrying from %s", docURL)
 				currentURL = docURL
