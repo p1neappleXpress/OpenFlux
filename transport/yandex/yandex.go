@@ -809,7 +809,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 			if strings.Contains(loc, "showcaptchafast") {
 				utils.Debugf("[YDOCS] captcha detected, solving...")
 				if _, cerr := solveCaptcha(currentURL, jar, ua); cerr != nil {
-					return YandexDocsInfo{}, fmt.Errorf("captcha solve: %w", cerr)
+					return YandexDocsInfo{}, fmt.Errorf("%w: captcha solve: %w", ErrCaptchaRequired, cerr)
 				}
 				utils.Debugf("[YDOCS] captcha solved, retrying original url")
 				currentURL = url

@@ -23,9 +23,11 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
+// boardsBaseURL is the boards origin; replaced in tests.
+var boardsBaseURL = "https://boards.yandex.ru"
+
 const (
-	boardsBase = "boards.yandex.ru"
-	boardsUA   = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
+	boardsUA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
 	boardsSocketHostDefault = "socket33.boards.yandex.ru"
 
@@ -217,7 +219,7 @@ func (t *BoardsTransport) getAllowCaptcha(client *http.Client, u, hash string) e
 	req.Header.Set("User-Agent", boardsUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
+	req.Header.Set("Referer", boardsBaseURL+"/guest/?hash="+hash)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -246,14 +248,14 @@ func (t *BoardsTransport) authorize(hash, name string) (boardsInfo, error) {
 		},
 	}
 
-	docURL := "https://" + boardsBase + "/whiteboard/?hash=" + hash
+	docURL := boardsBaseURL + "/whiteboard/?hash=" + hash
 
 	// GET whiteboard — может вернуть 302 на showcaptchafast
 	if err := t.getAllowCaptcha(client, docURL, hash); err != nil {
 		if err == errCaptchaRequired {
 			utils.Debugf("[BOARDS] captcha required, solving...")
 			if _, cerr := solveCaptcha(docURL, jar, boardsUA); cerr != nil {
-				return boardsInfo{}, fmt.Errorf("captcha solve: %w", cerr)
+				return boardsInfo{}, fmt.Errorf("%w: captcha solve: %w", ErrCaptchaRequired, cerr)
 			}
 			utils.Debugf("[BOARDS] captcha solved, re-fetching whiteboard")
 
@@ -272,7 +274,7 @@ func (t *BoardsTransport) authorize(hash, name string) (boardsInfo, error) {
 		return boardsInfo{}, fmt.Errorf("request-guest-token: %w", err)
 	}
 
-	u, _ := url.Parse("https://" + boardsBase)
+	u, _ := url.Parse(boardsBaseURL)
 	var jwt string
 	for _, c := range jar.Cookies(u) {
 		if c.Name == "token_"+hash {
@@ -320,13 +322,13 @@ func apiRequest(hash, action string, content interface{}) *http.Request {
 		"action":  action,
 		"content": base64.StdEncoding.EncodeToString(raw),
 	})
-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(body))
+	req, _ := http.NewRequest("POST", boardsBaseURL+"/api", bytes.NewReader(body))
 	req.Header.Set("User-Agent", boardsUA)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
-	req.Header.Set("Origin", "https://"+boardsBase)
+	req.Header.Set("Referer", boardsBaseURL+"/guest/?hash="+hash)
+	req.Header.Set("Origin", boardsBaseURL)
 	return req
 }
 
@@ -491,7 +493,7 @@ func (t *BoardsTransport) connectAndServe(info boardsInfo) error {
 
 	header := http.Header{}
 	header.Set("User-Agent", boardsUA)
-	header.Set("Origin", "https://"+boardsBase)
+	header.Set("Origin", boardsBaseURL)
 	header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	var cookieParts []string
@@ -1044,7 +1046,7 @@ func (t *BoardsTransport) jar() *cookiejar.Jar {
 // FetchCookies returns a snapshot of the transport's current cookie jar as
 // name -> value for boards.yandex.ru.
 func (t *BoardsTransport) FetchCookies() (map[string]string, error) {
-	u, err := url.Parse("https://" + boardsBase + "/")
+	u, err := url.Parse(boardsBaseURL + "/")
 	if err != nil {
 		return nil, err
 	}
@@ -1061,7 +1063,7 @@ func (t *BoardsTransport) ApplyCookies(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
-	u, _ := url.Parse("https://" + boardsBase + "/")
+	u, _ := url.Parse(boardsBaseURL + "/")
 	jar, _ := cookiejar.New(nil)
 	cookies := make([]*http.Cookie, 0, len(values))
 	for k, v := range values {
