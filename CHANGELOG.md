@@ -7,6 +7,16 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ### Fixed
 
+- **A node restarted under a live client no longer left that client a permanent zombie.** The client's
+  only way back was the keepalive reset, and that reset is armed by the first LinkPing/Pong exchange -
+  a restart landing in the session's first seconds found it unarmed, and the client helloed into a
+  session the node would never answer until the user restarted it. The client now asks for its first
+  pong as soon as the handshake completes, and a session that has not been keepalived yet still gives
+  up on a silent exit after 6 link timeouts (3 min) instead of never.
+- **A lost handshake reply no longer mutes the exit for a full reset cycle.** `receiveHello` answered
+  only the first initial hello (zero peer echo); every identical repeat was ignored without a word, so
+  a client whose reply was lost on the carrier stayed deaf until its next keepalive timeout produced a
+  fresh challenge. An initial hello is answered every time it is offered while the session is open.
 - **A direct exit could go silent to every client: one TCP connection held the carrier's only lane.**
   Exit-mode `DirectTransport` serves one peer at a time, and its accept loop blocked in the incumbent
   connection's read with no deadline. Whoever bound the lane first kept it for as long as the TCP
