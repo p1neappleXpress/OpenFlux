@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/p1neappleXpress/OpenFlux/transport/control"
 )
@@ -62,6 +63,71 @@ func TestSessionRehandshakesAfterExitRestart(t *testing.T) {
 		_ = client.Send(testIPv4(40, 6))
 		return got.Load() > 0
 	})
+}
+
+// The exit died before the client's first pong arrived, so the fast reset is
+// not armed. The client must still give up on the silence on its own and
+// rehandshake with the restarted exit, not zombie until restarted.
+func TestSessionRecoversWhenKeepaliveWasNeverNegotiated(t *testing.T) {
+	client, exit, _, ew := linkedSessions(t, "direct")
+	fastKeepalive(client, exit)
+	exit.noPong = true
+	startPair(t, client, exit)
+	client.mu.Lock()
+	armed := client.peerKeepalive
+	client.mu.Unlock()
+	if armed {
+		t.Fatal("keepalive support detected without a pong")
+	}
+	_ = exit.Stop()
+
+	restarted := restartOn(t, true, ew["direct"])
+	var got atomic.Int32
+	restarted.Receive(func([]byte) { got.Add(1) })
+	if err := restarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the keepalive-less client to rehandshake with the restarted exit", func() bool {
+		_ = client.Send(testIPv4(40, 6))
+		return got.Load() > 0
+	})
+}
+
+// The client pings for its first pong as soon as the handshake completes,
+// not on the next keepalive tick: a node restart in the session's first
+// seconds must find the client's reset armed.
+func TestSessionPingsRightAfterHandshake(t *testing.T) {
+	client, exit, _, _ := linkedSessions(t, "direct")
+	for _, s := range []*Session{client, exit} {
+		s.keepaliveInterval = time.Hour // no tick within the test
+		s.linkTimeout = 100 * time.Millisecond
+	}
+	startPair(t, client, exit)
+	eventually(t, "keepalive support to be detected without a tick", func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.peerKeepalive
+	})
+}
+
+// A lost first reply must not mute the exit: an initial hello is answered
+// every time it is offered while the session is open.
+func TestSessionAnswersRepeatedInitialHello(t *testing.T) {
+	_, exit, _, ew := linkedSessions(t, "direct")
+	if err := exit.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var stranger [32]byte
+	_, _ = rand.Read(stranger[:])
+	link := exit.links["direct"]
+
+	for i := 1; i <= 3; i++ {
+		exit.receive(link, hello(t, stranger, [32]byte{}))
+		want := i
+		eventually(t, "a reply to the initial hello", func() bool {
+			return sentCount(ew["direct"]) >= want
+		})
+	}
 }
 
 func hello(t *testing.T, local, peer [32]byte) []byte {

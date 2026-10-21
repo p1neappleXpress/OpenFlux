@@ -467,10 +467,14 @@ func (s *Session) diagnose() string {
 }
 
 func (s *Session) startLink(link *transportLink) error {
+	// Wire the receive chain before the carrier starts: a listener bound in
+	// Start can accept a peer at once, and a frame arriving before the chain
+	// is in place is dropped silently - the peer's first hello, on a fresh
+	// node, gone for good.
+	link.batched.Receive(func(p []byte) { s.receive(link, p) })
 	if err := link.batched.Start(); err != nil {
 		return err
 	}
-	link.batched.Receive(func(p []byte) { s.receive(link, p) })
 	if link.classicCodec != nil {
 		if err := link.classicCodec.Start(); err != nil {
 			utils.Debugf("[SESSION] %q classic pipeline: %v", link.name, err)
@@ -490,6 +494,12 @@ func (s *Session) startLink(link *transportLink) error {
 		link.stop()
 		return errors.New("session stopped")
 	}
+	// A carrier that serves one peer at a time must hand the peer's
+	// connection over to a challenger once this peer stops talking to the
+	// session (see laneGuard and DirectTransport.takeLane).
+	if g, ok := link.raw.(interface{ SetLaneGuard(func() bool) }); ok {
+		g.SetLaneGuard(s.laneGuard(link))
+	}
 	// A carrier that comes up in an established session (e.g. once a check
 	// was passed) is probed at once: the pong marks it heard, instead of it
 	// waiting for the next keepalive tick.
@@ -497,6 +507,25 @@ func (s *Session) startLink(link *transportLink) error {
 		go func() { _ = s.sendControlVia(link, control.SubtypeLinkPing, nil) }()
 	}
 	return nil
+}
+
+// laneGuard tells a carrier that serves one peer at a time when the
+// connection holding its lane is load-bearing: the session established, and
+// the peer heard on that carrier lately (a classic client counts while its
+// packets arrive). A connection whose peer stopped talking - a client that
+// restarted under us and can no longer finish the handshake - yields the
+// lane to the next challenger instead of holding every later client in the
+// carrier's backlog.
+func (s *Session) laneGuard(link *transportLink) func() bool {
+	return func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.ready || s.stopped {
+			return false
+		}
+		return s.heardLocked(link) ||
+			!link.classicHeard.IsZero() && time.Since(link.classicHeard) < s.linkTimeout
+	}
 }
 
 func (s *Session) superviseLink(link *transportLink) {
@@ -611,9 +640,22 @@ func (s *Session) keepaliveLoop() {
 		case <-tick.C:
 		}
 		s.mu.Lock()
-		if !s.exit && s.ready && s.peerKeepalive && s.peerSilentLocked() {
-			s.resetLocked()
-			utils.Infof("[SESSION] exit silent on every carrier for %v: handshaking again", s.linkTimeout)
+		if !s.exit && s.ready {
+			bound := s.linkTimeout
+			if !s.peerKeepalive {
+				// A peer that has not answered a single ping either predates
+				// keepalive (its silence in idle is normal, so wait longer
+				// before giving up on it) or the session is too young to have
+				// pinged yet. Waiting forever is the one thing it must not
+				// mean: a node restarted under such a client used to leave it
+				// a zombie, helloing into a session the node would never
+				// answer, with no way out but a client restart.
+				bound = 6 * s.linkTimeout
+			}
+			if s.peerSilentForLocked(bound) {
+				s.resetLocked()
+				utils.Infof("[SESSION] exit silent on every carrier for %v: handshaking again", bound)
+			}
 		}
 		var quiet []*transportLink
 		if s.ready {
@@ -635,9 +677,12 @@ func (s *Session) keepaliveLoop() {
 	}
 }
 
-func (s *Session) peerSilentLocked() bool {
+// peerSilentForLocked reports whether every carrier has been silent for at
+// least d: nothing was heard on any of them, whatever this side sent.
+// Caller holds s.mu.
+func (s *Session) peerSilentForLocked(d time.Duration) bool {
 	for _, l := range s.links {
-		if time.Since(l.lastHeard) < s.linkTimeout {
+		if time.Since(l.lastHeard) < d {
 			return false
 		}
 	}
@@ -1299,13 +1344,24 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 	}
 	link.lastHeard = time.Now()
 	var names []string
-	if changed || (!wasReady && echo) || (wasReady && env.Hello.Ready == 0) {
+	// An initial hello (zero peer echo) gets an answer every time it is
+	// offered while the session is open: the client repeats it when our
+	// first reply was lost, and only the first one was ever answered.
+	if changed || (!wasReady && (echo || zero)) || (wasReady && env.Hello.Ready == 0) {
 		names = append(names, s.order...)
 	}
 	peer := s.peer
 	s.mu.Unlock()
 
 	s.cntHelloAccept.Add(1)
+	if echo && !wasReady && !s.exit {
+		// Ask for the first pong at once instead of waiting for the
+		// keepalive tick: keepalive support is confirmed within a round
+		// trip, so a node restart that lands in the session's first
+		// seconds finds the client's reset armed - not a client that has
+		// no way to learn the exit is gone.
+		go func() { _ = s.sendControlVia(link, control.SubtypeLinkPing, nil) }()
+	}
 	if echo && !wasReady && !s.exit && (s.classicSeen || !s.classicSince.IsZero()) {
 		utils.Infof("[SESSION] the exit answered the Session handshake on %q: switching from classic to the Session", link.name)
 	}
