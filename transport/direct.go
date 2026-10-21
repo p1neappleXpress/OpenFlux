@@ -42,8 +42,10 @@ type DirectConfig struct {
 	// HandshakeTimeout bounds the initial TCP connect / accept.
 	HandshakeTimeout time.Duration
 
-	// ReadTimeout bounds a single ReadMessage on the wire. A zero value
-	// disables the deadline and relies on TCP keepalives.
+	// ReadTimeout bounds a single read on the wire. A zero value uses the
+	// transport's own idle bounds instead (directFirstRecord for a
+	// connection's first record, then directIdle); either way a connection
+	// that delivers nothing is dropped, see serveConn.
 	ReadTimeout time.Duration
 
 	// KeepAliveInterval controls the TCP keepalive probe interval on the
@@ -104,6 +106,13 @@ type DirectTransport struct {
 
 	// Exit-mode listener.
 	listener net.Listener
+
+	// laneHold, set by the Session above, reports whether the connection
+	// holding the lane carries a peer that peer still talks to (see
+	// SetLaneGuard). connAt is when that connection took the lane, for the
+	// handshake grace window. Both guarded by mu.
+	laneHold func() bool
+	connAt   time.Time
 
 	// Stats not tracked by BaseTransport directly.
 	reconnects atomic.Uint64
@@ -271,9 +280,57 @@ func (t *DirectTransport) acceptLoop() {
 			continue
 		}
 		utils.Debugf("[DIRECT] acceptLoop: ACCEPTED %s", connDesc(conn))
-		t.serveConn(conn)
-		utils.Debugf("[DIRECT] acceptLoop: serveConn returned, looping back")
+		go t.serveConn(t.takeLane(conn))
 	}
+}
+
+// takeLane installs conn as the connection the transport reads and writes,
+// or returns nil when a live peer holds the lane for the session above. The
+// exit serves one peer at a time - but the lane belongs to a peer the session
+// is actually talking to, not to whichever TCP connection arrived first: a
+// client that can no longer finish the handshake (it restarted under us, or
+// answers under keys it has not derived) keeps helloing forever and would
+// otherwise hold every later client in the listen backlog, acknowledged and
+// never read.
+func (t *DirectTransport) takeLane(conn net.Conn) net.Conn {
+	// hold runs without t.mu: it locks the Session, whose own paths (Stop,
+	// RemoveTransport) lock the session first and this transport second.
+	now := time.Now()
+	t.mu.Lock()
+	old, hold, oldAt := t.conn, t.laneHold, t.connAt
+	t.mu.Unlock()
+	if old != nil {
+		held := hold != nil && hold()
+		if !held && now.Sub(oldAt) < directDance {
+			held = true // the handshake under the incumbent gets its window
+		}
+		if held {
+			utils.Infof("[DIRECT] challenger %s refused: the lane is taken by %s (%s ago, session live: %v)",
+				connDesc(conn), connDesc(old), now.Sub(oldAt).Round(time.Second), hold != nil && hold())
+			_ = conn.Close()
+			return nil
+		}
+	}
+	// The accept loop is the only installer, so nothing raced us here but
+	// the old connection's teardown, which only clears the slot.
+	t.mu.Lock()
+	t.conn, t.connAt = conn, now
+	t.mu.Unlock()
+	t.SetConnected(true)
+	if old != nil {
+		utils.Infof("[DIRECT] %s takes the lane from %s", connDesc(conn), connDesc(old))
+		_ = old.Close() // its reader exits; its teardown leaves the new conn alone
+	}
+	return conn
+}
+
+// SetLaneGuard lets the session above decide when the connection holding the
+// lane is load-bearing: hold reports whether the peer was heard on this
+// carrier lately. Without a guard every challenger is admitted.
+func (t *DirectTransport) SetLaneGuard(hold func() bool) {
+	t.mu.Lock()
+	t.laneHold = hold
+	t.mu.Unlock()
 }
 
 // ---- client mode ----
@@ -306,7 +363,7 @@ func (t *DirectTransport) dialLoop() {
 			utils.Debugf("[DIRECT] dialLoop: CONNECTED to %s in %v (local=%s remote=%s)",
 				t.config.DialAddr, elapsed, connDesc(conn),
 				conn.RemoteAddr().String())
-			t.serveConn(conn)
+			t.serveConn(t.takeLane(conn))
 			t.reconnects.Add(1)
 			utils.Debugf("[DIRECT] dialLoop: serveConn returned (reconnects=%d)", t.reconnects.Load())
 			delay = t.config.ReconnectMinDelay
@@ -331,7 +388,35 @@ func (t *DirectTransport) dialLoop() {
 
 // ---- shared conn lifecycle ----
 
+// The exit accepts one peer at a time, so a connection holds the lane for as
+// long as it lives - and a connection can look alive while carrying nothing:
+// an abandoned redial of a reconnecting client, or a port probe that sends a
+// record header and stalls. While it holds the lane the kernel keeps
+// completing and acknowledging newer clients into the listen backlog, and
+// they are never read: the node is silent, their handshake times out. Both
+// bounds sit well above the session's own pace - a client hellos four times
+// a second before the handshake, and a live session exchanges keepalives at
+// least every keepaliveInterval (10 s) - so only a dead connection misses
+// them.
+const (
+	// directFirstRecord is how long a fresh connection may take to deliver
+	// its first complete record.
+	directFirstRecord = 5 * time.Second
+	// directIdle is how long an established connection may stay silent.
+	directIdle = 35 * time.Second
+	// directDance is how long a connection that has not brought the
+	// session up yet is shielded from challengers: long enough for the
+	// handshake to finish, including a client whose KDF context differs
+	// rotating onto ours (about 4-6 s of context probing), short enough
+	// that a connection which will never finish yields the lane after one
+	// window instead of helloing into it forever.
+	directDance = 10 * time.Second
+)
+
 func (t *DirectTransport) serveConn(conn net.Conn) {
+	if conn == nil {
+		return // takeLane refused this challenger
+	}
 	utils.Debugf("[DIRECT] serveConn: begin %s", connDesc(conn))
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
@@ -342,24 +427,22 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 		}
 	}
 
-	t.mu.Lock()
-	t.conn = conn
-	t.mu.Unlock()
-	t.SetConnected(true)
-	utils.Debugf("[DIRECT] serveConn: connected=%v", t.IsConnected())
-
 	defer func() {
 		utils.Debugf("[DIRECT] serveConn: tearing down %s", connDesc(conn))
 		t.mu.Lock()
-		if t.conn == conn {
+		mine := t.conn == conn
+		if mine {
 			t.conn = nil
 		}
 		t.mu.Unlock()
-		t.SetConnected(false)
+		if mine {
+			t.SetConnected(false)
+		}
 		_ = conn.Close()
 	}()
 
 	buf := make([]byte, t.config.MaxRecordBytes)
+	spoke := false
 	for {
 		select {
 		case <-t.done:
@@ -368,9 +451,14 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 		default:
 		}
 
-		if t.config.ReadTimeout > 0 {
-			_ = conn.SetReadDeadline(time.Now().Add(t.config.ReadTimeout))
+		idle := directIdle
+		if !spoke {
+			idle = directFirstRecord
 		}
+		if t.config.ReadTimeout > 0 {
+			idle = t.config.ReadTimeout
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(idle))
 		utils.Debugf("[DIRECT] serveConn: waiting for 2-byte header")
 		if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 			if err == io.EOF {
@@ -393,6 +481,7 @@ func (t *DirectTransport) serveConn(conn net.Conn) {
 				len(buf[:n]), n, err)
 			return
 		}
+		spoke = true
 		utils.Debugf("[DIRECT] serveConn: received record #%d size=%d",
 			t.recordsIn.Load()+1, n)
 		if utils.IsVerbose() {

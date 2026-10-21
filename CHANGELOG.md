@@ -5,6 +5,26 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A direct exit could go silent to every client: one TCP connection held the carrier's only lane.**
+  Exit-mode `DirectTransport` serves one peer at a time, and its accept loop blocked in the incumbent
+  connection's read with no deadline. Whoever bound the lane first kept it for as long as the TCP
+  connection lived - most damagingly a *stale* client: one that restarted under a node restart, can no
+  longer finish the handshake, and helloes forever without a session ever coming up. Every later client
+  was completed and acknowledged by the kernel into the listen backlog and never read; the node stayed
+  silent, and only the previous client dying for good freed the lane. That is the zombie first
+  connection to a freshly started node (seen on l3 and l4 alike). The lane now belongs to a peer the
+  session is actually talking to: the Session installs a lane guard on the carrier, a challenger is
+  refused while the incumbent's peer is heard, and takes the lane over (the incumbent's connection
+  closes) once it is not. A connection that never completes a record at all - a port probe that sends a
+  length header and stalls - is also dropped on its own now: first record within 5 s, then silence for
+  at most 35 s (the session exchanges keepalives at least every 10 s).
+- **A carrier's first frames could arrive before the Session's receive chain was wired.** `Start()` on a
+  link bound the listener before `Receive()` installed the callback chain, and a frame landing in that
+  window was dropped silently - most painfully the peer's first hello on a fresh node. The chain goes up
+  before the carrier starts now, for bootstrap and post-start carriers alike.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed
