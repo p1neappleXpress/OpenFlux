@@ -467,10 +467,14 @@ func (s *Session) diagnose() string {
 }
 
 func (s *Session) startLink(link *transportLink) error {
+	// Wire the receive chain before the carrier starts: a listener bound in
+	// Start can accept a peer at once, and a frame arriving before the chain
+	// is in place is dropped silently - the peer's first hello, on a fresh
+	// node, gone for good.
+	link.batched.Receive(func(p []byte) { s.receive(link, p) })
 	if err := link.batched.Start(); err != nil {
 		return err
 	}
-	link.batched.Receive(func(p []byte) { s.receive(link, p) })
 	if link.classicCodec != nil {
 		if err := link.classicCodec.Start(); err != nil {
 			utils.Debugf("[SESSION] %q classic pipeline: %v", link.name, err)
@@ -490,6 +494,12 @@ func (s *Session) startLink(link *transportLink) error {
 		link.stop()
 		return errors.New("session stopped")
 	}
+	// A carrier that serves one peer at a time must hand the peer's
+	// connection over to a challenger once this peer stops talking to the
+	// session (see laneGuard and DirectTransport.takeLane).
+	if g, ok := link.raw.(interface{ SetLaneGuard(func() bool) }); ok {
+		g.SetLaneGuard(s.laneGuard(link))
+	}
 	// A carrier that comes up in an established session (e.g. once a check
 	// was passed) is probed at once: the pong marks it heard, instead of it
 	// waiting for the next keepalive tick.
@@ -497,6 +507,25 @@ func (s *Session) startLink(link *transportLink) error {
 		go func() { _ = s.sendControlVia(link, control.SubtypeLinkPing, nil) }()
 	}
 	return nil
+}
+
+// laneGuard tells a carrier that serves one peer at a time when the
+// connection holding its lane is load-bearing: the session established, and
+// the peer heard on that carrier lately (a classic client counts while its
+// packets arrive). A connection whose peer stopped talking - a client that
+// restarted under us and can no longer finish the handshake - yields the
+// lane to the next challenger instead of holding every later client in the
+// carrier's backlog.
+func (s *Session) laneGuard(link *transportLink) func() bool {
+	return func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.ready || s.stopped {
+			return false
+		}
+		return s.heardLocked(link) ||
+			!link.classicHeard.IsZero() && time.Since(link.classicHeard) < s.linkTimeout
+	}
 }
 
 func (s *Session) superviseLink(link *transportLink) {
