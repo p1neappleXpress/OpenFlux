@@ -1090,10 +1090,15 @@ DEPRECATED (removed in v2)
 	if statusServer != nil {
 		if managerInst != nil {
 			utils.SafeGo("ipc-status", func() {
-				ipcStatusLoop(statusServer, managerInst, managerInst.Session().ActiveTransport, managerInst.Session().ActiveTransports)
+				sess := managerInst.Session()
+				ipcStatusLoop(statusServer, managerInst, sess.ActiveTransport, sess.ActiveTransports,
+					func() *transport.DiagnosticsSnapshot {
+						d := sess.Diagnostics()
+						return &d
+					})
 			})
 		} else {
-			utils.SafeGo("ipc-status", func() { ipcStatusLoop(statusServer, trans, nil, nil) })
+			utils.SafeGo("ipc-status", func() { ipcStatusLoop(statusServer, trans, nil, nil, nil) })
 		}
 	}
 
@@ -1190,8 +1195,9 @@ type statusSource interface {
 }
 
 // ipcStatusLoop reports to the app every second: whether a carrier reaches
-// the peer, traffic totals, uptime and (Sessions) the active carrier.
-func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, activeAll func() []string) {
+// the peer, traffic totals, uptime, (Sessions) the active carrier and the
+// diagnostics behind the "connected but no internet" screen.
+func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, activeAll func() []string, diag func() *transport.DiagnosticsSnapshot) {
 	started := time.Now()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -1209,6 +1215,17 @@ func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, acti
 		}
 		if activeAll != nil {
 			p.ActiveAll = activeAll()
+		}
+		if diag != nil {
+			if d := diag(); d != nil {
+				p.Established = d.Established
+				p.LastHeardMs = d.LastHeardMs
+				for _, c := range d.Carriers {
+					p.Carriers = append(p.Carriers, ipc.CarrierStatus{
+						Name: c.Name, Connected: c.Connected, Heard: c.Heard, LastHeardMs: c.LastHeardMs,
+					})
+				}
+			}
 		}
 		_ = srv.SendStatus(p)
 	}

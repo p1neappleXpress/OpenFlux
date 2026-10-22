@@ -74,6 +74,23 @@ type StatusPayload struct {
 	// ActiveAll names every carrier data is spread over: several when they
 	// share the highest priority. Active is the first. Sessions only.
 	ActiveAll []string `json:"active_all,omitempty"`
+	// Diagnostics for the "connected but no internet" screen: whether the
+	// handshake is established, how long ago the peer last answered, and
+	// every carrier's state. False/-1/nil when the transport is not a
+	// Session.
+	Established bool            `json:"established"`
+	LastHeardMs int64           `json:"last_heard_ms"` // -1: the peer was never heard
+	Carriers    []CarrierStatus `json:"carriers,omitempty"`
+}
+
+// CarrierStatus is one carrier's row of the status diagnostics: Connected
+// without Heard is the silent data plane - the carrier's socket is up on
+// this side while nothing arrives from the peer on it.
+type CarrierStatus struct {
+	Name        string `json:"name"`
+	Connected   bool   `json:"connected"`
+	Heard       bool   `json:"heard"`
+	LastHeardMs int64  `json:"last_heard_ms"` // -1: never heard on this carrier
 }
 
 type CommandPayload struct {
