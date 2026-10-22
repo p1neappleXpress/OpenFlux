@@ -5,6 +5,16 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Session diagnostics in the IPC status, for the "connected but no internet" screen.** The one-second
+  status the app already receives now carries `established` (the handshake is done), `last_heard_ms`
+  (how long ago the peer last answered, -1 for never) and a per-carrier row (`connected`, `heard`,
+  `last_heard_ms`). A row that is connected without heard is the silent data plane - the user-visible
+  signature of a node restarted underneath a session - and with these fields an app can tell it from a
+  dead network within seconds instead of leaving the user to guess. `Session.Diagnostics()` is the
+  in-process form for non-IPC callers.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed

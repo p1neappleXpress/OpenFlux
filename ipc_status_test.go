@@ -32,7 +32,7 @@ func TestIPCStatusWithoutSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	go ipcStatusLoop(srv, fixedStats{in: 1500, out: 700}, nil, nil)
+	go ipcStatusLoop(srv, fixedStats{in: 1500, out: 700}, nil, nil, nil)
 
 	c, err := ipc.Dial(path)
 	if err != nil {
@@ -56,6 +56,72 @@ func TestIPCStatusWithoutSession(t *testing.T) {
 	case p := <-got:
 		if !p.Connected || p.BytesIn != 1500 || p.BytesOut != 700 || p.Active != "" {
 			t.Fatalf("status = %+v", p)
+		}
+		if p.Established {
+			t.Fatalf("a classic carrier reported an established session: %+v", p)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no status")
+	}
+}
+
+// A Session's status carries the diagnostics of the "connected but no
+// internet" screen: the handshake state, the last-heard clock and every
+// carrier's row.
+func TestIPCStatusDiagnostics(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ofipcdiag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "s.sock")
+	srv := ipc.NewServer(path, &coreIPCHandler{})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	snap := &transport.DiagnosticsSnapshot{
+		Established: true,
+		Mode:        "session",
+		LastHeardMs: 1500,
+		Carriers: []transport.CarrierDiagnostics{
+			{Name: "direct", Connected: true, Heard: true, LastHeardMs: 1500},
+			{Name: "yandex", Connected: false, Heard: false, LastHeardMs: -1},
+		},
+	}
+	go ipcStatusLoop(srv, fixedStats{}, nil, nil, func() *transport.DiagnosticsSnapshot { return snap })
+
+	c, err := ipc.Dial(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	got := make(chan ipc.StatusPayload, 1)
+	c.SetHandler(func(typ ipc.MsgType, body []byte) {
+		if typ != ipc.MsgStatus {
+			return
+		}
+		var p ipc.StatusPayload
+		if json.Unmarshal(body, &p) == nil {
+			select {
+			case got <- p:
+			default:
+			}
+		}
+	})
+	select {
+	case p := <-got:
+		if !p.Established || p.LastHeardMs != 1500 {
+			t.Fatalf("status = %+v", p)
+		}
+		if len(p.Carriers) != 2 {
+			t.Fatalf("carriers = %+v, want both", p.Carriers)
+		}
+		if c := p.Carriers[0]; c.Name != "direct" || !c.Connected || !c.Heard || c.LastHeardMs != 1500 {
+			t.Fatalf("carrier 0 = %+v", c)
+		}
+		if c := p.Carriers[1]; c.Name != "yandex" || c.Connected || c.Heard || c.LastHeardMs != -1 {
+			t.Fatalf("carrier 1 = %+v", c)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no status")
