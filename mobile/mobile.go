@@ -58,12 +58,19 @@ func SetLowMemory(on bool) {
 	lowMemory.Store(on)
 }
 
+// keptLogs is how many pending log lines the app may read (ReadLogs);
+// older ones are dropped. The list is cut back to it only once it has
+// doubled, so a line costs O(1): cutting on every line past keptLogs copied
+// the whole list each time, under the lock the packets to the device take,
+// and with packet logs on (hundreds of lines a second) that held them up.
+const keptLogs = 500
+
 func appendLog(message string) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.logs = append(client.logs, message)
-	if len(client.logs) > 500 {
-		client.logs = append([]string(nil), client.logs[len(client.logs)-500:]...)
+	if len(client.logs) > 2*keptLogs {
+		client.logs = append([]string(nil), client.logs[len(client.logs)-keptLogs:]...)
 	}
 }
 
@@ -306,7 +313,11 @@ func ReadTimeout(timeoutMs int) []byte {
 func ReadLogs() string {
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	logs := strings.Join(client.logs, "\n")
+	lines := client.logs
+	if len(lines) > keptLogs {
+		lines = lines[len(lines)-keptLogs:]
+	}
+	logs := strings.Join(lines, "\n")
 	client.logs = nil
 	return logs
 }
