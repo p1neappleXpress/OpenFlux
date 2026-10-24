@@ -294,6 +294,10 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
+	egressProxy := flag.String("egress-proxy", "",
+		"Exit, l4 only: route the re-dial of client destinations through "+
+			"socks5://[user:pass@]host:port or http://[user:pass@]host:port. "+
+			"TCP only: UDP flows are refused while set (a direct dial would bypass the proxy)")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
@@ -494,6 +498,7 @@ DEPRECATED (removed in v2)
 		applyConfString(conf.Interface, "SessionContext", "session-context", sessionContextFlag, setFlags)
 		applyConfString(conf.Interface, "CookieStore", "cookie-store", cookieStorePath, setFlags)
 		applyConfString(conf.Interface, "IPCSocket", "ipc-socket", ipcSocketPath, setFlags)
+		applyConfString(conf.Interface, "EgressProxy", "egress-proxy", egressProxy, setFlags)
 		applyConfString(conf.Interface, "URL", "url", &globalDocUrl, setFlags)
 		if v, ok := confValue(conf.Interface, "Debug"); ok && !setFlags["debug"] {
 			if b, err := strconv.Atoi(v); err == nil {
@@ -667,6 +672,20 @@ DEPRECATED (removed in v2)
 	exitMode, err := tunnel.ParseExitMode(*mode)
 	if err != nil {
 		log.Fatalf("--mode: %v", err)
+	}
+
+	// Egress proxy: l4 re-dial through a SOCKS5/HTTP proxy the operator
+	// points at. l3 writes raw packets itself and has no proxy path.
+	if *egressProxy != "" {
+		if *role == roleExit && exitMode == tunnel.ExitModeL3 {
+			log.Fatal("--egress-proxy cannot work in l3 mode (raw-socket SNAT has no proxy path); use --mode=l4")
+		}
+		d, err := tunnel.NewEgressProxyDialer(*egressProxy)
+		if err != nil {
+			log.Fatalf("--egress-proxy: %v", err)
+		}
+		tunnel.SetEgressProxy(d)
+		log.Printf("Egress proxy: %s (TCP re-dial goes through it; UDP flows are refused)", strings.SplitN(*egressProxy, "//", 2)[0]+"//…")
 	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
