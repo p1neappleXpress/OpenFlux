@@ -5,6 +5,27 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+## [1.4.0-opffk.2] - 2026-10-25
+
+### Added
+
+- **`--create-cups-rooms`**: creates a fresh cups.online room set and prints the packed room list as JSON
+  (`{"rooms":"…"}`) on stdout — the web UI persists it as the cupsonline transport URL, so client links
+  carry the rooms. Runs before normal flag parsing, like `--parse-link`.
+
+
+## [1.4.0] - 2026-10-24
+
+### Added
+
+- **Egress proxy for the L4 exit** (`--egress-proxy`, or `EgressProxy` in the `.conf`): the exit re-dials
+  client destinations through a SOCKS5 or HTTP CONNECT proxy (`socks5://[user:pass@]host:port`,
+  `http://[user:pass@]host:port`) instead of connecting directly. TCP only: UDP flows are refused while the
+  proxy is set, because a direct UDP dial would silently bypass it — plain DNS clients fall back to TCP.
+  Incompatible with `--mode=l3` (raw-socket SNAT has no proxy path). This is an opffk fork feature; the
+  pins in `deploy/node-install.sh` track this fork's builds.
+
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed

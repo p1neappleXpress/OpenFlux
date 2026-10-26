@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/transport/control"
 	"github.com/p1neappleXpress/OpenFlux/transport/ipc"
 	"github.com/p1neappleXpress/OpenFlux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/phpbox"
 	"github.com/p1neappleXpress/OpenFlux/transport/registry"
 	"github.com/p1neappleXpress/OpenFlux/transport/script"
@@ -252,6 +254,25 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--inspect-script" {
 		os.Exit(runInspectScript(os.Args[2:], os.Stdout))
 	}
+	// opffk fork: create a fresh cups.online room set and print the packed
+	// list as JSON on stdout ({"rooms":"..."}), for the web UI to persist
+	// as the cupsonline transport URL. Same shape as --parse-link: an
+	// entry point checked before normal flag parsing, JSON only on stdout.
+	if len(os.Args) == 2 && os.Args[1] == "--create-cups-rooms" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		packed, err := cupsonline.CreateRoomList(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create rooms: %v\n", err)
+			os.Exit(1)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(map[string]string{"rooms": packed}); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	// Updates of installed script transports, JSON reports on stdout; see
 	// script_cli.go. The apps decide only when to call them and what to say.
 	if len(os.Args) >= 2 {
@@ -319,6 +340,10 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
+	egressProxy := flag.String("egress-proxy", "",
+		"Exit, l4 only: route the re-dial of client destinations through "+
+			"socks5://[user:pass@]host:port or http://[user:pass@]host:port. "+
+			"TCP only: UDP flows are refused while set (a direct dial would bypass the proxy)")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
@@ -523,6 +548,7 @@ DEPRECATED (removed in v2)
 		applyConfString(conf.Interface, "SessionContext", "session-context", sessionContextFlag, setFlags)
 		applyConfString(conf.Interface, "CookieStore", "cookie-store", cookieStorePath, setFlags)
 		applyConfString(conf.Interface, "IPCSocket", "ipc-socket", ipcSocketPath, setFlags)
+		applyConfString(conf.Interface, "EgressProxy", "egress-proxy", egressProxy, setFlags)
 		applyConfString(conf.Interface, "URL", "url", &globalDocUrl, setFlags)
 		if v, ok := confValue(conf.Interface, "Debug"); ok && !setFlags["debug"] {
 			if b, err := strconv.Atoi(v); err == nil {
@@ -696,6 +722,20 @@ DEPRECATED (removed in v2)
 	exitMode, err := tunnel.ParseExitMode(*mode)
 	if err != nil {
 		log.Fatalf("--mode: %v", err)
+	}
+
+	// Egress proxy: l4 re-dial through a SOCKS5/HTTP proxy the operator
+	// points at. l3 writes raw packets itself and has no proxy path.
+	if *egressProxy != "" {
+		if *role == roleExit && exitMode == tunnel.ExitModeL3 {
+			log.Fatal("--egress-proxy cannot work in l3 mode (raw-socket SNAT has no proxy path); use --mode=l4")
+		}
+		d, err := tunnel.NewEgressProxyDialer(*egressProxy)
+		if err != nil {
+			log.Fatalf("--egress-proxy: %v", err)
+		}
+		tunnel.SetEgressProxy(d)
+		log.Printf("Egress proxy: %s (TCP re-dial goes through it; UDP flows are refused)", strings.SplitN(*egressProxy, "//", 2)[0]+"//…")
 	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
