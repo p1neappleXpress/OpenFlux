@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/transport/control"
 	"github.com/p1neappleXpress/OpenFlux/transport/ipc"
 	"github.com/p1neappleXpress/OpenFlux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/phpbox"
 	"github.com/p1neappleXpress/OpenFlux/transport/registry"
 	"github.com/p1neappleXpress/OpenFlux/transport/script"
@@ -228,6 +230,25 @@ func main() {
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "--inspect-script" {
 		os.Exit(runInspectScript(os.Args[2:], os.Stdout))
+	}
+	// opffk fork: create a fresh cups.online room set and print the packed
+	// list as JSON on stdout ({"rooms":"..."}), for the web UI to persist
+	// as the cupsonline transport URL. Same shape as --parse-link: an
+	// entry point checked before normal flag parsing, JSON only on stdout.
+	if len(os.Args) == 2 && os.Args[1] == "--create-cups-rooms" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		packed, err := cupsonline.CreateRoomList(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create rooms: %v\n", err)
+			os.Exit(1)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(map[string]string{"rooms": packed}); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 	// Updates of installed script transports, JSON reports on stdout; see
 	// script_cli.go. The apps decide only when to call them and what to say.

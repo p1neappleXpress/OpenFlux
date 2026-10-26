@@ -5,6 +5,15 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+## [1.4.0-opffk.2] - 2026-10-25
+
+### Added
+
+- **`--create-cups-rooms`**: creates a fresh cups.online room set and prints the packed room list as JSON
+  (`{"rooms":"…"}`) on stdout — the web UI persists it as the cupsonline transport URL, so client links
+  carry the rooms. Runs before normal flag parsing, like `--parse-link`.
+
+
 ## [1.4.0] - 2026-10-24
 
 ### Added
