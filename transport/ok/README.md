@@ -135,3 +135,13 @@ In transport: `OkClient.SetPushConfig` + `WaitIncomingCall` / `WaitIncomingCallP
 (`ok_push.go`). Adblock often blocks `/push` — disable on ok.ru when capturing.
 
 Exact VCP chunk HTML still best taken from a live EventStream with adblock off.
+
+## Cookie keep-alive
+
+Before `getCallToken`, the client GETs `https://ok.ru/` (and `/messages`) with the
+current Cookie jar and merges `Set-Cookie` into `OkClient.cookies`. OK rotates
+`JSESSIONID` and `AUTHCODE` this way; without it long-lived exit nodes lose the
+calls token even though the browser would still look "logged in".
+
+Requires a full web session (AUTHCODE present). Accounts stuck on
+`anonymContactImprovementStart` often get `apiUrl` without `token`.

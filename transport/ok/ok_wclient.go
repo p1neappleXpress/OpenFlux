@@ -62,6 +62,92 @@ func (c *OkClient) doJSON(method, rawURL string, body []byte, extraHeaders map[s
 	return b, resp.StatusCode, nil
 }
 
+
+// parseCookieHeader splits a Cookie request header into name→value.
+func parseCookieHeader(h string) map[string]string {
+	out := make(map[string]string)
+	for _, part := range strings.Split(h, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i := strings.IndexByte(part, '=')
+		if i <= 0 {
+			continue
+		}
+		out[strings.TrimSpace(part[:i])] = strings.TrimSpace(part[i+1:])
+	}
+	return out
+}
+
+func cookieHeaderFromMap(m map[string]string) string {
+	parts := make([]string, 0, len(m))
+	for k, v := range m {
+		parts = append(parts, k+"="+v)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// mergeSetCookies applies Set-Cookie pairs into an existing Cookie header map.
+// Empty noise cookies from ok.ru (vk_access_token, cookieChoice, landref) are skipped when empty.
+func mergeSetCookies(cookieHeader string, setCookies []string) string {
+	m := parseCookieHeader(cookieHeader)
+	for _, sc := range setCookies {
+		pair := strings.Split(sc, ";")[0]
+		i := strings.IndexByte(pair, '=')
+		if i <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(pair[:i])
+		val := strings.TrimSpace(pair[i+1:])
+		if name == "" {
+			continue
+		}
+		if (name == "vk_access_token" || name == "cookieChoice" || name == "landref") && val == "" {
+			continue
+		}
+		m[name] = val
+	}
+	return cookieHeaderFromMap(m)
+}
+
+// RefreshSessionCookies GETs ok.ru/ (and /messages) with the current jar and
+// merges Set-Cookie into c.cookies. OK rotates JSESSIONID + AUTHCODE this way;
+// call before GetCallToken so long-lived exit nodes keep a working token.
+func (c *OkClient) RefreshSessionCookies() error {
+	if strings.TrimSpace(c.cookies) == "" {
+		return fmt.Errorf("ok: no cookies to refresh")
+	}
+	client := c.httpClient()
+	refreshOne := func(rawURL string) error {
+		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", c.ua)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		req.Header.Set("Cookie", c.cookies)
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		sets := resp.Header.Values("Set-Cookie")
+		if len(sets) == 0 {
+			return nil
+		}
+		c.cookies = mergeSetCookies(c.cookies, sets)
+		logInfo("cookie refresh %s: %d Set-Cookie", rawURL, len(sets))
+		return nil
+	}
+	if err := refreshOne("https://ok.ru/"); err != nil {
+		return err
+	}
+	_ = refreshOne("https://ok.ru/messages")
+	return nil
+}
+
 // GetCallToken — POST /web-api/v2/videochat/getCallToken
 //
 // Real capture:
@@ -71,6 +157,11 @@ func (c *OkClient) doJSON(method, rawURL string, body []byte, extraHeaders map[s
 func (c *OkClient) GetCallToken(peerID int64) (CallParams, error) {
 	var out CallParams
 	_ = peerID
+
+	// Soft keep-alive: rotate JSESSIONID/AUTHCODE via GET ok.ru Set-Cookie.
+	if err := c.RefreshSessionCookies(); err != nil {
+		logInfo("cookie refresh skipped: %v", err)
+	}
 
 	payload, _ := json.Marshal(map[string]interface{}{"id": callTokenAPIID})
 	body, code, err := c.doJSON(http.MethodPost, getCallTokenPath, payload, nil)
@@ -93,7 +184,21 @@ func (c *OkClient) GetCallToken(peerID int64) (CallParams, error) {
 		return out, fmt.Errorf("getCallToken JSON: %w body=%s", err, truncate(body, 300))
 	}
 	if !wrap.Success || wrap.Result.Token == "" {
-		return out, fmt.Errorf("getCallToken failed: %s", truncate(body, 500))
+		// One more soft refresh + retry (session may have been mid-rotate).
+		_ = c.RefreshSessionCookies()
+		body, code, err = c.doJSON(http.MethodPost, getCallTokenPath, payload, nil)
+		if err != nil {
+			return out, err
+		}
+		if code != 200 {
+			return out, fmt.Errorf("getCallToken HTTP %d: %s", code, truncate(body, 300))
+		}
+		if err := json.Unmarshal(body, &wrap); err != nil {
+			return out, fmt.Errorf("getCallToken JSON: %w body=%s", err, truncate(body, 300))
+		}
+		if !wrap.Success || wrap.Result.Token == "" {
+			return out, fmt.Errorf("getCallToken failed: %s", truncate(body, 500))
+		}
 	}
 
 	out.Token = wrap.Result.Token
