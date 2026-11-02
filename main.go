@@ -316,7 +316,7 @@ func main() {
 	scriptPubkey := flag.String("script-pubkey", "", "Hex-encoded ed25519 public key the script transport's signature is checked against")
 	scriptName := flag.String("script-name", "", "Carrier name for the script transport (default: the name in its own info())")
 	refusePeerLogin := flag.Bool("refuse-peer-login", false, "Exit: take no account sign-in (Yandex, Mail.ru login cookies) from clients over the Session; only the owner's push over SSH (node-install.sh set-cookies) changes it")
-	scriptAutoUpdate := flag.Bool("script-auto-update", false,"Node: keep .flux transports current and self-heal (check/apply auto-OK updates, roll back, hot-swap without a restart)")
+	scriptAutoUpdate := flag.Bool("script-auto-update", false, "Node: keep .flux transports current and self-heal (check/apply auto-OK updates, roll back, hot-swap without a restart)")
 	scriptUpdateChannel := flag.String("script-update-channel", "stable", "Node: update channel for --script-auto-update (stable | nightly)")
 	configPath := flag.String("config", "",
 		"Path to an OpenFlux .conf file. Command-line flags override values from the file.")
@@ -475,6 +475,15 @@ DEPRECATED (removed in v2)
 
 	os.Args = expandShortFlags(os.Args)
 	flag.Parse()
+
+	if target := os.Getenv("OPENFLUX_FETCH"); target != "" {
+		runFetch(target)
+		return
+	}
+	if echoRooms := os.Getenv("OPENFLUX_CUPS_ECHO"); echoRooms != "" {
+		runCupsEcho(echoRooms, os.Getenv("OPENFLUX_ECHO_TAG"))
+		return
+	}
 
 	// OPENFLUX_DNS overrides DNS resolution to a specific nameserver (e.g.
 	// "8.8.8.8:53"). Needed for the CLI on Android, where a static (CGO-off)

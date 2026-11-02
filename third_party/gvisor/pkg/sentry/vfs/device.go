@@ -1,0 +1,277 @@
+// Copyright 2019 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package vfs
+
+import (
+	"bytes"
+	"cmp"
+	"fmt"
+	"slices"
+
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+)
+
+// DeviceKind indicates whether a device is a block or character device.
+//
+// +stateify savable
+type DeviceKind uint32
+
+const (
+	// BlockDevice indicates a block device.
+	BlockDevice DeviceKind = iota
+
+	// CharDevice indicates a character device.
+	CharDevice
+)
+
+// String implements fmt.Stringer.String.
+func (kind DeviceKind) String() string {
+	switch kind {
+	case BlockDevice:
+		return "block"
+	case CharDevice:
+		return "character"
+	default:
+		return fmt.Sprintf("invalid device kind %d", kind)
+	}
+}
+
+// +stateify savable
+type devTuple struct {
+	kind  DeviceKind
+	major uint32
+	minor uint32
+}
+
+// A Device backs device special files.
+type Device interface {
+	// Open returns a FileDescription representing this device.
+	Open(ctx context.Context, mnt *Mount, d *Dentry, opts OpenOptions) (*FileDescription, error)
+}
+
+// +stateify savable
+type registeredDevice struct {
+	dev  Device
+	opts RegisterDeviceOptions
+}
+
+// RegisterDeviceOptions contains options to
+// VirtualFilesystem.RegisterDevice().
+//
+// +stateify savable
+type RegisterDeviceOptions struct {
+	// GroupName is the name shown for this device registration in
+	// /proc/devices. If GroupName is empty, this registration will not be
+	// shown in /proc/devices.
+	GroupName string
+	// Pathname is the name for the device file of this device in /dev directory.
+	// If Pathname is empty, then no device file is created.
+	Pathname string
+	// FilePerms are the permission bits to create the device file with. Only
+	// used if Pathname is provided.
+	FilePerms uint16
+}
+
+// RegisterDevice registers the given Device in vfs with the given major and
+// minor device numbers.
+func (vfs *VirtualFilesystem) RegisterDevice(kind DeviceKind, major, minor uint32, dev Device, opts *RegisterDeviceOptions) error {
+	tup := devTuple{kind, major, minor}
+	vfs.devicesMu.Lock()
+	defer vfs.devicesMu.Unlock()
+	if existing, ok := vfs.devices[tup]; ok {
+		return fmt.Errorf("%s device number (%d, %d) is already registered to device type %T", kind, major, minor, existing.dev)
+	}
+	vfs.devices[tup] = &registeredDevice{
+		dev:  dev,
+		opts: *opts,
+	}
+	return nil
+}
+
+// ForEachDevice calls the given callback for each registered device.
+func (vfs *VirtualFilesystem) ForEachDevice(cb func(pathname string, kind DeviceKind, major, minor uint32, perms uint16) error) error {
+	vfs.devicesMu.Lock()
+	defer vfs.devicesMu.Unlock()
+	for tup, dev := range vfs.devices {
+		if err := cb(dev.opts.Pathname, tup.kind, tup.major, tup.minor, dev.opts.FilePerms); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IsDeviceRegistered returns true if a device that matches the
+// (kind, major, minor) tuple is registered.
+func (vfs *VirtualFilesystem) IsDeviceRegistered(kind DeviceKind, major, minor uint32) bool {
+	vfs.devicesMu.RLock()
+	defer vfs.devicesMu.RUnlock()
+	_, ok := vfs.devices[devTuple{kind, major, minor}]
+	return ok
+}
+
+// GetRegisteredDevice returns the device registered for the given (kind,
+// major, minor) tuple.
+func (vfs *VirtualFilesystem) GetRegisteredDevice(kind DeviceKind, major, minor uint32) Device {
+	tup := devTuple{kind, major, minor}
+	vfs.devicesMu.RLock()
+	defer vfs.devicesMu.RUnlock()
+	rd, ok := vfs.devices[tup]
+	if !ok {
+		return nil
+	}
+	return rd.dev
+}
+
+// OpenDeviceSpecialFile returns a FileDescription representing the given
+// device.
+func (vfs *VirtualFilesystem) OpenDeviceSpecialFile(ctx context.Context, mnt *Mount, d *Dentry, kind DeviceKind, major, minor uint32, opts *OpenOptions) (*FileDescription, error) {
+	tup := devTuple{kind, major, minor}
+	vfs.devicesMu.RLock()
+	defer vfs.devicesMu.RUnlock()
+	rd, ok := vfs.devices[tup]
+	if !ok {
+		return nil, linuxerr.ENXIO
+	}
+	return rd.dev.Open(ctx, mnt, d, *opts)
+}
+
+// GetDynamicCharDevMajor allocates and returns an unused major device number
+// for a character device or set of character devices.
+func (vfs *VirtualFilesystem) GetDynamicCharDevMajor() (uint32, error) {
+	vfs.dynCharDevMajorMu.Lock()
+	defer vfs.dynCharDevMajorMu.Unlock()
+	// Compare Linux's fs/char_dev.c:find_dynamic_major().
+	for major := uint32(254); major >= 234; major-- {
+		if _, ok := vfs.dynCharDevMajorUsed[major]; !ok {
+			vfs.dynCharDevMajorUsed[major] = struct{}{}
+			return major, nil
+		}
+	}
+	for major := uint32(511); major >= 384; major-- {
+		if _, ok := vfs.dynCharDevMajorUsed[major]; !ok {
+			vfs.dynCharDevMajorUsed[major] = struct{}{}
+			return major, nil
+		}
+	}
+	return 0, linuxerr.EBUSY
+}
+
+// PutDynamicCharDevMajor deallocates a major device number returned by a
+// previous call to GetDynamicCharDevMajor.
+func (vfs *VirtualFilesystem) PutDynamicCharDevMajor(major uint32) {
+	vfs.dynCharDevMajorMu.Lock()
+	defer vfs.dynCharDevMajorMu.Unlock()
+	delete(vfs.dynCharDevMajorUsed, major)
+}
+
+// GetAnonBlockDevMinor allocates and returns an unused minor device number for
+// an "anonymous" block device with major number UNNAMED_MAJOR.
+func (vfs *VirtualFilesystem) GetAnonBlockDevMinor() (uint32, error) {
+	vfs.anonBlockDevMinorMu.Lock()
+	defer vfs.anonBlockDevMinorMu.Unlock()
+	minor := vfs.anonBlockDevMinorNext
+	const maxDevMinor = (1 << 20) - 1
+	for minor < maxDevMinor {
+		if _, ok := vfs.anonBlockDevMinor[minor]; !ok {
+			vfs.anonBlockDevMinor[minor] = struct{}{}
+			vfs.anonBlockDevMinorNext = minor + 1
+			return minor, nil
+		}
+		minor++
+	}
+	return 0, linuxerr.EMFILE
+}
+
+// PutAnonBlockDevMinor deallocates a minor device number returned by a
+// previous call to GetAnonBlockDevMinor.
+func (vfs *VirtualFilesystem) PutAnonBlockDevMinor(minor uint32) {
+	vfs.anonBlockDevMinorMu.Lock()
+	defer vfs.anonBlockDevMinorMu.Unlock()
+	delete(vfs.anonBlockDevMinor, minor)
+	if minor < vfs.anonBlockDevMinorNext {
+		vfs.anonBlockDevMinorNext = minor
+	}
+}
+
+// GenerateProcDevices emits the contents of /proc/devices for vfs to buf.
+func (vfs *VirtualFilesystem) GenerateProcDevices(buf *bytes.Buffer) error {
+	type registeredDeviceGroup struct {
+		lowestMinorByName map[string]uint32
+	}
+	blockDevsByMajor := make(map[uint32]*registeredDeviceGroup)
+	charDevsByMajor := make(map[uint32]*registeredDeviceGroup)
+
+	func() {
+		vfs.devicesMu.Lock()
+		defer vfs.devicesMu.Unlock()
+		for tup, rd := range vfs.devices {
+			if rd.opts.GroupName == "" {
+				continue
+			}
+			var m map[uint32]*registeredDeviceGroup
+			switch tup.kind {
+			case BlockDevice:
+				m = blockDevsByMajor
+			case CharDevice:
+				m = charDevsByMajor
+			}
+			rdg := m[tup.major]
+			if rdg == nil {
+				rdg = &registeredDeviceGroup{
+					lowestMinorByName: make(map[string]uint32),
+				}
+				m[tup.major] = rdg
+			}
+			minor, ok := rdg.lowestMinorByName[rd.opts.GroupName]
+			if !ok || tup.minor < minor {
+				rdg.lowestMinorByName[rd.opts.GroupName] = tup.minor
+			}
+		}
+	}()
+
+	generateDevs := func(devsByMajor map[uint32]*registeredDeviceGroup, buf *bytes.Buffer) {
+		majors := make([]uint32, 0, len(devsByMajor))
+		for major := range devsByMajor {
+			majors = append(majors, major)
+		}
+		slices.Sort(majors)
+		for _, major := range majors {
+			rdg := devsByMajor[major]
+			type minorGroup struct {
+				lowestMinor uint32
+				groupName   string
+			}
+			minors := make([]minorGroup, 0, len(rdg.lowestMinorByName))
+			for name, minor := range rdg.lowestMinorByName {
+				minors = append(minors, minorGroup{
+					lowestMinor: minor,
+					groupName:   name,
+				})
+			}
+			slices.SortFunc(minors, func(a, b minorGroup) int {
+				return cmp.Or(cmp.Compare(a.lowestMinor, b.lowestMinor), cmp.Compare(a.groupName, b.groupName))
+			})
+			for _, minorGroup := range minors {
+				fmt.Fprintf(buf, "%3d %s\n", major, minorGroup.groupName)
+			}
+		}
+	}
+	buf.WriteString("Character devices:\n")
+	generateDevs(charDevsByMajor, buf)
+	buf.WriteString("\nBlock devices:\n")
+	generateDevs(blockDevsByMajor, buf)
+	return nil
+}

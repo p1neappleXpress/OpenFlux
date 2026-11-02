@@ -1,0 +1,142 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package linux
+
+import (
+	"math"
+	"structs"
+
+	"gvisor.dev/gvisor/pkg/hostarch"
+)
+
+// Filesystem types used in statfs(2).
+//
+// See linux/magic.h.
+const (
+	ANON_INODE_FS_MAGIC   = 0x09041934
+	CGROUP_SUPER_MAGIC    = 0x27e0eb
+	DEVPTS_SUPER_MAGIC    = 0x00001cd1
+	EXT_SUPER_MAGIC       = 0xef53
+	FUSE_SUPER_MAGIC      = 0x65735546
+	MQUEUE_MAGIC          = 0x19800202
+	NSFS_MAGIC            = 0x6e736673
+	OVERLAYFS_SUPER_MAGIC = 0x794c7630
+	PIPEFS_MAGIC          = 0x50495045
+	PROC_SUPER_MAGIC      = 0x9fa0
+	RAMFS_MAGIC           = 0x09041934
+	SOCKFS_MAGIC          = 0x534F434B
+	SYSFS_MAGIC           = 0x62656572
+	TMPFS_MAGIC           = 0x01021994
+	V9FS_MAGIC            = 0x01021997
+)
+
+// Filesystem path limits, from uapi/linux/limits.h.
+const (
+	NAME_MAX = 255
+	PATH_MAX = 4096
+)
+
+// The bit mask f_flags in struct statfs, from include/linux/statfs.h
+const (
+	ST_RDONLY      = 0x0001
+	ST_NOSUID      = 0x0002
+	ST_NODEV       = 0x0004
+	ST_NOEXEC      = 0x0008
+	ST_SYNCHRONOUS = 0x0010
+	ST_VALID       = 0x0020
+	ST_MANDLOCK    = 0x0040
+	ST_NOATIME     = 0x0400
+	ST_NODIRATIME  = 0x0800
+	ST_RELATIME    = 0x1000
+	ST_NOSYMFOLLOW = 0x2000
+)
+
+// Statfs is struct statfs, from uapi/asm-generic/statfs.h.
+//
+// +marshal
+type Statfs struct {
+	_ structs.HostLayout
+	// Type is one of the filesystem magic values, defined above.
+	Type uint64
+
+	// BlockSize is the optimal transfer block size in bytes.
+	BlockSize int64
+
+	// Blocks is the maximum number of data blocks the filesystem may store, in
+	// units of BlockSize.
+	Blocks uint64
+
+	// BlocksFree is the number of free data blocks, in units of BlockSize.
+	BlocksFree uint64
+
+	// BlocksAvailable is the number of data blocks free for use by
+	// unprivileged users, in units of BlockSize.
+	BlocksAvailable uint64
+
+	// Files is the number of used file nodes on the filesystem.
+	Files uint64
+
+	// FileFress is the number of free file nodes on the filesystem.
+	FilesFree uint64
+
+	// FSID is the filesystem ID.
+	FSID [2]int32
+
+	// NameLength is the maximum file name length.
+	NameLength uint64
+
+	// FragmentSize is equivalent to BlockSize.
+	FragmentSize int64
+
+	// Flags is the set of filesystem mount flags.
+	Flags uint64
+
+	// Spare is unused.
+	Spare [4]uint64
+}
+
+// Whence argument to lseek(2), from include/uapi/linux/fs.h.
+const (
+	SEEK_SET  = 0
+	SEEK_CUR  = 1
+	SEEK_END  = 2
+	SEEK_DATA = 3
+	SEEK_HOLE = 4
+)
+
+// Sync_file_range flags, from include/uapi/linux/fs.h
+const (
+	SYNC_FILE_RANGE_WAIT_BEFORE = 1
+	SYNC_FILE_RANGE_WRITE       = 2
+	SYNC_FILE_RANGE_WAIT_AFTER  = 4
+)
+
+// Flag argument to renameat2(2), from include/uapi/linux/fs.h.
+const (
+	RENAME_NOREPLACE = (1 << 0) // Don't overwrite target.
+	RENAME_EXCHANGE  = (1 << 1) // Exchange src and dst.
+	RENAME_WHITEOUT  = (1 << 2) // Whiteout src.
+)
+
+// Overlayfs constants from include/linux/fs.h.
+const (
+	WHITEOUT_MODE = 0
+	WHITEOUT_DEV  = 0
+)
+
+// MAX_RW_COUNT is the maximum size in bytes of a single read or write.
+// Reads and writes that exceed this size may be truncated.
+// (Linux: include/linux/fs.h:MAX_RW_COUNT)
+var MAX_RW_COUNT = int(hostarch.PageRoundDown(uint32(math.MaxInt32)))

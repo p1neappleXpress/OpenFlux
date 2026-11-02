@@ -3,8 +3,13 @@ package transport
 import "sort"
 
 // ContextPlaceholder is the --url default and the one fixed encryption KDF
-// context every current peer uses unless a context was set explicitly.
-const ContextPlaceholder = "http://#"
+// context every current peer uses unless a context was set explicitly. One
+// string for every carrier and every mode: the peers cannot diverge on it.
+const ContextPlaceholder = "openflux_"
+
+// legacyPlaceholder is the placeholder older builds use. It stays an
+// alternate, so a build in the field is still reached.
+const legacyPlaceholder = "http://#"
 
 // maxContextCandidates bounds how many contexts a peer tries: each one costs
 // an scrypt derivation (32 MiB, tens of milliseconds) the first time it is

@@ -1,0 +1,510 @@
+// Copyright 2018 The containerd Authors.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package proc
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/containerd/console"
+
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/stdio"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	google_protobuf "github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/fifo"
+	runc "github.com/containerd/go-runc"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/shim/v1/extension"
+	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	"gvisor.dev/gvisor/pkg/shim/v1/utils"
+)
+
+const statusStopped = "stopped"
+
+// Init represents an initial process for a container.
+type Init struct {
+	wg        sync.WaitGroup
+	initState initState
+
+	// mu is used to ensure that `Start()` and `Exited()` calls return in
+	// the right order when invoked in separate go routines.  This is the
+	// case within the shim implementation as it makes use of the reaper
+	// interface.
+	mu sync.Mutex
+
+	waitBlock chan struct{}
+
+	WorkDir string
+
+	id       string
+	Bundle   string
+	console  console.Console
+	Platform stdio.Platform
+	io       runc.IO
+	runtime  *runsccmd.Runsc
+	status   int
+	exited   time.Time
+	pid      int
+	closers  []io.Closer
+	stdin    io.Closer
+	stdio    stdio.Stdio
+	Rootfs   string
+	IoUID    int
+	IoGID    int
+	Sandbox  bool
+	UserLog  string
+	Monitor  ProcessMonitor
+}
+
+// NewRunsc returns a new runsc instance for a process.
+func NewRunsc(root, path, namespace, runtime string, config map[string]string, spec *specs.Spec) *runsccmd.Runsc {
+	if root == "" {
+		root = RunscRoot
+	}
+	return &runsccmd.Runsc{
+		Command:      runtime,
+		PdeathSignal: unix.SIGKILL,
+		Log:          filepath.Join(path, "log.json"),
+		LogFormat:    runc.JSON,
+		PanicLog:     utils.PanicLogPath(spec),
+		Root:         filepath.Join(root, namespace),
+		Config:       config,
+	}
+}
+
+// New returns a new init process.
+func New(id string, runtime *runsccmd.Runsc, stdio stdio.Stdio) *Init {
+	p := &Init{
+		id:        id,
+		runtime:   runtime,
+		stdio:     stdio,
+		status:    0,
+		waitBlock: make(chan struct{}),
+	}
+	p.initState = &createdState{p: p}
+	return p
+}
+
+// Create the process with the provided config.
+func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
+	var socket *runc.Socket
+	if r.Terminal {
+		if socket, err = runc.NewTempConsoleSocket(); err != nil {
+			return fmt.Errorf("failed to create OCI runtime console socket: %w", err)
+		}
+		defer socket.Close()
+	} else if hasNoIO(r) {
+		if p.io, err = runc.NewNullIO(); err != nil {
+			return fmt.Errorf("creating new NULL IO: %w", err)
+		}
+	} else {
+		if p.io, err = runc.NewPipeIO(p.IoUID, p.IoGID, withConditionalIO(p.stdio)); err != nil {
+			return fmt.Errorf("failed to create OCI runtime io pipes: %w", err)
+		}
+	}
+	// pidFile is the file that will contain the sandbox pid.
+	pidFile := filepath.Join(p.Bundle, "init.pid")
+	opts := &runsccmd.CreateOpts{
+		PidFile:            pidFile,
+		FSRestoreImagePath: r.FSRestoreImagePath,
+		FSRestoreDirect:    r.FSRestoreDirect,
+	}
+	if socket != nil {
+		opts.ConsoleSocket = socket
+	}
+	if p.Sandbox {
+		opts.IO = p.io
+		// UserLog is only useful for sandbox.
+		opts.UserLog = p.UserLog
+	}
+	if err := p.runtime.Create(ctx, r.ID, r.Bundle, opts); err != nil {
+		return p.runtimeError(err, "OCI runtime create failed")
+	}
+	if r.Stdin != "" {
+		sc, err := fifo.OpenFifo(context.Background(), r.Stdin, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		if err != nil {
+			return fmt.Errorf("failed to open stdin fifo %s: %w", r.Stdin, err)
+		}
+		p.stdin = sc
+		p.closers = append(p.closers, sc)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if socket != nil {
+		console, err := socket.ReceiveMaster()
+		if err != nil {
+			return fmt.Errorf("failed to retrieve console master: %w", err)
+		}
+		console, err = p.Platform.CopyConsole(ctx, console, r.ID, r.Stdin, r.Stdout, r.Stderr, &p.wg)
+		if err != nil {
+			return fmt.Errorf("failed to start console copy: %w", err)
+		}
+		p.console = console
+	} else if !hasNoIO(r) {
+		if err := copyPipes(ctx, p.io, r.Stdin, r.Stdout, r.Stderr, &p.wg); err != nil {
+			return fmt.Errorf("failed to start io pipe copy: %w", err)
+		}
+	}
+	pid, err := runc.ReadPidFile(pidFile)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve OCI runtime container pid: %w", err)
+	}
+	p.pid = pid
+	return nil
+}
+
+// Wait waits for the process to exit.
+func (p *Init) Wait() {
+	<-p.waitBlock
+}
+
+// ID returns the ID of the process.
+func (p *Init) ID() string {
+	return p.id
+}
+
+// Pid returns the PID of the process.
+func (p *Init) Pid() int {
+	return p.pid
+}
+
+// ExitStatus returns the exit status of the process.
+func (p *Init) ExitStatus() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.status
+}
+
+// ExitedAt returns the time when the process exited.
+func (p *Init) ExitedAt() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.exited
+}
+
+// Status returns the status of the process.
+func (p *Init) Status(ctx context.Context) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.State(ctx)
+}
+
+func (p *Init) state(ctx context.Context) (string, error) {
+	c, err := p.runtime.State(ctx, p.id)
+	if err != nil {
+		if strings.Contains(err.Error(), "does not exist") {
+			return statusStopped, nil
+		}
+		return "", p.runtimeError(err, "OCI runtime state failed")
+	}
+	return p.convertStatus(c.Status), nil
+}
+
+// Start starts the init process.
+func (p *Init) Start(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Start(ctx, nil /* restoreConf */)
+}
+
+func (p *Init) start(ctx context.Context, restoreConf *extension.RestoreConfig) error {
+	var cio runc.IO
+	if !p.Sandbox {
+		cio = p.io
+	}
+	if restoreConf == nil {
+		if err := p.runtime.Start(ctx, p.id, cio); err != nil {
+			return p.runtimeError(err, "OCI runtime start failed")
+		}
+	} else {
+		if err := p.runtime.Restore(ctx, p.id, cio, &runsccmd.RestoreOpts{
+			ImagePath:  restoreConf.ImagePath,
+			Detach:     true,
+			Direct:     restoreConf.Direct,
+			Background: restoreConf.Background,
+		}); err != nil {
+			return p.runtimeError(err, "OCI runtime restore failed")
+		}
+	}
+	go func() {
+		status, err := p.runtime.Wait(context.Background(), p.id)
+		if err != nil {
+			log.G(ctx).WithError(err).Errorf("Failed to wait for container %q", p.id)
+			p.killAllLocked(ctx)
+			status = internalErrorCode
+		}
+		ExitCh <- Exit{
+			Timestamp: time.Now(),
+			ID:        p.id,
+			Status:    status,
+		}
+	}()
+	return nil
+}
+
+// Restore restores the container from a snapshot.
+func (p *Init) Restore(ctx context.Context, conf *extension.RestoreConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Start(ctx, conf)
+}
+
+// SetExited set the exit status of the init process.
+func (p *Init) SetExited(status int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.initState.SetExited(status)
+}
+
+func (p *Init) setExited(status int) {
+	if !p.exited.IsZero() {
+		log.L.Debugf("Status already set to %d, ignoring status: %d", p.status, status)
+		return
+	}
+
+	log.L.Debugf("Setting status: %d", status)
+	p.exited = time.Now()
+	p.status = status
+	p.Platform.ShutdownConsole(context.Background(), p.console)
+	close(p.waitBlock)
+}
+
+// Delete deletes the init process.
+func (p *Init) Delete(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Delete(ctx)
+}
+
+func (p *Init) delete(ctx context.Context) error {
+	p.killAllLocked(ctx)
+	p.wg.Wait()
+
+	err := p.runtime.Delete(ctx, p.id, nil)
+	if err != nil {
+		// ignore errors if a runtime has already deleted the process
+		// but we still hold metadata and pipes
+		//
+		// this is common during a checkpoint, runc will delete the container state
+		// after a checkpoint and the container will no longer exist within runc
+		if strings.Contains(err.Error(), "does not exist") {
+			err = nil
+		} else {
+			err = p.runtimeError(err, "failed to delete task")
+		}
+	}
+	if p.io != nil {
+		for _, c := range p.closers {
+			c.Close()
+		}
+		p.io.Close()
+	}
+	if err2 := mount.UnmountAll(p.Rootfs, 0); err2 != nil {
+		log.G(ctx).WithError(err2).Warn("failed to cleanup rootfs mount")
+		if err == nil {
+			err = fmt.Errorf("failed rootfs umount: %w", err2)
+		}
+	}
+	return err
+}
+
+// Resize resizes the init processes console.
+func (p *Init) Resize(ws console.WinSize) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.console == nil {
+		return nil
+	}
+	return p.console.Resize(ws)
+}
+
+func (p *Init) resize(ws console.WinSize) error {
+	if p.console == nil {
+		return nil
+	}
+	return p.console.Resize(ws)
+}
+
+// Kill kills the init process.
+func (p *Init) Kill(ctx context.Context, signal uint32, all bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Kill(ctx, signal, all)
+}
+
+func (p *Init) kill(ctx context.Context, signal uint32, all bool) error {
+	var (
+		killErr error
+		backoff = 100 * time.Millisecond
+	)
+	const timeout = time.Second
+	for start := time.Now(); time.Since(start) < timeout; {
+		state, err := p.initState.State(ctx)
+		if err != nil {
+			return p.runtimeError(err, "OCI runtime state failed")
+		}
+		// For runsc, signal only works when container is running state.
+		// If the container is not in running state, directly return
+		// "no such process"
+		if state == statusStopped {
+			return fmt.Errorf("no such process: %w", errdefs.ErrNotFound)
+		}
+		killErr = p.runtime.Kill(ctx, p.id, int(signal), &runsccmd.KillOpts{All: all})
+		if killErr == nil {
+			return nil
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	return p.runtimeError(killErr, "kill timeout")
+}
+
+// KillAll kills all processes belonging to the init process. If
+// `runsc kill --all` returns error, assume the container has already stopped.
+func (p *Init) KillAll(context context.Context) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.killAllLocked(context)
+}
+
+func (p *Init) killAllLocked(context context.Context) {
+	if err := p.runtime.Kill(context, p.id, int(unix.SIGKILL), &runsccmd.KillOpts{All: true}); err != nil {
+		log.L.Warningf("Ignoring error killing container %q: %v", p.id, err)
+	}
+}
+
+// Stdin returns the stdin of the process.
+func (p *Init) Stdin() io.Closer {
+	return p.stdin
+}
+
+// Runtime returns the OCI runtime configured for the init process.
+func (p *Init) Runtime() *runsccmd.Runsc {
+	return p.runtime
+}
+
+// Exec returns a new child process.
+func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (extension.Process, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Exec(ctx, path, r)
+}
+
+// exec returns a new exec'd process.
+func (p *Init) exec(path string, r *ExecConfig) (extension.Process, error) {
+	var spec specs.Process
+	if err := json.Unmarshal(r.Spec.Value, &spec); err != nil {
+		return nil, err
+	}
+	spec.Terminal = r.Terminal
+
+	e := &execProcess{
+		id:     r.ID,
+		path:   path,
+		parent: p,
+		spec:   spec,
+		stdio: stdio.Stdio{
+			Stdin:    r.Stdin,
+			Stdout:   r.Stdout,
+			Stderr:   r.Stderr,
+			Terminal: r.Terminal,
+		},
+		waitBlock: make(chan struct{}),
+	}
+	e.execState = &execCreatedState{p: e}
+	return e, nil
+}
+
+func (p *Init) Stats(ctx context.Context, id string) (*runc.Stats, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Stats(ctx, id)
+}
+
+// Update applies resource changes from JSON LinuxResources in the protobuf Any.
+func (p *Init) Update(ctx context.Context, r *google_protobuf.Any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if r == nil {
+		return fmt.Errorf("resources are required: %w", errdefs.ErrInvalidArgument)
+	}
+	var resources specs.LinuxResources
+	if err := json.Unmarshal(r.Value, &resources); err != nil {
+		return fmt.Errorf("decoding resources: %w", err)
+	}
+	return p.runtime.Update(ctx, p.id, &resources)
+}
+
+func (p *Init) stats(ctx context.Context, id string) (*runc.Stats, error) {
+	return p.Runtime().Stats(ctx, id)
+}
+
+// Stdio returns the stdio of the process.
+func (p *Init) Stdio() stdio.Stdio {
+	return p.stdio
+}
+
+func (p *Init) runtimeError(rErr error, msg string) error {
+	if rErr == nil {
+		return nil
+	}
+
+	rMsg, err := getLastRuntimeError(p.runtime)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: %w (unable to retrieve OCI runtime error: %v)", msg, rErr, err)
+	case rMsg == "":
+		return fmt.Errorf("%s: %w", msg, rErr)
+	default:
+		return fmt.Errorf("%s: %s", msg, rMsg)
+	}
+}
+
+func (p *Init) convertStatus(status string) string {
+	if status == "created" && !p.Sandbox && p.status == internalErrorCode {
+		// Treat start failure state for non-root container as stopped.
+		return statusStopped
+	}
+	return status
+}
+
+func withConditionalIO(c stdio.Stdio) runc.IOOpt {
+	return func(o *runc.IOOption) {
+		o.OpenStdin = c.Stdin != ""
+		o.OpenStdout = c.Stdout != ""
+		o.OpenStderr = c.Stderr != ""
+	}
+}

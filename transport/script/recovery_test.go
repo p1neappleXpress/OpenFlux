@@ -54,11 +54,11 @@ func TestRecoveryLadderFlapDoesNotReset(t *testing.T) {
 	l := NewRecoveryLadder(p)
 	now := time.Unix(0, 0)
 
-	l.OnFailed(now)                       // 1
-	now = now.Add(time.Second)            //
-	l.OnConnected(now)                    // connects...
-	now = now.Add(5 * time.Second)        // ...but only for 5s (< StableFor)
-	a := l.OnFailed(now)                  // 2: the brief connect must NOT have reset
+	l.OnFailed(now)                // 1
+	now = now.Add(time.Second)     //
+	l.OnConnected(now)             // connects...
+	now = now.Add(5 * time.Second) // ...but only for 5s (< StableFor)
+	a := l.OnFailed(now)           // 2: the brief connect must NOT have reset
 	if a != RecoverRecheck {
 		t.Fatalf("a sub-StableFor flap must not reset the ladder; got %q want recheck", a.Code())
 	}

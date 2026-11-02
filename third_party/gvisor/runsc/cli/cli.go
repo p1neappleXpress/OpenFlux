@@ -1,0 +1,394 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package cli provides the entrypoint for runsc binaries.
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/subcommands"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/coverage"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
+	"gvisor.dev/gvisor/runsc/version"
+)
+
+// versionFlagName is the name of a flag that triggers printing the version.
+// Although this flags is not part of the OCI spec, it is used by
+// Docker, and thus should not be removed.
+const versionFlagName = "version"
+
+var (
+	// These flags are unique to runsc, and are used to configure parts of the
+	// system that are not covered by the runtime spec.
+
+	// Debugging flags.
+	logFD      = flag.Int("log-fd", -1, "file descriptor to log to.  If set, the 'log' flag is ignored.")
+	debugLogFD = flag.Int("debug-log-fd", -1, "file descriptor to write debug logs to.  If set, the 'debug-log-dir' flag is ignored.")
+	panicLogFD = flag.Int("panic-log-fd", -1, "file descriptor to write Go's runtime messages.")
+	coverageFD = flag.Int("coverage-fd", -1, "file descriptor to write Go coverage output.")
+)
+
+// Run runs the binary, whose behavior is determined by the subcommand passed
+// on the command line. commands is a mapping of all top level runsc commands
+// to their command group name. helpTopics is a list of additional help topics.
+func Run(commands map[util.SubCommand]string, helpTopics []subcommands.Command) {
+	// Set the start time as soon as possible.
+	startTime := starttime.Get()
+
+	// Help flags, and help and flags commands, are generated automatically.
+	flagHelp := flag.Bool("help", false, "show information about runsc subcommands and exit")
+	flag.BoolVar(flagHelp, "h", false, "equivalent to the 'help' flag")
+	cdr := subcommands.DefaultCommander
+	help := NewHelp(cdr)
+	subcommands.Register(help, "")
+	subcommands.Register(subcommands.FlagsCommand(), "")
+
+	// Register all commands.
+	for cmd, group := range commands {
+		subcommands.Register(&helpCommandWrapper{wrapped: cmd}, group)
+	}
+
+	// Register help commands.
+	for _, cmd := range helpTopics {
+		help.Register(cmd)
+	}
+
+	// Register with the main command line.
+	config.RegisterFlags(flag.CommandLine)
+
+	// Register version flag if it is not already defined.
+	if flag.Lookup(versionFlagName) == nil {
+		flag.Bool(versionFlagName, false, "show version and exit.")
+	}
+
+	// All subcommands must be registered before flag parsing.
+	flag.Parse()
+
+	// Are we showing help?
+	if *flagHelp {
+		help.printTopLevelHelp()
+		os.Exit(0)
+	}
+
+	// Are we showing the version?
+	if flag.Get(flag.Lookup(versionFlagName).Value).(bool) {
+		// The format here is the same as runc.
+		fmt.Fprintf(os.Stdout, "runsc version %s\n", version.Version())
+		fmt.Fprintf(os.Stdout, "spec: %s\n", specutils.Version)
+		os.Exit(0)
+	}
+
+	// Create a buffered emitter to capture logs during initialization. This is
+	// needed because log package initializes the target with an emitter that
+	// writes to stderr (which is reserved for the application). This would
+	// prevent any intermediate logs from leaking to stderr. This is later
+	// drained to the right target once the emitter is created below.
+	bufEmitter := &bufferedEmitter{}
+	log.SetTarget(bufEmitter)
+
+	config.WarnOnDeprecatedFlagUsage(flag.CommandLine)
+
+	// Create a new Config from the flags.
+	conf, err := config.NewFromFlags(flag.CommandLine)
+	if err != nil {
+		util.Fatalf("%s", err.Error())
+	}
+
+	var errorLogger io.Writer
+	if *logFD > -1 {
+		errorLogger = os.NewFile(uintptr(*logFD), "error log file")
+	} else if conf.LogFilename != "" {
+		// We must set O_APPEND and not O_TRUNC because Docker passes
+		// the same log file for all commands (and also parses these
+		// log files), so we can't destroy them on each command.
+		var err error
+		errorLogger, err = log.OpenFile(conf.LogFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, &log.DefaultFileOpts{})
+		if err != nil {
+			util.Fatalf("error opening log file %q: %v", conf.LogFilename, err)
+		}
+	}
+	util.ErrorLogger = errorLogger
+
+	// Fetch the container ID and spec for the subcommand, if possible.
+	subCmdName := flag.CommandLine.Arg(0)
+	var (
+		subCmd      util.SubCommand
+		subCmdFlags *flag.FlagSet
+		cid         string
+		spec        *specs.Spec
+	)
+	for cmd := range commands {
+		if cmd.Name() == subCmdName {
+			subCmd = cmd
+			break
+		}
+	}
+	// If subCmd is nil, it will fail later. Ignore it.
+	if subCmd != nil {
+		subCmdFlags = flag.NewFlagSet(subCmdName, flag.ContinueOnError)
+		subCmdFlags.Usage = func() { cdr.ExplainCommand(cdr.Error, subCmd) }
+		subCmd.SetFlags(subCmdFlags)
+		if err := subCmdFlags.Parse(flag.CommandLine.Args()[1:]); err != nil {
+			util.Fatalf("failed to parse flags for %q: %v", subCmdName, err)
+		}
+		cid, spec, err = subCmd.FetchSpec(conf, subCmdFlags)
+		if err != nil {
+			util.Fatalf("FetchSpec failed: %v", err)
+		}
+		// Fix the config based on the OCI spec. If spec is nil, it means that the
+		// subcommand doesn't operate on a container, so there is no corresponding
+		// container spec to apply.
+		if spec != nil {
+			if err := specutils.FixConfig(conf, spec); err != nil {
+				util.Fatalf("Failed to apply OCI spec annotations to runsc config: %v", err)
+			}
+		}
+	}
+
+	// Construct LogFileOpts for the subcommand.
+	lfOpts := &specutils.LogFileOpts{
+		SandboxID: "<unknown>",
+		CID:       "<unknown>",
+		Command:   subCmdName,
+		Timestamp: startTime,
+	}
+	if spec != nil {
+		lfOpts.Test = specutils.TestName(conf, spec)
+		lfOpts.CID = cid
+		if specutils.IsRootContainer(spec) {
+			lfOpts.SandboxID = cid
+		} else {
+			lfOpts.SandboxID, _ = specutils.SandboxID(spec)
+		}
+	}
+
+	// Sets the reference leak check mode. Also set it in config below to
+	// propagate it to child processes.
+	refs.SetLeakMode(conf.ReferenceLeak)
+
+	// Set up logging.
+	if conf.Debug && specutils.IsDebugCommand(conf, subCmdName) {
+		log.SetLevel(log.Debug)
+	}
+
+	// Logging will include the local date and time via the time package.
+	//
+	// On first use, time.Local initializes the local time zone, which
+	// involves opening tzdata files on the host. Since this requires
+	// opening host files, it must be done before syscall filter
+	// installation.
+	//
+	// Generally there will be a log message before filter installation
+	// that will force initialization, but force initialization here in
+	// case that does not occur.
+	_ = time.Local.String()
+
+	var emitters log.MultiEmitter
+	if *debugLogFD > -1 {
+		f := os.NewFile(uintptr(*debugLogFD), "debug log file")
+		emitters = append(emitters, newEmitter(conf.DebugLogFormat, f))
+	} else if len(conf.DebugLog) > 0 && specutils.IsDebugCommand(conf, subCmdName) {
+		f, err := specutils.OpenDebugLogFile(conf.DebugLog, lfOpts)
+		if err != nil {
+			util.Fatalf("error opening debug log file in %q: %v", conf.DebugLog, err)
+		}
+		emitters = append(emitters, newEmitter(conf.DebugLogFormat, f))
+	} else {
+		// Stderr is reserved for the application, just discard the logs if no debug
+		// log is specified.
+		emitters = append(emitters, newEmitter("text", io.Discard))
+	}
+
+	if *panicLogFD > -1 || *debugLogFD > -1 {
+		fd := *panicLogFD
+		if fd < 0 {
+			fd = *debugLogFD
+		}
+		// Quick sanity check to make sure no other commands get passed
+		// a log fd (they should use log dir instead).
+		if _, ok := subCmd.(util.InternalCommand); !ok {
+			util.Fatalf("flags --debug-log-fd and --panic-log-fd should only be passed to internal commands, but was passed to %q", subCmdName)
+		}
+
+		// If we are the boot process, then we own our stdio FDs and can do what we
+		// want with them. Since Docker and Containerd both eat boot's stderr, we
+		// dup our stderr to the provided log FD so that panics will appear in the
+		// logs, rather than just disappear.
+		if err := unix.Dup3(fd, int(os.Stderr.Fd()), 0); err != nil {
+			util.Fatalf("error dup'ing fd %d to stderr: %v", fd, err)
+		}
+	} else if conf.AlsoLogToStderr {
+		emitters = append(emitters, newEmitter(conf.DebugLogFormat, os.Stderr))
+	}
+	if ulEmittter, add := userLogEmitter(conf, subCmdName); add {
+		emitters = append(emitters, ulEmittter)
+	}
+
+	switch len(emitters) {
+	case 0:
+		// Do nothing.
+	case 1:
+		// Use the singular emitter to avoid needless
+		// `for` loop overhead when logging to a single place.
+		log.SetTarget(emitters[0])
+	default:
+		log.SetTarget(&emitters)
+	}
+
+	// Drain the buffered logs to the configured target.
+	bufEmitter.drain(log.Log().Emitter)
+
+	const delimString = `**************** gVisor ****************`
+	log.Infof(delimString)
+	log.Infof("Version %s, %s, %s, %d CPUs, %s, PID %d, PPID %d, UID %d, GID %d", version.Version(), runtime.Version(), runtime.GOARCH, runtime.NumCPU(), runtime.GOOS, os.Getpid(), os.Getppid(), os.Getuid(), os.Getgid())
+	log.Debugf("Page size: 0x%x (%d bytes)", os.Getpagesize(), os.Getpagesize())
+	log.Infof("Args: %v", os.Args)
+	conf.Log()
+	if log.IsLogging(log.Debug) {
+		if goStartTime := starttime.GoStartTime(); goStartTime.Equal(startTime) {
+			log.Debugf("Go started execution at %s. Could not measure process spawn time (no /proc/self/status?)", goStartTime.Format("15:04:05.000000"))
+		} else {
+			log.Debugf("runsc process spawned at %v, Go started execution at %s. Startup overhead: %v", startTime.Format("15:04:05.000000"), goStartTime.Format("15:04:05.000000"), goStartTime.Sub(startTime))
+		}
+	}
+	log.Infof(delimString)
+
+	if *coverageFD >= 0 {
+		f := os.NewFile(uintptr(*coverageFD), "coverage file")
+		coverage.EnableReport(f)
+	}
+	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		// SIGTERM is sent to all processes if a test exceeds its
+		// timeout and this case is handled by syscall_test_runner.
+		log.Warningf("Block the TERM signal. This is only safe in tests!")
+		signal.Ignore(unix.SIGTERM)
+	}
+
+	// Call the subcommand and pass in the configuration.
+	var (
+		subCmdCode subcommands.ExitStatus
+		ws         unix.WaitStatus
+	)
+	if subCmd != nil {
+		subCmdCode = subCmd.Execute(context.Background(), subCmdFlags, conf, &ws)
+	} else {
+		subCmdCode = subcommands.Execute(context.Background(), conf, &ws)
+	}
+	// Check for leaks and write coverage report before os.Exit().
+	refs.DoLeakCheck()
+	_ = coverage.Report()
+	if subCmdCode == subcommands.ExitSuccess {
+		log.Infof("Exiting with status: %v", ws)
+		if ws.Signaled() {
+			// No good way to return it, emulate what the shell does. Maybe raise
+			// signal to self?
+			os.Exit(128 + int(ws.Signal()))
+		}
+		os.Exit(ws.ExitStatus())
+	}
+	// Return an error that is unlikely to be used by the application.
+	log.Warningf("Failure to execute command, err: %v", subCmdCode)
+	os.Exit(128)
+}
+
+func newEmitter(format string, logFile io.Writer) log.Emitter {
+	switch format {
+	case "text":
+		return log.GoogleEmitter{&log.Writer{Next: logFile}}
+	case "json":
+		return log.JSONEmitter{&log.Writer{Next: logFile}}
+	case "json-k8s":
+		return log.K8sJSONEmitter{&log.Writer{Next: logFile}}
+	}
+	util.Fatalf("invalid log format %q, must be 'text', 'json', or 'json-k8s'", format)
+	panic("unreachable")
+}
+
+// userLogEmitter returns an emitter to add logs to user logs if requested.
+func userLogEmitter(conf *config.Config, subcommand string) (log.Emitter, bool) {
+	if subcommand != "boot" || !conf.DebugToUserLog {
+		return nil, false
+	}
+	// We need to manually scan for `--user-log-fd` since it is a flag of the
+	// `boot` subcommand. We know it is in `--user-log-fd=FD` format because
+	// we control how arguments to `runsc boot` are formatted.
+	const userLogFDFlagPrefix = "--user-log-fd="
+	var userLog *os.File
+	for _, arg := range os.Args[1:] {
+		if !strings.HasPrefix(arg, userLogFDFlagPrefix) {
+			continue
+		}
+		if userLog != nil {
+			util.Fatalf("duplicate %q flag", userLogFDFlagPrefix)
+		}
+		userLogFD, err := strconv.Atoi(arg[len(userLogFDFlagPrefix):])
+		if err != nil {
+			util.Fatalf("invalid user log FD flag %q: %v", arg, err)
+		}
+		userLog = os.NewFile(uintptr(userLogFD), "user log file")
+	}
+	if userLog == nil {
+		return nil, false
+	}
+	return log.K8sJSONEmitter{&log.Writer{Next: userLog}}, true
+}
+
+type bufferedLog struct {
+	depth     int
+	level     log.Level
+	timestamp time.Time
+	message   string
+}
+
+type bufferedEmitter struct {
+	mu     sync.Mutex
+	buffer []bufferedLog
+}
+
+// Emit implements log.Emitter.Emit.
+func (b *bufferedEmitter) Emit(depth int, level log.Level, timestamp time.Time, format string, v ...any) {
+	// Render the message now to capture the state of `v` args (at the time it
+	// was originally emitted).
+	message := fmt.Sprintf(format, v...)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buffer = append(b.buffer, bufferedLog{depth: depth, level: level, timestamp: timestamp, message: message})
+}
+
+func (b *bufferedEmitter) drain(emitter log.Emitter) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, l := range b.buffer {
+		emitter.Emit(l.depth, l.level, l.timestamp, "%s", l.message)
+	}
+	b.buffer = nil
+}

@@ -1,0 +1,228 @@
+// Copyright 2020 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package devpts
+
+import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
+)
+
+// replicaInode is the inode for the replica end of the Terminal.
+//
+// +stateify savable
+type replicaInode struct {
+	implStatFS
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
+	kernfs.InodeNotDirectory
+	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
+
+	locks vfs.FileLocks
+
+	// root is the devpts root inode.
+	root *rootInode
+
+	// t is the connected Terminal.
+	t *Terminal
+}
+
+var _ kernfs.Inode = (*replicaInode)(nil)
+
+// Open implements kernfs.Inode.Open.
+func (ri *replicaInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	return ri.t.OpenTTY(ctx, rp.Mount(), d.VFSDentry(), opts)
+}
+
+// Valid implements kernfs.Inode.Valid.
+func (ri *replicaInode) Valid(context.Context, *kernfs.Dentry, string) bool {
+	// Return valid if the replica still exists.
+	ri.root.mu.Lock()
+	defer ri.root.mu.Unlock()
+	_, ok := ri.root.replicas[ri.t.n]
+	return ok
+}
+
+// Stat implements kernfs.Inode.Stat.
+func (ri *replicaInode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
+	statx, err := ri.InodeAttrs.Stat(ctx, vfsfs, opts)
+	if err != nil {
+		return linux.Statx{}, err
+	}
+	statx.Blksize = 1024
+	statx.RdevMajor = linux.UNIX98_PTY_REPLICA_MAJOR
+	statx.RdevMinor = ri.t.n
+	return statx, nil
+}
+
+// SetStat implements kernfs.Inode.SetStat
+func (ri *replicaInode) SetStat(ctx context.Context, vfsfs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
+	if opts.Stat.Mask&linux.STATX_SIZE != 0 {
+		return linuxerr.EINVAL
+	}
+	return ri.InodeAttrs.SetStat(ctx, vfsfs, creds, opts)
+}
+
+// +stateify savable
+type replicaFileDescription struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
+
+	inode *replicaInode
+}
+
+var _ vfs.FileDescriptionImpl = (*replicaFileDescription)(nil)
+
+// Release implements fs.FileOperations.Release.
+func (rfd *replicaFileDescription) Release(ctx context.Context) {
+	rfd.inode.t.ld.replicaClose()
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (rfd *replicaFileDescription) EventRegister(e *waiter.Entry) error {
+	rfd.inode.t.ld.replicaWaiter.EventRegister(e)
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (rfd *replicaFileDescription) EventUnregister(e *waiter.Entry) {
+	rfd.inode.t.ld.replicaWaiter.EventUnregister(e)
+}
+
+// Readiness implements waiter.Waitable.Readiness.
+func (rfd *replicaFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return rfd.inode.t.ld.replicaReadiness()
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (rfd *replicaFileDescription) Epollable() bool {
+	return true
+}
+
+// Read implements vfs.FileDescriptionImpl.Read.
+func (rfd *replicaFileDescription) Read(ctx context.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
+	return rfd.inode.t.ld.inputQueueRead(ctx, dst)
+}
+
+// Write implements vfs.FileDescriptionImpl.Write.
+func (rfd *replicaFileDescription) Write(ctx context.Context, src usermem.IOSequence, _ vfs.WriteOptions) (int64, error) {
+	return rfd.inode.t.ld.outputQueueWrite(ctx, src)
+}
+
+// Ioctl implements vfs.FileDescriptionImpl.Ioctl.
+func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		// ioctl(2) may only be called from a task goroutine.
+		return 0, linuxerr.ENOTTY
+	}
+
+	switch cmd := args[1].Uint(); cmd {
+	case linux.FIONREAD: // linux.FIONREAD == linux.TIOCINQ
+		// Get the number of bytes in the input queue read buffer.
+		return 0, rfd.inode.t.ld.inputQueueReadSize(t, io, args)
+	case linux.TCGETS:
+		return rfd.inode.t.ld.getTermios(t, args)
+	case linux.TCGETS2:
+		return rfd.inode.t.ld.getTermios2(t, args)
+	case linux.TCSETS:
+		return rfd.inode.t.ld.setTermios(t, args)
+	case linux.TCSETSW:
+		// Note that this should drain the output queue first, but we
+		// don't implement that yet.
+		return rfd.inode.t.ld.setTermios(t, args)
+	case linux.TCSETSF:
+		// This should drain the output queue and clear the input queue
+		// first, but we don't implement that yet.
+		return rfd.inode.t.ld.setTermios(t, args)
+	case linux.TCSETS2:
+		return rfd.inode.t.ld.setTermios2(t, args)
+	case linux.TCSETSW2:
+		// Note that this should drain the output queue first, but we
+		// don't implement that yet.
+		return rfd.inode.t.ld.setTermios2(t, args)
+	case linux.TCSETSF2:
+		// This should drain the output queue and clear the input queue
+		// first, but we don't implement that yet.
+		return rfd.inode.t.ld.setTermios2(t, args)
+	case linux.TCSBRK:
+		// TCSBRK with arg != 0 is tcdrain, which waits for output to
+		// drain. For a pty with no real hardware, this is a no-op.
+		// TCSBRK with arg == 0 sends a break, also a no-op for ptys.
+		return 0, nil
+	case linux.TCFLSH:
+		return 0, rfd.inode.t.ld.tcFlush(replicaEndpoint, args[2].Uint())
+	case linux.TIOCGPTN:
+		nP := primitive.Uint32(rfd.inode.t.n)
+		_, err := nP.CopyOut(t, args[2].Pointer())
+		return 0, err
+	case linux.TIOCGWINSZ:
+		return 0, rfd.inode.t.ld.windowSize(t, args)
+	case linux.TIOCSWINSZ:
+		return 0, rfd.inode.t.ld.setWindowSize(t, args)
+	case linux.TIOCSCTTY:
+		// Make the given terminal the controlling terminal of the
+		// calling process.
+		steal := args[2].Int() == 1
+		return 0, t.ThreadGroup().SetControllingTTY(ctx, rfd.inode.t.replicaKTTY, steal, rfd.vfsfd.IsReadable())
+	case linux.TIOCNOTTY:
+		// Release this process's controlling terminal.
+		return 0, t.ThreadGroup().ReleaseControllingTTY(rfd.inode.t.replicaKTTY)
+	case linux.TIOCGPGRP:
+		// Get the foreground process group id.
+		pgid, err := t.ThreadGroup().ForegroundProcessGroupID(rfd.inode.t.replicaKTTY)
+		if err != nil {
+			return 0, err
+		}
+		ret := primitive.Int32(pgid)
+		_, err = ret.CopyOut(t, args[2].Pointer())
+		return 0, err
+	case linux.TIOCSPGRP:
+		// Set the foreground process group id.
+		var pgid primitive.Int32
+		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, rfd.inode.t.replicaKTTY, kernel.ProcessGroupID(pgid))
+	default:
+		maybeEmitUnimplementedEvent(ctx, sysno, cmd)
+		return 0, linuxerr.ENOTTY
+	}
+}
+
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
+func (rfd *replicaFileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
+	creds := auth.CredentialsFromContext(ctx)
+	fs := rfd.vfsfd.VirtualDentry().Mount().Filesystem()
+	return rfd.inode.SetStat(ctx, fs, creds, opts)
+}
+
+// Stat implements vfs.FileDescriptionImpl.Stat.
+func (rfd *replicaFileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	fs := rfd.vfsfd.VirtualDentry().Mount().Filesystem()
+	return rfd.inode.Stat(ctx, fs, opts)
+}

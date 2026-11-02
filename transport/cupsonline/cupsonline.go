@@ -777,9 +777,11 @@ func (w *cupsWS) connectAndServe() error {
 	wsURL = strings.TrimRight(wsURL, "/") + "/websocket"
 
 	header := http.Header{}
+	cookies := a.httpClient.Jar.Cookies(mustParseURL(a.connURL))
+	utils.Infof("[CUPS] ws connect room=%s cookies=%d origin=%s", shortRoom(w.roomUUID), len(cookies), originOf(a.connURL))
 	header.Set("Origin", originOf(a.connURL))
 	header.Set("User-Agent", cupsUA)
-	for _, c := range a.httpClient.Jar.Cookies(mustParseURL(a.connURL)) {
+	for _, c := range cookies {
 		header.Add("Cookie", c.Name+"="+c.Value)
 	}
 
@@ -793,10 +795,16 @@ func (w *cupsWS) connectAndServe() error {
 		ReadBufferSize:   w.config.ReadBufferSize,
 		WriteBufferSize:  w.config.WriteBufferSize,
 	}
-	conn, _, err := dialer.DialContext(w.ctx, wsURL, header)
+	conn, resp, err := dialer.DialContext(w.ctx, wsURL, header)
 	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		utils.Infof("[CUPS] ws dial FAILED room=%s status=%d err=%v", shortRoom(w.roomUUID), status, err)
 		return fmt.Errorf("dial: %w", err)
 	}
+	utils.Infof("[CUPS] ws dial OK room=%s", shortRoom(w.roomUUID))
 	// Stop mustn't have to wait for the server's next message to take the
 	// reader down.
 	unhook := context.AfterFunc(w.ctx, func() { conn.Close() })
@@ -1248,6 +1256,13 @@ func (w *cupsWS) handleReply(raw []byte) {
 		}
 		return
 	}
+	if os.Getenv("OPENFLUX_CUPS_FRAMES") != "" {
+		n := len(raw)
+		if n > 24 {
+			n = 24
+		}
+		utils.Infof("[CUPS] frame in room=%s len=%d head=%s", shortRoom(w.roomUUID), len(raw), string(raw[:n]))
+	}
 	push, ok := obj["push"].(map[string]interface{})
 	if !ok {
 		return
@@ -1410,6 +1425,7 @@ type CupsonlineTransport struct {
 	// roomIDs are the rooms to join, from --url. Empty on an exit node
 	// means "create new ones"; a client can't start without them.
 	roomIDs   []string
+	joined    atomic.Int64
 	config    CupsonlineConfig
 	isClient  bool
 	clientErr error
@@ -1508,6 +1524,14 @@ func (t *CupsonlineTransport) Start() error {
 		return errStopped
 	}
 
+	joined := 0
+	for _, s := range slots {
+		if s.auth != nil {
+			joined++
+		}
+	}
+	t.joined.Store(int64(joined))
+
 	joinedAt := time.Now()
 	wss := make([]*cupsWS, len(slots))
 	for i, s := range slots {
@@ -1533,7 +1557,17 @@ func (t *CupsonlineTransport) Start() error {
 		}
 		// Already reported by enterRooms; run() only probes it now and then.
 		ws.dead.Store(errors.Is(s.err, errRoomGone))
-		ws.onData = t.CallReceive
+		room := s.id
+		ws.onData = func(b []byte) {
+			if os.Getenv("OPENFLUX_CUPS_FRAMES") != "" {
+				n := len(b)
+				if n > 16 {
+					n = 16
+				}
+				utils.Infof("[CUPS] frame in room=%s len=%d head=%x", shortRoom(room), len(b), b[:n])
+			}
+			t.CallReceive(b)
+		}
 		wss[i] = ws
 	}
 	t.wss = wss
@@ -1689,6 +1723,20 @@ func (t *CupsonlineTransport) Send(data []byte) error {
 	}
 	if st := t.stripe.Load(); st != nil {
 		return st.Send(data)
+	}
+	ws := t.pickRoom()
+	if ws == nil {
+		return errNoRoom
+	}
+	return ws.Send(data)
+}
+
+// SendRaw publishes one message straight into a room, bypassing the stripe.
+// The pointer channel needs this: through the stripe a short id is wrapped as
+// data and the peer's tap never sees it as an announcement.
+func (t *CupsonlineTransport) SendRaw(data []byte) error {
+	if len(data) > t.config.MaxPayloadBytes {
+		return fmt.Errorf("cups: посылка %d байт больше предела %d", len(data), t.config.MaxPayloadBytes)
 	}
 	ws := t.pickRoom()
 	if ws == nil {
@@ -1936,3 +1984,30 @@ func (t *CupsonlineTransport) SetNumRooms(n int) {
 
 // StripeOptions are the settings for a stripe over this carrier's rooms.
 func StripeOptions() transport.StripeOptions { return stripeOptions }
+
+// JoinedRooms is how many rooms this transport actually entered. Connective
+// state comes up before that, so a caller that needs the rooms must wait for
+// this, not for IsConnected.
+func (t *CupsonlineTransport) JoinedRooms() int { return int(t.joined.Load()) }
+
+// RoomIDs reports the rooms this transport runs. An exit node creates them a
+// few seconds after start, so callers that hang their own channel on this one
+// have to ask, not read the url.
+func (t *CupsonlineTransport) RoomIDs() []string {
+	t.Mu.Lock()
+	out := make([]string, 0, len(t.roomIDs))
+	out = append(out, t.roomIDs...)
+	t.Mu.Unlock()
+	if len(out) > 0 {
+		return out
+	}
+	// An exit node has no --url: it creates the rooms at start and records the
+	// packed list, which is what the client and the pointer channel share.
+	t.roomsMu.Lock()
+	packed := t.roomList
+	t.roomsMu.Unlock()
+	if ids, _, err := transport.UnpackRooms(packed); err == nil {
+		out = append(out, ids...)
+	}
+	return out
+}

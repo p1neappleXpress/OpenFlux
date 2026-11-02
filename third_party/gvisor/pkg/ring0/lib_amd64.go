@@ -1,0 +1,130 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build amd64
+// +build amd64
+
+package ring0
+
+import (
+	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/hostarch"
+)
+
+// fxrstor restores floating point state.
+func fxrstor(addr uintptr)
+
+// xrstor restores floating point state.
+func xrstor(addr uintptr)
+
+// fxsave saves floating point state.
+func fxsave(addr uintptr)
+
+// xsave saves floating point state.
+func xsave(addr uintptr)
+
+// xsaveopt saves floating point state.
+func xsaveopt(addr uintptr)
+
+// writeFS sets the FS base address (selects one of wrfsbase or wrfsmsr).
+func writeFS(addr uintptr)
+
+// wrfsbase writes to the GS base address.
+func wrfsbase(addr uintptr)
+
+// wrfsmsr writes to the GS_BASE MSR.
+func wrfsmsr(addr uintptr)
+
+// writeGS sets the GS address (selects one of wrgsbase or wrgsmsr).
+func writeGS(addr uintptr)
+
+// wrgsbase writes to the GS base address.
+func wrgsbase(addr uintptr)
+
+// wrgsmsr writes to the GS_BASE MSR.
+func wrgsmsr(addr uintptr)
+
+// stmxcsr reads the MXCSR control and status register.
+func stmxcsr(addr *uint32)
+
+// ldmxcsr writes to the MXCSR control and status register.
+func ldmxcsr(addr *uint32)
+
+// readCR2 reads the current CR2 value.
+func readCR2() uintptr
+
+// fninit initializes the floating point unit.
+func fninit()
+
+// xsetbv writes to an extended control register.
+func xsetbv(reg, value uintptr)
+
+// xgetbv reads an extended control register.
+func xgetbv(reg uintptr) uintptr
+
+// wrmsr reads to the given MSR.
+func wrmsr(reg, value uintptr)
+
+// rdmsr reads the given MSR.
+func rdmsr(reg uintptr) uintptr
+
+// Mostly-constants set by Init.
+var (
+	hasSMEP       bool
+	hasSMAP       bool
+	hasUMIP       bool
+	hasPCID       bool
+	hasXSAVEOPT   bool
+	hasXSAVE      bool
+	hasFSGSBASE   bool
+	hasLA57       bool
+	validXCR0Mask uintptr
+	localXCR0     uintptr
+)
+
+// Init sets function pointers based on architectural features.
+//
+// This must be called prior to using ring0. It may be called with the
+// auto-detected feature set using InitDefault. It may also be called at
+// another time with a  different FeatureSet.
+func Init(fs cpuid.FeatureSet) {
+	// Initialize all sizes.
+	VirtualAddressBits = uintptr(fs.VirtualAddressBits())
+	if PhysicalAddressBits == 0 {
+		PhysicalAddressBits = uintptr(fs.PhysicalAddressBits())
+	}
+	UserspaceSize = uintptr(1) << (VirtualAddressBits - 1)
+	MaximumUserAddress = (UserspaceSize - 1) & ^uintptr(hostarch.PageSize-1)
+	KernelStartAddress = ^uintptr(0) - (UserspaceSize - 1)
+	// Initialize all functions.
+	hasSMEP = fs.HasFeature(cpuid.X86FeatureSMEP)
+	hasSMAP = fs.HasFeature(cpuid.X86FeatureSMAP)
+	hasUMIP = fs.HasFeature(cpuid.X86FeatureUMIP)
+	hasPCID = fs.HasFeature(cpuid.X86FeaturePCID)
+	hasXSAVEOPT = fs.UseXsaveopt()
+	hasXSAVE = fs.UseXsave()
+	hasFSGSBASE = fs.HasFeature(cpuid.X86FeatureFSGSBase)
+	hasLA57 = fs.HasFeature(cpuid.X86FeatureLA57)
+	validXCR0Mask = uintptr(fs.ValidXCR0Mask())
+	if hasXSAVE {
+		XCR0DisabledMask := uintptr((1 << 9) | (1 << 17) | (1 << 18))
+		localXCR0 = xgetbv(0) &^ XCR0DisabledMask
+	}
+}
+
+// InitDefault initializes ring0 with the auto-detected host feature set.
+func InitDefault() {
+	cpuid.Initialize()
+	Init(cpuid.HostFeatureSet())
+}

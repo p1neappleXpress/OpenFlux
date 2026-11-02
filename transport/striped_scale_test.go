@@ -21,9 +21,9 @@ type delayLane struct {
 	alive atomic.Bool
 }
 
-func (l *delayLane) Start() error   { l.alive.Store(true); return nil }
-func (l *delayLane) Stop() error    { l.alive.Store(false); return nil }
-func (l *delayLane) IsConnected() bool { return l.alive.Load() }
+func (l *delayLane) Start() error          { l.alive.Store(true); return nil }
+func (l *delayLane) Stop() error           { l.alive.Store(false); return nil }
+func (l *delayLane) IsConnected() bool     { return l.alive.Load() }
 func (l *delayLane) Stats() TransportStats { return TransportStats{Connected: l.alive.Load()} }
 
 func (l *delayLane) Receive(cb func([]byte)) {

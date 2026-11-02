@@ -1,0 +1,182 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package auth
+
+import (
+	"math"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+)
+
+// A UserNamespace represents a user namespace. See user_namespaces(7) for
+// details.
+//
+// +stateify savable
+type UserNamespace struct {
+	// parent is this namespace's parent. If this is the root namespace, parent
+	// is nil. The parent pointer is immutable.
+	parent *UserNamespace
+
+	// owner is the effective UID of the namespace's creator in the root
+	// namespace. owner is immutable.
+	owner KUID
+
+	// Keys is the set of keys in this namespace.
+	Keys KeySet
+
+	// mu protects the following fields.
+	//
+	// If mu will be locked in multiple UserNamespaces, it must be locked in
+	// descendant namespaces before ancestors.
+	mu userNamespaceMutex `state:"nosave"`
+
+	// Mappings of user/group IDs between this namespace and its parent.
+	//
+	// All ID maps, once set, cannot be changed. This means that successful
+	// UID/GID translations cannot be racy.
+	uidMapFromParent idMapSet
+	uidMapToParent   idMapSet
+	gidMapFromParent idMapSet
+	gidMapToParent   idMapSet
+
+	// parentHadSetfcap is true if the parent namespace had the CAP_SETFCAP
+	// capability when this namespace was created. Similar to
+	// user_namespace.parent_could_setfcap in Linux.
+	parentHadSetfcap bool
+
+	// setgroupsAllowed mirrors USERNS_SETGROUPS_ALLOWED in Linux. Protected by mu.
+	setgroupsAllowed bool
+}
+
+// NewRootUserNamespace returns a UserNamespace that is appropriate for a
+// system's root user namespace. Note that namespaces returned by separate calls
+// to this function are *distinct* namespaces. Once a root namespace is created
+// by this function, the returned value must be reused to refer to the same
+// namespace.
+func NewRootUserNamespace() *UserNamespace {
+	var ns UserNamespace
+	ns.setgroupsAllowed = true
+	// """
+	// The initial user namespace has no parent namespace, but, for
+	// consistency, the kernel provides dummy user and group ID mapping files
+	// for this namespace. Looking at the uid_map file (gid_map is the same)
+	// from a shell in the initial namespace shows:
+	//
+	// $ cat /proc/$$/uid_map
+	// 0          0 4294967295
+	// """ - user_namespaces(7)
+	for _, m := range []*idMapSet{
+		&ns.uidMapFromParent,
+		&ns.uidMapToParent,
+		&ns.gidMapFromParent,
+		&ns.gidMapToParent,
+	} {
+		// Insertion into an empty map shouldn't fail.
+		m.InsertRange(idMapRange{0, math.MaxUint32}, 0)
+	}
+	return &ns
+}
+
+// Root returns the root of the user namespace tree containing ns.
+func (ns *UserNamespace) Root() *UserNamespace {
+	for ns.parent != nil {
+		ns = ns.parent
+	}
+	return ns
+}
+
+// "The kernel imposes (since version 3.11) a limit of 32 nested levels of user
+// namespaces." - user_namespaces(7)
+const maxUserNamespaceDepth = 32
+
+func (ns *UserNamespace) depth() int {
+	var i int
+	for ns != nil {
+		i++
+		ns = ns.parent
+	}
+	return i
+}
+
+// NewChildUserNamespace returns a new user namespace created by a caller with
+// credentials c.
+func (c *Credentials) NewChildUserNamespace() (*UserNamespace, error) {
+	if c.UserNamespace.depth() >= maxUserNamespaceDepth {
+		// "... Calls to unshare(2) or clone(2) that would cause this limit to
+		// be exceeded fail with the error EUSERS." - user_namespaces(7)
+		return nil, linuxerr.EUSERS
+	}
+	// "EPERM: CLONE_NEWUSER was specified in flags, but either the effective
+	// user ID or the effective group ID of the caller does not have a mapping
+	// in the parent namespace (see user_namespaces(7))." - clone(2)
+	// "CLONE_NEWUSER requires that the user ID and group ID of the calling
+	// process are mapped to user IDs and group IDs in the user namespace of
+	// the calling process at the time of the call." - unshare(2)
+	if !c.EffectiveKUID.In(c.UserNamespace).Ok() {
+		return nil, linuxerr.EPERM
+	}
+	if !c.EffectiveKGID.In(c.UserNamespace).Ok() {
+		return nil, linuxerr.EPERM
+	}
+	c.UserNamespace.mu.Lock()
+	parentSetgroupsAllowed := c.UserNamespace.setgroupsAllowed
+	c.UserNamespace.mu.Unlock()
+	return &UserNamespace{
+		parent:           c.UserNamespace,
+		owner:            c.EffectiveKUID,
+		parentHadSetfcap: c.HasSelfCapability(linux.CAP_SETFCAP),
+		setgroupsAllowed: parentSetgroupsAllowed,
+		// "When a user namespace is created, it starts without a mapping of
+		// user IDs (group IDs) to the parent user namespace." -
+		// user_namespaces(7)
+	}, nil
+}
+
+// SetgroupsAllowed returns ns's USERNS_SETGROUPS_ALLOWED bit.
+func (ns *UserNamespace) SetgroupsAllowed() bool {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	return ns.setgroupsAllowed
+}
+
+// MaySetgroups mirrors userns_may_setgroups in Linux.
+func (ns *UserNamespace) MaySetgroups() bool {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	return !ns.gidMapFromParent.IsEmpty() && ns.setgroupsAllowed
+}
+
+// SetSetgroupsAllowed mirrors proc_setgroups_write in Linux.
+func (ns *UserNamespace) SetSetgroupsAllowed(ctx context.Context, allow bool) error {
+	c := CredentialsFromContext(ctx)
+	if !c.HasCapabilityIn(linux.CAP_SYS_ADMIN, ns) {
+		return linuxerr.EPERM
+	}
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	if allow {
+		if !ns.setgroupsAllowed {
+			return linuxerr.EPERM
+		}
+		return nil
+	}
+	if !ns.gidMapFromParent.IsEmpty() {
+		return linuxerr.EPERM
+	}
+	ns.setgroupsAllowed = false
+	return nil
+}

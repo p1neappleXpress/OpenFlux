@@ -38,7 +38,7 @@ type ScriptTransport struct {
 
 	name      string
 	scriptSrc []byte
-	pkg       *Package // non-nil when loaded from a .flux package, nil for a plain .js
+	pkg       *Package          // non-nil when loaded from a .flux package, nil for a plain .js
 	pubKey    ed25519.PublicKey // the key the package/.js was verified against; what an update must stay pinned to
 	file      string            // base name it was loaded from, so an update replaces that very file
 	cfgURL    string

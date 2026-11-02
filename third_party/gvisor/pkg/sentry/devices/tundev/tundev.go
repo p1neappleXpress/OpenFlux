@@ -1,0 +1,211 @@
+// Copyright 2020 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package tundev implements the /dev/net/tun device.
+package tundev
+
+import (
+	"io"
+	"time"
+
+	"golang.org/x/sys/unix"
+	"golang.org/x/time/rate"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
+	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
+)
+
+const (
+	netTunDevMajor = 10
+	netTunDevMinor = 200
+)
+
+var warnRateLimiter = rate.NewLimiter(rate.Every(time.Second), 1)
+
+// tunDevice implements vfs.Device for /dev/net/tun.
+//
+// +stateify savable
+type tunDevice struct{}
+
+// Open implements vfs.Device.Open.
+func (tunDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd := &tunFD{}
+	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
+		UseDentryMetadata: true,
+	}); err != nil {
+		return nil, err
+	}
+	return &fd.vfsfd, nil
+}
+
+// tunFD implements vfs.FileDescriptionImpl for /dev/net/tun.
+//
+// +stateify savable
+type tunFD struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
+
+	device tun.Device
+}
+
+// Ioctl implements vfs.FileDescriptionImpl.Ioctl.
+func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	request := args[1].Uint()
+	data := args[2].Pointer()
+
+	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		panic("Ioctl should be called from a task context")
+	}
+
+	switch request {
+	case linux.TUNSETIFF:
+		if !t.NetworkNamespace().HasCapability(ctx, linux.CAP_NET_ADMIN) {
+			return 0, linuxerr.EPERM
+		}
+		stack, ok := t.NetworkContext().(*netstack.Stack)
+		if !ok {
+			return 0, linuxerr.EINVAL
+		}
+
+		var req linux.IFReq
+		if _, err := req.CopyIn(t, data); err != nil {
+			return 0, err
+		}
+
+		// Validate flags.
+		linuxFlags := hostarch.ByteOrder.Uint16(req.Data[:])
+		flags, err := netstack.LinuxToTUNFlags(linuxFlags)
+		if err != nil {
+			if warnRateLimiter.Allow() {
+				ctx.Warningf("Unsuported tun flags: %x", linuxFlags)
+			}
+		}
+		return 0, fd.device.SetIff(ctx, stack.Stack, req.Name(), flags)
+
+	case linux.TUNSETPERSIST:
+		v := args[2].Uint()
+		return 0, fd.device.SetPersistent(v != 0)
+
+	case linux.TUNGETIFF:
+		var req linux.IFReq
+		copy(req.IFName[:], fd.device.Name())
+		hostarch.ByteOrder.PutUint16(req.Data[:], netstack.TUNFlagsToLinux(fd.device.Flags()))
+		_, err := req.CopyOut(t, data)
+		return 0, err
+
+	default:
+		return 0, linuxerr.ENOTTY
+	}
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *tunFD) Release(ctx context.Context) {
+	fd.device.Release(ctx)
+}
+
+// PRead implements vfs.FileDescriptionImpl.PRead.
+func (fd *tunFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	return fd.Read(ctx, dst, opts)
+}
+
+// Read implements vfs.FileDescriptionImpl.Read.
+func (fd *tunFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	data, err := fd.device.Read()
+	if err != nil {
+		return 0, err
+	}
+	defer data.Release()
+
+	size := data.Size()
+	n, err := io.CopyN(dst.Writer(ctx), data, dst.NumBytes())
+	if n > 0 && n < int64(size) {
+		// Not an error for partial copying. Packet truncated.
+		err = nil
+	}
+	return int64(n), err
+}
+
+// PWrite implements vfs.FileDescriptionImpl.PWrite.
+func (fd *tunFD) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
+	return fd.Write(ctx, src, opts)
+}
+
+// Write implements vfs.FileDescriptionImpl.Write.
+func (fd *tunFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
+	if src.NumBytes() == 0 {
+		return 0, unix.EINVAL
+	}
+	mtu, err := fd.device.MTU()
+	if err != nil {
+		return 0, err
+	}
+	if int64(mtu) < src.NumBytes() {
+		return 0, unix.EMSGSIZE
+	}
+	data := buffer.NewView(int(src.NumBytes()))
+	defer data.Release()
+	if _, err := io.CopyN(data, src.Reader(ctx), src.NumBytes()); err != nil {
+		return 0, err
+	}
+	return fd.device.Write(data)
+}
+
+// Readiness implements watier.Waitable.Readiness.
+func (fd *tunFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return fd.device.Readiness(mask)
+}
+
+// EventRegister implements watier.Waitable.EventRegister.
+func (fd *tunFD) EventRegister(e *waiter.Entry) error {
+	fd.device.EventRegister(e)
+	return nil
+}
+
+// EventUnregister implements watier.Waitable.EventUnregister.
+func (fd *tunFD) EventUnregister(e *waiter.Entry) {
+	fd.device.EventUnregister(e)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (fd *tunFD) Epollable() bool {
+	return true
+}
+
+// IsNetTunSupported returns whether /dev/net/tun device is supported for s.
+func IsNetTunSupported(s inet.Stack) bool {
+	_, ok := s.(*netstack.Stack)
+	return ok
+}
+
+// Register registers all devices implemented by this package in vfsObj.
+func Register(vfsObj *vfs.VirtualFilesystem) error {
+	return vfsObj.RegisterDevice(vfs.CharDevice, netTunDevMajor, netTunDevMinor, tunDevice{}, &vfs.RegisterDeviceOptions{
+		Pathname:  "net/tun",
+		FilePerms: 0666,
+	})
+}

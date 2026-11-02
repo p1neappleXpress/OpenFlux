@@ -162,7 +162,7 @@ func TestKitCarriersAreTheClientsProfile(t *testing.T) {
 			t.Errorf("transport %d = %+v, want %+v", i, kit.Transports[i], want[i])
 		}
 	}
-	if kit.Context != "http://#" {
+	if kit.Context != "openflux_" {
 		t.Errorf("context = %q: the fixed placeholder, as the installer derives it", kit.Context)
 	}
 	// MAX alone has no document: the placeholder both ends derive

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -22,8 +23,11 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
-// Prefix starts every link; the path segment is the format version.
+// Prefix starts every link; the path segment is the format version. Encode
+// writes PrefixV2, Decode reads both: a v1 link keeps working forever, and a
+// v2 link tells an old client "update OpenFlux" instead of decoding to noise.
 const Prefix = "openflux://v1/"
+const PrefixV2 = "openflux://v2/"
 
 // maxPayload bounds the decompressed JSON, so a crafted link cannot make
 // the decoder allocate without limit.
@@ -95,6 +99,16 @@ type Transport struct {
 	URL      string `json:"url,omitempty"`
 	Priority int    `json:"priority,omitempty"`
 	Dial     string `json:"dial,omitempty"` // direct: the exit's host:port
+	// Params are what a JS transport takes besides its url: a room key, a
+	// token, a channel name. Values are strings so the field never needs a
+	// version of its own.
+	Params map[string]string `json:"params,omitempty"`
+	// Enabled is nil (on) or explicitly off, so a transport can stay in the
+	// link while it is not used.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Role says what the transport carries: "data" (the tunnel's traffic),
+	// "control" (pointers and acks only) or "" (both).
+	Role string `json:"role,omitempty"`
 }
 
 // Config is what a client needs to connect to one exit.
@@ -114,7 +128,15 @@ type Config struct {
 	// Mode is "" (the classic tunnel) or ModeStream. Readers that predate it ignore the
 	// field and would run the classic tunnel against a PHP exit, which cannot work, so
 	// only links made for stream mode carry it.
-	Mode       string      `json:"mode,omitempty"`
+	Mode string `json:"mode,omitempty"`
+	// Node is the exit's host:port, for links that name it instead of leaving
+	// the choice to the app.
+	Node string `json:"node,omitempty"`
+	// Settings are the knobs that used to be flags (handshake timeout, batch
+	// size, dial timeout); the core reads the ones it knows and ignores the rest.
+	Settings map[string]string `json:"settings,omitempty"`
+	// V is the body version Encode wrote: 0 for a v1 link, 2 for this one.
+	V          int         `json:"v,omitempty"`
 	Transports []Transport `json:"transports"`
 }
 
@@ -124,13 +146,35 @@ type Config struct {
 var knownTypes = map[string]bool{
 	"yandex": true, "vyandex": true, "boards": true, "mailru": true,
 	"cupsonline": true, "avito": true, "direct": true, "telemost": true,
+	// yandex-cbir: the app ships it as a JS transport; the core names it so a
+	// link can carry it (the carrier itself is the scripted one).
+	"yandex-cbir": true,
+}
+
+// jsTypes are the JS transports the app knows, named by
+// OPENFLUX_JS_TRANSPORTS ("cbir,vkteams"). The core does not carry the JS
+// catalogue, so the app tells it which types a link may name.
+func jsTypes() map[string]bool {
+	out := map[string]bool{}
+	for _, t := range strings.Split(os.Getenv("OPENFLUX_JS_TRANSPORTS"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out[t] = true
+		}
+	}
+	return out
+}
+
+// shareableType reports whether a link may carry this type: one the core
+// knows, or a JS transport the app named.
+func shareableType(typ string) bool {
+	return knownTypes[typ] || jsTypes()[typ]
 }
 
 // Shareable reports whether a link can carry a carrier of this type that
 // rides a service (a document, a board, a conference): direct, the exit's own
 // port, is not one, and MAX is not shareable at all.
 func Shareable(typ string) bool {
-	if !knownTypes[typ] {
+	if !shareableType(typ) {
 		return false
 	}
 	return typ != "direct"
@@ -163,7 +207,10 @@ func (c *Config) Validate() error {
 		return linkError(CodeUnknownCodec, c.Codec, fmt.Sprintf("share: unknown codec %q", c.Codec), nil)
 	}
 	for _, t := range c.Transports {
-		if !knownTypes[t.Type] {
+		if t.Role != "" && t.Role != "data" && t.Role != "control" && t.Role != "both" {
+			return linkError(CodeBadPayload, t.Type, fmt.Sprintf("share: unknown transport role %q (data, control or both)", t.Role), nil)
+		}
+		if !shareableType(t.Type) {
 			if t.Type == "oneme" {
 				return linkError(CodeNotShareable, t.Type, "share: MAX (oneme) cannot be shared: its token belongs to one account", nil)
 			}
@@ -203,6 +250,7 @@ func Encode(c Config) (string, error) {
 	if err := c.Validate(); err != nil {
 		return "", err
 	}
+	c.V = 2
 	raw, err := json.Marshal(c)
 	if err != nil {
 		return "", err
@@ -218,7 +266,7 @@ func Encode(c Config) (string, error) {
 	if err := w.Close(); err != nil {
 		return "", err
 	}
-	return Prefix + base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
+	return PrefixV2 + base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 // Decode parses and validates an openflux:// link.
@@ -230,7 +278,11 @@ func Encode(c Config) (string, error) {
 // link Encode writes has none of them.
 func Decode(link string) (Config, error) {
 	link = strings.TrimSpace(link)
-	if !strings.HasPrefix(link, Prefix) {
+	prefix := Prefix
+	if strings.HasPrefix(link, PrefixV2) {
+		prefix = PrefixV2
+	}
+	if !strings.HasPrefix(link, prefix) {
 		if strings.HasPrefix(strings.ToLower(link), "openflux://") && !strings.HasPrefix(link, "openflux://") {
 			return Config{}, linkError(CodeCaseChanged, "", "share: the link's letters changed case on the way (openflux:// links are case-sensitive); copy it again", nil)
 		}
@@ -239,7 +291,7 @@ func Decode(link string) (Config, error) {
 		}
 		return Config{}, linkError(CodeNotLink, "", "share: not an openflux:// link", nil)
 	}
-	body := normalizeBody(strings.TrimPrefix(link, Prefix))
+	body := normalizeBody(strings.TrimPrefix(link, prefix))
 	packed, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
 		return Config{}, linkError(CodeDamaged, "", fmt.Sprintf("share: bad link encoding (%d characters after the prefix; truncated or mangled?)", len(body)), err)

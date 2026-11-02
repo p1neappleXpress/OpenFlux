@@ -113,7 +113,7 @@ func TestErrorCodesAreStable(t *testing.T) {
 	good := frozenLinks[0].link
 	cases := []struct{ name, link, code string }{
 		{"not a link", "https://example.com", "not_link"},
-		{"future version", "openflux://v2/abc", "unsupported_version"},
+		{"future version", "openflux://v3/abc", "unsupported_version"},
 		{"case changed", "OPENFLUX://V1/abc", "case_changed"},
 		{"truncated", good[:len(good)-30], "damaged"},
 	}

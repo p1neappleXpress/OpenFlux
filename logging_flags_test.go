@@ -48,15 +48,15 @@ func TestPickSessionContext(t *testing.T) {
 		// the one fixed placeholder, so URLs, transport priorities and
 		// cupsonline room lists can no longer make two peers derive different
 		// contexts and fail the handshake. See transport.KDFContexts.
-		{"no explicit: --url ignored", "", "https://u", specs, "http://#"},
-		{"no explicit: transport URLs ignored", "", "http://#", specs, "http://#"},
-		{"no URL anywhere", "", "http://#", specs[:1], "http://#"},
-		{"cupsonline rooms never a context", "", "http://#", []transportSpec{
+		{"no explicit: --url ignored", "", "https://u", specs, "openflux_"},
+		{"no explicit: transport URLs ignored", "", "openflux_", specs, "openflux_"},
+		{"no URL anywhere", "", "openflux_", specs[:1], "openflux_"},
+		{"cupsonline rooms never a context", "", "openflux_", []transportSpec{
 			{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"},
 			{Type: "yandex", Priority: 50, URL: "https://docs/doc"},
-		}, "http://#"},
+		}, "openflux_"},
 		{"classic cupsonline client with rooms as --url", "", "WyIxYzE0NGQwZS1lMDQw",
-			[]transportSpec{{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"}}, "http://#"},
+			[]transportSpec{{Type: "cupsonline", Priority: 100, URL: "WyIxYzE0NGQwZS1lMDQw"}}, "openflux_"},
 	}
 	for _, c := range cases {
 		if got, _ := transport.KDFContexts(c.explicit, c.url, contextSources(c.specs)); got != c.want {

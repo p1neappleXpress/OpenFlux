@@ -22,6 +22,7 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
 	"github.com/p1neappleXpress/OpenFlux/transport/script"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandexcbir"
 )
 
 // Options is what differs between the callers; the type, url and params are
@@ -72,6 +73,87 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 		return v
 	}
 	switch typ {
+	case "yandexpic", "yandex-cbir":
+		t := yandexcbir.New(url, o.IsExit)
+		// The cbirIds ride the cups rooms when the operator names them: the
+		// image storage carries the bulk, the rooms carry one short id per
+		// chunk, which is what keeps the data path free of chat limits.
+		// The rooms come from the environment on a node and from the link's
+		// transport url on a phone (apps cannot set environment variables).
+		rooms := os.Getenv("OPENFLUX_POINTER_ROOMS")
+		if rooms == "" && strings.HasPrefix(strings.TrimSpace(url), "eyJ") {
+			rooms = strings.TrimSpace(url)
+		}
+		// A pool in the url means the suggest slots carry the ids; rooms in
+		// the url (or the environment) mean cups does.
+		if pool, err := yandexcbir.ParsePool(strings.TrimSpace(url)); err == nil {
+			sp := newSlotPointers(t, pool, o.IsExit)
+			t.SetPointerChannel(sp)
+			go sp.run()
+			return t, nil
+		}
+		if rooms == "" {
+			// An exit has no room list of its own: the session creates one a
+			// few seconds later, so bind to whatever cups appears. adopt() only
+			// does this when this channel has no cups of its own.
+			pc := newCupsPointers(nil, t)
+			t.SetPointerChannel(pc)
+			go pc.bindLoop()
+			return t, nil
+		}
+		if rooms != "" {
+			// A cups instance of our own: the session's transport is wrapped, so
+			// a tap on it sees nothing. A standalone one joins the same rooms and
+			// carries raw strings both ways.
+			// Same role as the session lane: an exit creates/joins as a server,
+			// a client must join as a client - the server-mode join from a
+			// phone fails with "saved rooms unreachable".
+			// The control channel joins every room the list names: the relay
+			// rate-limits per participant, so more rooms mean more headroom
+			// for the pointer publications.
+			pc := newCupsPointers(nil, t)
+			pc.rooms = strings.TrimSpace(rooms)
+			t.SetPointerChannel(pc)
+			go pc.bindOrOwn(base)
+			return t, nil
+		}
+		if rooms != "" && false {
+			// The cbir transport is usually built before the cups one, so wait
+			// for the session's cups transport to appear and ride that.
+			go func(rooms string, t *yandexcbir.Transport) {
+				deadline := time.Now().Add(90 * time.Second)
+				for time.Now().Before(deadline) {
+					if shared := lookupCups(rooms); shared != nil {
+						pc := newSharedPointers(shared, t)
+						t.SetPointerChannel(pc)
+						pc.runShared()
+						return
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+				if shared := lookupCups(rooms); shared != nil {
+					pc := newSharedPointers(shared, t)
+					t.SetPointerChannel(pc)
+					pc.runShared()
+				}
+			}(rooms, t)
+			return t, nil
+		}
+		if rooms != "" {
+			// Same role as the session lane: an exit creates/joins as a server,
+			// a client must join as a client - the server-mode join from a
+			// phone fails with "saved rooms unreachable".
+			// The control channel joins every room the list names: the relay
+			// rate-limits per participant, so more rooms mean more headroom
+			// for the pointer publications.
+			cups := cupsonline.NewCupsonlineTransport(rooms, base, true)
+			pc := newCupsPointers(cups, t)
+			pc.rooms = strings.TrimSpace(rooms)
+			pc.roomHint = firstRoom(rooms)
+			t.SetPointerChannel(pc)
+			go pc.run()
+		}
+		return t, nil
 	case "", "yandex":
 		return yandex.NewYandexDocsTransport(url, base), nil
 	case "vyandex":
@@ -94,7 +176,9 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	case "cupsonline":
 		// Stripes over its rooms itself when the room list says so (see
 		// transport.PackRooms); an old list keeps the old wire.
-		return cupsonline.NewCupsonlineTransport(url, base, !roleParam(params, "exit", o.IsExit)), nil
+		cups := cupsonline.NewCupsonlineTransport(url, base, !roleParam(params, "exit", o.IsExit))
+		rememberCups(url, cups)
+		return cups, nil
 	case "avito":
 		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !roleParam(params, "exit", o.IsExit)), nil
 	case "oneme":

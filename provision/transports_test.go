@@ -3,6 +3,7 @@ package provision
 import (
 	"encoding/base64"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -69,7 +70,7 @@ func TestSessionContextIsFixed(t *testing.T) {
 		{{Type: "cupsonline", URL: testRooms}},
 		nil,
 	} {
-		if got := SessionContext(ts); got != "http://#" {
+		if got := SessionContext(ts); got != "openflux_" {
 			t.Errorf("SessionContext(%+v) = %q, want the fixed placeholder", ts, got)
 		}
 	}
@@ -85,7 +86,7 @@ func TestShareLinkCarriesTheChosenTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Negotiate || c.Secret != key || c.Context != "http://#" || c.Name != "Нода" {
+	if !c.Negotiate || c.Secret != key || c.Context != "openflux_" || c.Name != "Нода" {
 		t.Fatalf("link: %+v", c)
 	}
 	want := []share.Transport{
@@ -97,7 +98,7 @@ func TestShareLinkCarriesTheChosenTransports(t *testing.T) {
 		t.Fatalf("transports: %+v", c.Transports)
 	}
 	for i := range want {
-		if c.Transports[i] != want[i] {
+		if !reflect.DeepEqual(c.Transports[i], want[i]) {
 			t.Fatalf("transport %d: %+v, want %+v", i, c.Transports[i], want[i])
 		}
 	}
@@ -106,7 +107,7 @@ func TestShareLinkCarriesTheChosenTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c, _ = share.Decode(link); len(c.Transports) != 1 || c.Transports[0].Dial != "[2001:db8::1]:8445" || c.Context != "http://#" {
+	if c, _ = share.Decode(link); len(c.Transports) != 1 || c.Transports[0].Dial != "[2001:db8::1]:8445" || c.Context != "openflux_" {
 		t.Fatalf("direct only: %+v", c)
 	}
 	if _, err := ShareLink("x", key, "", 8445, nil); err == nil {
@@ -171,7 +172,7 @@ func TestCheckTransportsYandexDocsAndBoards(t *testing.T) {
 	}
 	// The context no longer comes from the documents: a board-only channel
 	// uses the fixed placeholder like every other (transport.KDFContexts).
-	if c := SessionContext([]ChannelTransport{{Type: "boards", URL: board}}); c != "http://#" {
+	if c := SessionContext([]ChannelTransport{{Type: "boards", URL: board}}); c != "openflux_" {
 		t.Fatalf("board context %q", c)
 	}
 }

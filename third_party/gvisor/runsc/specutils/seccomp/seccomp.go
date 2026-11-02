@@ -1,0 +1,302 @@
+// Copyright 2020 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package seccomp implements some features of libseccomp in order to support
+// OCI.
+package seccomp
+
+import (
+	"fmt"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	slinux "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
+)
+
+var (
+	killThreadAction = seccomp.KillThread
+	trapAction       = seccomp.Trap
+	// runc always returns EPERM as the errorcode for SECCOMP_RET_ERRNO
+	errnoAction = seccomp.ReturnError.Code(uint16(unix.EPERM))
+	// runc always returns EPERM as the errorcode for SECCOMP_RET_TRACE
+	traceAction = seccomp.Trace.Code(uint16(unix.EPERM))
+	allowAction = seccomp.Allow
+)
+
+// BuildProgram generates a bpf program based on the given OCI seccomp
+// config.
+func BuildProgram(s *specs.LinuxSeccomp) (bpf.Program, error) {
+	defaultAction, err := convertAction(s.DefaultAction)
+	if err != nil {
+		return bpf.Program{}, fmt.Errorf("secomp default action: %w", err)
+	}
+	ruleset, err := convertRules(s)
+	if err != nil {
+		return bpf.Program{}, fmt.Errorf("invalid seccomp rules: %w", err)
+	}
+
+	prog := &seccomp.Program{
+		RuleSets: ruleset,
+		Options: seccomp.ProgramOptions{
+			DefaultAction: defaultAction,
+			BadArchAction: killThreadAction,
+		},
+	}
+	instrs, _, err := prog.Build()
+	if err != nil {
+		return bpf.Program{}, fmt.Errorf("building seccomp program: %w", err)
+	}
+
+	program, err := bpf.Compile(instrs, true /* optimize */)
+	if err != nil {
+		return bpf.Program{}, fmt.Errorf("compiling seccomp program: %w", err)
+	}
+
+	return program, nil
+}
+
+// lookupSyscallNo gets the syscall number for the syscall with the given name
+// for the given architecture.
+func lookupSyscallNo(arch uint32, name string) (uint32, error) {
+	var table *kernel.SyscallTable
+	// LINT.IfChange
+	switch arch {
+	case linux.AUDIT_ARCH_X86_64:
+		table = slinux.AMD64
+	case linux.AUDIT_ARCH_AARCH64:
+		table = slinux.ARM64
+	}
+	// LINT.ThenChange(:KnownArchs)
+	if table == nil {
+		return 0, fmt.Errorf("unsupported architecture: %d", arch)
+	}
+	n, err := table.LookupNo(name)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(n), nil
+}
+
+// convertAction converts a LinuxSeccompAction to BPFAction
+func convertAction(act specs.LinuxSeccompAction) (seccomp.Action, error) {
+	// TODO(gvisor.dev/issue/3124): Update specs package to include ActLog and ActKillProcess.
+	// LINT.IfChange
+	switch act {
+	case specs.ActKill:
+		return killThreadAction, nil
+	case specs.ActTrap:
+		return trapAction, nil
+	case specs.ActErrno:
+		return errnoAction, nil
+	case specs.ActTrace:
+		return traceAction, nil
+	case specs.ActAllow:
+		return allowAction, nil
+	default:
+		return seccomp.Default, fmt.Errorf("invalid action: %v", act)
+	}
+	// LINT.ThenChange(:KnownActions)
+}
+
+// convertRules converts OCI linux seccomp rules into RuleSets that can be used by
+// the seccomp package to build a seccomp program.
+func convertRules(s *specs.LinuxSeccomp) ([]seccomp.RuleSet, error) {
+	// NOTE: Architectures are only really relevant when calling 32bit syscalls
+	// on a 64bit system. Since we don't support that in gVisor anyway, we
+	// ignore Architectures and only test against the native architecture.
+
+	var rulesets []seccomp.RuleSet
+
+	for _, syscall := range s.Syscalls {
+		sysRules := seccomp.NewSyscallRules()
+
+		action, err := convertAction(syscall.Action)
+		if err != nil {
+			return nil, err
+		}
+
+		// Args
+		rule, err := convertArgs(syscall.Args)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, name := range syscall.Names {
+			syscallNo, err := lookupSyscallNo(nativeArchAuditNo, name)
+			if err != nil {
+				// If there is an error looking up the syscall number, assume it is
+				// not supported on this architecture and ignore it. This is, for
+				// better or worse, what runc does.
+				log.Warningf("OCI seccomp: ignoring syscall %q", name)
+				continue
+			}
+
+			sysRules.Add(uintptr(syscallNo), rule)
+		}
+
+		rulesets = append(rulesets, seccomp.RuleSet{
+			Rules:  sysRules,
+			Action: action,
+		})
+	}
+
+	return rulesets, nil
+}
+
+// convertArgs converts an OCI seccomp argument rule to a list of seccomp.Rule.
+func convertArgs(args []specs.LinuxSeccompArg) (seccomp.SyscallRule, error) {
+	argCounts := make([]uint, 6)
+
+	for _, arg := range args {
+		if arg.Index > 6 {
+			return nil, fmt.Errorf("invalid index: %d", arg.Index)
+		}
+
+		argCounts[arg.Index]++
+	}
+
+	// NOTE: If multiple rules apply to the same argument (same index) the
+	// action is triggered if any one of the rules matches (OR). If not, then
+	// all rules much match in order to trigger the action (AND). This appears to
+	// be some kind of legacy behavior of runc that nevertheless needs to be
+	// supported to maintain compatibility.
+
+	hasMultipleArgs := false
+	for _, count := range argCounts {
+		if count > 1 {
+			hasMultipleArgs = true
+			break
+		}
+	}
+
+	if hasMultipleArgs {
+		rules := seccomp.Or{}
+
+		// Old runc behavior - do this for compatibility.
+		// Add rules as ORs by adding separate Rules.
+		for _, arg := range args {
+			rule := seccomp.PerArg{nil, nil, nil, nil, nil, nil}
+
+			if err := convertRule(arg, &rule); err != nil {
+				return nil, err
+			}
+
+			rules = append(rules, rule)
+		}
+
+		return rules, nil
+	}
+
+	// Add rules as ANDs by adding to the same Rule.
+	rule := seccomp.PerArg{nil, nil, nil, nil, nil, nil}
+	for _, arg := range args {
+		if err := convertRule(arg, &rule); err != nil {
+			return nil, err
+		}
+	}
+
+	return rule, nil
+}
+
+// convertRule converts and adds the arg to a PerArg rule.
+func convertRule(arg specs.LinuxSeccompArg, perArg *seccomp.PerArg) error {
+	// LINT.IfChange
+	switch arg.Op {
+	case specs.OpEqualTo:
+		perArg[arg.Index] = seccomp.EqualTo(arg.Value)
+	case specs.OpNotEqual:
+		perArg[arg.Index] = seccomp.NotEqual(arg.Value)
+	case specs.OpGreaterThan:
+		perArg[arg.Index] = seccomp.GreaterThan(arg.Value)
+	case specs.OpGreaterEqual:
+		perArg[arg.Index] = seccomp.GreaterThanOrEqual(arg.Value)
+	case specs.OpLessThan:
+		perArg[arg.Index] = seccomp.LessThan(arg.Value)
+	case specs.OpLessEqual:
+		perArg[arg.Index] = seccomp.LessThanOrEqual(arg.Value)
+	case specs.OpMaskedEqual:
+		perArg[arg.Index] = seccomp.MaskedEqual(uintptr(arg.Value), uintptr(arg.ValueTwo))
+	default:
+		return fmt.Errorf("unsupported operand: %q", arg.Op)
+	}
+	// LINT.ThenChange(:KnownOperators)
+	return nil
+}
+
+// KnownActions returns a list of all supported seccomp actions.
+// Used by `runsc features`.
+func KnownActions() []string {
+	// LINT.IfChange
+	return []string{
+		string(specs.ActKill),
+		string(specs.ActTrap),
+		string(specs.ActErrno),
+		string(specs.ActTrace),
+		string(specs.ActAllow),
+	}
+	// LINT.ThenChange(:convertAction)
+}
+
+// KnownOperators returns a list of all supported seccomp operators.
+// Used by `runsc features`.
+func KnownOperators() []string {
+	// LINT.IfChange
+	return []string{
+		string(specs.OpEqualTo),
+		string(specs.OpNotEqual),
+		string(specs.OpGreaterThan),
+		string(specs.OpGreaterEqual),
+		string(specs.OpLessThan),
+		string(specs.OpLessEqual),
+		string(specs.OpMaskedEqual),
+	}
+	// LINT.ThenChange(:convertRule)
+}
+
+// KnownArchs returns a list of all supported seccomp architectures.
+// Used by `runsc features`.
+func KnownArchs() []string {
+	// LINT.IfChange
+	return []string{
+		string(specs.ArchX86_64),
+		string(specs.ArchAARCH64),
+	}
+	// LINT.ThenChange(:lookupSyscallNo)
+}
+
+// KnownFlags returns a list of all supported seccomp flags.
+// Used by `runsc features`.
+func KnownFlags() []string {
+	// LINT.IfChange
+	return []string{
+		"SECCOMP_FILTER_FLAG_TSYNC",
+	}
+	// LINT.ThenChange(../../../test/syscalls/linux/seccomp.cc)
+}
+
+// SupportedFlags returns a list of all supported seccomp flags.
+// This list may be a subset of one returned by KnownFlags.
+// Used by `runsc features`.
+func SupportedFlags() []string {
+	// LINT.IfChange
+	return []string{
+		"SECCOMP_FILTER_FLAG_TSYNC",
+	}
+	// LINT.ThenChange(../../../test/syscalls/linux/seccomp.cc)
+}

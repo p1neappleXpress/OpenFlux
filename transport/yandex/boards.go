@@ -505,7 +505,7 @@ func (t *BoardsTransport) connectAndServe(info boardsInfo) error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
-		NetDialContext: dialIPv4FirstOn(t.network()),
+		NetDialContext:   dialIPv4FirstOn(t.network()),
 	}
 	utils.Debugf("[BOARDS] dial %s", wsURL)
 	conn, resp, err := dialer.Dial(wsURL, header)

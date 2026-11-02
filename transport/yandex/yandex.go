@@ -337,7 +337,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		// insufficient on iOS).
 		dialer := websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
-			NetDialContext: dialIPv4FirstOn(t.network()),
+			NetDialContext:   dialIPv4FirstOn(t.network()),
 		}
 		// Join the engine.io session by long polling first; strict balancers
 		// refuse a bare websocket (#31). Lenient ones still get a direct dial

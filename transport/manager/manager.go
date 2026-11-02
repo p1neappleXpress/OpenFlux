@@ -60,7 +60,7 @@ type Manager struct {
 	// Callbacks wired from main.go / mobile bridge.
 	dataCallback    func([]byte)
 	controlCallback func(sub control.Subtype, payload []byte)
-	promptNotifier PromptNotifier
+	promptNotifier  PromptNotifier
 	remoteAuth      PromptNotifier
 
 	// authSent rate-limits AuthRequired forwarding per transport.

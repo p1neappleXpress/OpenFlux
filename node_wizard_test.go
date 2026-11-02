@@ -130,7 +130,7 @@ func TestNodeWizardShareLinkAndSignIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Negotiate || c.Secret != key || c.Context != "http://#" || len(c.Transports) != 2 ||
+	if !c.Negotiate || c.Secret != key || c.Context != "openflux_" || len(c.Transports) != 2 ||
 		c.Transports[0].Type != "vyandex" || c.Transports[1].Dial != "203.0.113.5:8445" {
 		t.Fatalf("link config: %+v", c)
 	}
@@ -158,7 +158,7 @@ func TestNodeWizardShareLinkWithChosenTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Context != "http://#" || len(c.Transports) != 3 || c.Transports[0].Type != "mailru" ||
+	if c.Context != "openflux_" || len(c.Transports) != 3 || c.Transports[0].Type != "mailru" ||
 		c.Transports[1].Type != "cupsonline" || c.Transports[2].Dial != "203.0.113.5:8445" {
 		t.Fatalf("link config: %+v", c)
 	}

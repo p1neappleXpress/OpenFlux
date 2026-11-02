@@ -1,0 +1,585 @@
+// Copyright 2019 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package vfs
+
+import (
+	"bytes"
+	goContext "context"
+	"io"
+	"math"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
+)
+
+// The following design pattern is strongly recommended for filesystem
+// implementations to adapt:
+//   - Have a local fileDescription struct (containing FileDescription) which
+//     embeds FileDescriptionDefaultImpl and overrides the default methods
+//     which are common to all fd implementations for that filesystem like
+//     StatusFlags, SetStatusFlags, Stat, SetStat, StatFS, etc.
+//   - This should be embedded in all file description implementations as the
+//     first field by value.
+//   - Directory FDs would also embed DirectoryFileDescriptionDefaultImpl.
+
+// FileDescriptionDefaultImpl may be embedded by implementations of
+// FileDescriptionImpl to obtain implementations of many FileDescriptionImpl
+// methods with default behavior analogous to Linux's.
+//
+// +stateify savable
+type FileDescriptionDefaultImpl struct{}
+
+// OnClose implements FileDescriptionImpl.OnClose analogously to
+// file_operations::flush == NULL in Linux.
+func (FileDescriptionDefaultImpl) OnClose(ctx context.Context) error {
+	return nil
+}
+
+// StatFS implements FileDescriptionImpl.StatFS analogously to
+// super_operations::statfs == NULL in Linux.
+func (FileDescriptionDefaultImpl) StatFS(ctx context.Context) (linux.Statfs, error) {
+	return linux.Statfs{}, linuxerr.ENOSYS
+}
+
+// Allocate implements FileDescriptionImpl.Allocate analogously to
+// fallocate called on an invalid type of file in Linux.
+//
+// Note that directories can rely on this implementation even though they
+// should technically return EISDIR. Allocate should never be called for a
+// directory, because it requires a writable fd.
+func (FileDescriptionDefaultImpl) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	return linuxerr.ENODEV
+}
+
+// Readiness implements waiter.Waitable.Readiness analogously to
+// file_operations::poll == NULL in Linux.
+func (FileDescriptionDefaultImpl) Readiness(mask waiter.EventMask) waiter.EventMask {
+	// include/linux/poll.h:vfs_poll() => DEFAULT_POLLMASK
+	return waiter.ReadableEvents | waiter.WritableEvents
+}
+
+// EventRegister implements waiter.Waitable.EventRegister analogously to
+// file_operations::poll == NULL in Linux.
+func (FileDescriptionDefaultImpl) EventRegister(e *waiter.Entry) error {
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister analogously to
+// file_operations::poll == NULL in Linux.
+func (FileDescriptionDefaultImpl) EventUnregister(e *waiter.Entry) {
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (FileDescriptionDefaultImpl) Epollable() bool {
+	return false
+}
+
+// PRead implements FileDescriptionImpl.PRead analogously to
+// file_operations::read == file_operations::read_iter == NULL in Linux.
+func (FileDescriptionDefaultImpl) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error) {
+	return 0, linuxerr.EINVAL
+}
+
+// Read implements FileDescriptionImpl.Read analogously to
+// file_operations::read == file_operations::read_iter == NULL in Linux.
+func (FileDescriptionDefaultImpl) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error) {
+	return 0, linuxerr.EINVAL
+}
+
+// PWrite implements FileDescriptionImpl.PWrite analogously to
+// file_operations::write == file_operations::write_iter == NULL in Linux.
+func (FileDescriptionDefaultImpl) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error) {
+	return 0, linuxerr.EINVAL
+}
+
+// Write implements FileDescriptionImpl.Write analogously to
+// file_operations::write == file_operations::write_iter == NULL in Linux.
+func (FileDescriptionDefaultImpl) Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error) {
+	return 0, linuxerr.EINVAL
+}
+
+// IterDirents implements FileDescriptionImpl.IterDirents analogously to
+// file_operations::iterate == file_operations::iterate_shared == NULL in
+// Linux.
+func (FileDescriptionDefaultImpl) IterDirents(ctx context.Context, cb IterDirentsCallback) error {
+	return linuxerr.ENOTDIR
+}
+
+// Seek implements FileDescriptionImpl.Seek analogously to
+// file_operations::llseek == NULL in Linux.
+func (FileDescriptionDefaultImpl) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	return 0, linuxerr.ESPIPE
+}
+
+// Sync implements FileDescriptionImpl.Sync analogously to
+// file_operations::fsync == NULL in Linux.
+func (FileDescriptionDefaultImpl) Sync(ctx context.Context) error {
+	return linuxerr.EINVAL
+}
+
+// ConfigureMMap implements FileDescriptionImpl.ConfigureMMap analogously to
+// file_operations::mmap == NULL in Linux.
+func (FileDescriptionDefaultImpl) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
+	return linuxerr.ENODEV
+}
+
+// Ioctl implements FileDescriptionImpl.Ioctl analogously to
+// file_operations::unlocked_ioctl == NULL in Linux.
+func (FileDescriptionDefaultImpl) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	// Return EOPNOTSUPP for reflink ioctls when the filesystem
+	// does not support remap_file_range, matching Linux behavior.
+	switch args[1].Uint() {
+	case linux.FICLONE, linux.FICLONERANGE, linux.FIDEDUPERANGE:
+		return 0, linuxerr.EOPNOTSUPP
+	}
+	return 0, linuxerr.ENOTTY
+}
+
+// ListXattr implements FileDescriptionImpl.ListXattr analogously to
+// inode_operations::listxattr == NULL in Linux.
+func (FileDescriptionDefaultImpl) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	// This isn't exactly accurate; see FileDescription.ListXattr.
+	return nil, linuxerr.ENOTSUP
+}
+
+// GetXattr implements FileDescriptionImpl.GetXattr analogously to
+// inode::i_opflags & IOP_XATTR == 0 in Linux.
+func (FileDescriptionDefaultImpl) GetXattr(ctx context.Context, opts GetXattrOptions) (string, error) {
+	return "", linuxerr.ENOTSUP
+}
+
+// SetXattr implements FileDescriptionImpl.SetXattr analogously to
+// inode::i_opflags & IOP_XATTR == 0 in Linux.
+func (FileDescriptionDefaultImpl) SetXattr(ctx context.Context, opts SetXattrOptions) error {
+	return linuxerr.ENOTSUP
+}
+
+// RemoveXattr implements FileDescriptionImpl.RemoveXattr analogously to
+// inode::i_opflags & IOP_XATTR == 0 in Linux.
+func (FileDescriptionDefaultImpl) RemoveXattr(ctx context.Context, name string) error {
+	return linuxerr.ENOTSUP
+}
+
+// RegisterFileAsyncHandler implements FileDescriptionImpl.RegisterFileAsyncHandler.
+func (FileDescriptionDefaultImpl) RegisterFileAsyncHandler(fd *FileDescription) error {
+	return fd.asyncHandler.Register(fd)
+}
+
+// UnregisterFileAsyncHandler implements FileDescriptionImpl.UnregisterFileAsyncHandler.
+func (FileDescriptionDefaultImpl) UnregisterFileAsyncHandler(fd *FileDescription) {
+	fd.asyncHandler.Unregister(fd)
+}
+
+// DirectoryFileDescriptionDefaultImpl may be embedded by implementations of
+// FileDescriptionImpl that always represent directories to obtain
+// implementations of non-directory I/O methods that return EISDIR.
+//
+// +stateify savable
+type DirectoryFileDescriptionDefaultImpl struct{}
+
+// Allocate implements DirectoryFileDescriptionDefaultImpl.Allocate.
+func (DirectoryFileDescriptionDefaultImpl) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	return linuxerr.EISDIR
+}
+
+// PRead implements FileDescriptionImpl.PRead.
+func (DirectoryFileDescriptionDefaultImpl) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error) {
+	return 0, linuxerr.EISDIR
+}
+
+// Read implements FileDescriptionImpl.Read.
+func (DirectoryFileDescriptionDefaultImpl) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error) {
+	return 0, linuxerr.EISDIR
+}
+
+// PWrite implements FileDescriptionImpl.PWrite.
+func (DirectoryFileDescriptionDefaultImpl) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error) {
+	return 0, linuxerr.EISDIR
+}
+
+// Write implements FileDescriptionImpl.Write.
+func (DirectoryFileDescriptionDefaultImpl) Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error) {
+	return 0, linuxerr.EISDIR
+}
+
+// DentryMetadataFileDescriptionImpl may be embedded by implementations of
+// FileDescriptionImpl for which FileDescriptionOptions.UseDentryMetadata is
+// true to obtain implementations of Stat and SetStat that panic.
+//
+// +stateify savable
+type DentryMetadataFileDescriptionImpl struct{}
+
+// Stat implements FileDescriptionImpl.Stat.
+func (DentryMetadataFileDescriptionImpl) Stat(ctx context.Context, opts StatOptions) (linux.Statx, error) {
+	panic("illegal call to DentryMetadataFileDescriptionImpl.Stat")
+}
+
+// SetStat implements FileDescriptionImpl.SetStat.
+func (DentryMetadataFileDescriptionImpl) SetStat(ctx context.Context, opts SetStatOptions) error {
+	panic("illegal call to DentryMetadataFileDescriptionImpl.SetStat")
+}
+
+// DynamicBytesSource represents a data source for a
+// DynamicBytesFileDescriptionImpl.
+//
+// +stateify savable
+type DynamicBytesSource interface {
+	// Generate writes the file's contents to buf.
+	Generate(ctx context.Context, buf *bytes.Buffer) error
+}
+
+// StaticData implements DynamicBytesSource over a static string.
+//
+// +stateify savable
+type StaticData struct {
+	Data string
+}
+
+// Generate implements DynamicBytesSource.
+func (s *StaticData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	buf.WriteString(s.Data)
+	return nil
+}
+
+// WritableDynamicBytesSource extends DynamicBytesSource to allow writes to the
+// underlying source.
+type WritableDynamicBytesSource interface {
+	DynamicBytesSource
+
+	// Write sends writes to the source.
+	Write(ctx context.Context, fd *FileDescription, src usermem.IOSequence, offset int64) (int64, error)
+}
+
+// DynamicBytesFileDescriptionImpl may be embedded by implementations of
+// FileDescriptionImpl that represent read-only regular files whose contents
+// are backed by a bytes.Buffer that is regenerated when necessary, consistent
+// with Linux's fs/seq_file.c:single_open().
+//
+// If data additionally implements WritableDynamicBytesSource, writes are
+// dispatched to the implementer. The source data is not automatically modified.
+//
+// DynamicBytesFileDescriptionImpl.Init() must be called before first
+// use.
+//
+// +stateify savable
+type DynamicBytesFileDescriptionImpl struct {
+	vfsfd    *FileDescription   // immutable
+	data     DynamicBytesSource // immutable
+	mu       sync.Mutex         `state:"nosave"` // protects the following fields
+	buf      bytes.Buffer       `state:".([]byte)"`
+	off      atomicbitops.Int64
+	lastRead int64 // offset at which the last Read, PRead, or Seek ended
+}
+
+func (fd *DynamicBytesFileDescriptionImpl) saveBuf() []byte {
+	return fd.buf.Bytes()
+}
+
+func (fd *DynamicBytesFileDescriptionImpl) loadBuf(_ goContext.Context, p []byte) {
+	fd.buf.Write(p)
+}
+
+// Init must be called before first use.
+func (fd *DynamicBytesFileDescriptionImpl) Init(vfsfd *FileDescription, data DynamicBytesSource) {
+	fd.vfsfd = vfsfd
+	fd.data = data
+}
+
+// Preconditions: fd.mu must be locked.
+func (fd *DynamicBytesFileDescriptionImpl) preadLocked(ctx context.Context, dst usermem.IOSequence, offset int64, opts *ReadOptions) (int64, error) {
+	// Regenerate the buffer if it's empty, or before pread() at a new offset.
+	// Compare fs/seq_file.c:seq_read() => traverse().
+	switch {
+	case offset != fd.lastRead:
+		fd.buf.Reset()
+		fallthrough
+	case fd.buf.Len() == 0:
+		if err := fd.data.Generate(ctx, &fd.buf); err != nil {
+			fd.buf.Reset()
+			// fd.off is not updated in this case.
+			fd.lastRead = 0
+			return 0, err
+		}
+	}
+	bs := fd.buf.Bytes()
+	if offset >= int64(len(bs)) {
+		return 0, io.EOF
+	}
+	n, err := dst.CopyOut(ctx, bs[offset:])
+	fd.lastRead = offset + int64(n)
+	return int64(n), err
+}
+
+// PRead implements FileDescriptionImpl.PRead.
+func (fd *DynamicBytesFileDescriptionImpl) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error) {
+	fd.mu.Lock()
+	n, err := fd.preadLocked(ctx, dst, offset, &opts)
+	fd.mu.Unlock()
+	return n, err
+}
+
+// Read implements FileDescriptionImpl.Read.
+func (fd *DynamicBytesFileDescriptionImpl) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error) {
+	fd.mu.Lock()
+	n, err := fd.preadLocked(ctx, dst, fd.off.Load(), &opts)
+	fd.off.Add(n)
+	fd.mu.Unlock()
+	return n, err
+}
+
+// Seek implements FileDescriptionImpl.Seek.
+func (fd *DynamicBytesFileDescriptionImpl) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	switch whence {
+	case linux.SEEK_SET:
+		// Use offset as given.
+	case linux.SEEK_CUR:
+		offset += fd.off.Load()
+	default:
+		// fs/seq_file:seq_lseek() rejects SEEK_END etc.
+		return 0, linuxerr.EINVAL
+	}
+	if offset < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	if offset != fd.lastRead {
+		// Regenerate the file's contents immediately. Compare
+		// fs/seq_file.c:seq_lseek() => traverse().
+		fd.buf.Reset()
+		if err := fd.data.Generate(ctx, &fd.buf); err != nil {
+			fd.buf.Reset()
+			fd.off.Store(0)
+			fd.lastRead = 0
+			return 0, err
+		}
+		fd.lastRead = offset
+	}
+	fd.off.Store(offset)
+	return offset, nil
+}
+
+// Preconditions: fd.mu must be locked.
+func (fd *DynamicBytesFileDescriptionImpl) pwriteLocked(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error) {
+	if opts.Flags&^(linux.RWF_HIPRI|linux.RWF_DSYNC|linux.RWF_SYNC) != 0 {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+	limit, err := CheckLimit(ctx, offset, src.NumBytes())
+	if err != nil {
+		return 0, err
+	}
+	src = src.TakeFirst64(limit)
+
+	writable, ok := fd.data.(WritableDynamicBytesSource)
+	if !ok {
+		return 0, linuxerr.EIO
+	}
+	n, err := writable.Write(ctx, fd.vfsfd, src, offset)
+	if err != nil {
+		return 0, err
+	}
+
+	// Invalidate cached data that might exist prior to this call.
+	fd.buf.Reset()
+	return n, nil
+}
+
+// PWrite implements FileDescriptionImpl.PWrite.
+func (fd *DynamicBytesFileDescriptionImpl) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error) {
+	fd.mu.Lock()
+	n, err := fd.pwriteLocked(ctx, src, offset, opts)
+	fd.mu.Unlock()
+	return n, err
+}
+
+// Write implements FileDescriptionImpl.Write.
+func (fd *DynamicBytesFileDescriptionImpl) Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error) {
+	fd.mu.Lock()
+	n, err := fd.pwriteLocked(ctx, src, fd.off.Load(), opts)
+	fd.off.Add(n)
+	fd.mu.Unlock()
+	return n, err
+}
+
+// GenericConfigureMMap may be used by most implementations of
+// FileDescriptionImpl.ConfigureMMap.
+func GenericConfigureMMap(fd *FileDescription, m memmap.Mappable, opts *memmap.MMapOpts) error {
+	if opts.Offset+opts.Length > math.MaxInt64 {
+		return linuxerr.EOVERFLOW
+	}
+	opts.Mappable = m
+	opts.MappingIdentity = fd
+	fd.IncRef()
+	return nil
+}
+
+// GenericProxyDeviceConfigureMMap may be used by most implementations of
+// FileDescriptionImpl.ConfigureMMap for which the underlying memmap.File is a
+// host device file, whose implementation of mmap() may have unusual
+// requirements and so should be called immediately (during application mmap())
+// to propagate any errors.
+func GenericProxyDeviceConfigureMMap(fd *FileDescription, m memmap.Mappable, opts *memmap.MMapOpts) error {
+	if opts.PlatformEffect < memmap.PlatformEffectPopulate {
+		opts.PlatformEffect = memmap.PlatformEffectPopulate
+	}
+	opts.RequirePlatformEffect = true
+	return GenericConfigureMMap(fd, m, opts)
+}
+
+// Offset returns the current offset of the file description.
+func (fd *DynamicBytesFileDescriptionImpl) Offset() int64 {
+	return fd.off.Load()
+}
+
+// LockFD may be used by most implementations of FileDescriptionImpl.Lock*
+// functions. Caller must call Init().
+//
+// +stateify savable
+type LockFD struct {
+	locks *FileLocks
+}
+
+// SupportsLocks implements FileDescriptionImpl.SupportsLocks.
+func (LockFD) SupportsLocks() bool {
+	return true
+}
+
+// Init initializes fd with FileLocks to use.
+func (fd *LockFD) Init(locks *FileLocks) {
+	fd.locks = locks
+}
+
+// Locks returns the locks associated with this file.
+func (fd *LockFD) Locks() *FileLocks {
+	return fd.locks
+}
+
+// LockBSD implements FileDescriptionImpl.LockBSD.
+func (fd *LockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
+	return fd.locks.LockBSD(ctx, uid, ownerPID, t, block)
+}
+
+// UnlockBSD implements FileDescriptionImpl.UnlockBSD.
+func (fd *LockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
+	fd.locks.UnlockBSD(uid)
+	return nil
+}
+
+// LockPOSIX implements FileDescriptionImpl.LockPOSIX.
+func (fd *LockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
+	return fd.locks.LockPOSIX(ctx, uid, ownerPID, t, r, block)
+}
+
+// UnlockPOSIX implements FileDescriptionImpl.UnlockPOSIX.
+func (fd *LockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	return fd.locks.UnlockPOSIX(ctx, uid, r)
+}
+
+// TestPOSIX implements FileDescriptionImpl.TestPOSIX.
+func (fd *LockFD) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	return fd.locks.TestPOSIX(ctx, uid, t, r)
+}
+
+// NoAsyncEventFD implements [Un]RegisterFileAsyncHandler of FileDescriptionImpl.
+type NoAsyncEventFD struct{}
+
+// RegisterFileAsyncHandler implements FileDescriptionImpl.RegisterFileAsyncHandler.
+func (NoAsyncEventFD) RegisterFileAsyncHandler(fd *FileDescription) error {
+	return nil
+}
+
+// UnregisterFileAsyncHandler implements FileDescriptionImpl.UnregisterFileAsyncHandler.
+func (NoAsyncEventFD) UnregisterFileAsyncHandler(fd *FileDescription) {
+}
+
+// NoLockFD implements Lock*/Unlock* portion of FileDescriptionImpl interface
+// returning ENOLCK.
+//
+// +stateify savable
+type NoLockFD struct{}
+
+// SupportsLocks implements FileDescriptionImpl.SupportsLocks.
+func (NoLockFD) SupportsLocks() bool {
+	return false
+}
+
+// LockBSD implements FileDescriptionImpl.LockBSD.
+func (NoLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
+	return linuxerr.ENOLCK
+}
+
+// UnlockBSD implements FileDescriptionImpl.UnlockBSD.
+func (NoLockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
+	return linuxerr.ENOLCK
+}
+
+// LockPOSIX implements FileDescriptionImpl.LockPOSIX.
+func (NoLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
+	return linuxerr.ENOLCK
+}
+
+// UnlockPOSIX implements FileDescriptionImpl.UnlockPOSIX.
+func (NoLockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	return linuxerr.ENOLCK
+}
+
+// TestPOSIX implements FileDescriptionImpl.TestPOSIX.
+func (NoLockFD) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	return linux.Flock{}, linuxerr.ENOLCK
+}
+
+// BadLockFD implements Lock*/Unlock* portion of FileDescriptionImpl interface
+// returning EBADF.
+//
+// +stateify savable
+type BadLockFD struct{}
+
+// SupportsLocks implements FileDescriptionImpl.SupportsLocks.
+func (BadLockFD) SupportsLocks() bool {
+	return false
+}
+
+// LockBSD implements FileDescriptionImpl.LockBSD.
+func (BadLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
+	return linuxerr.EBADF
+}
+
+// UnlockBSD implements FileDescriptionImpl.UnlockBSD.
+func (BadLockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
+	return linuxerr.EBADF
+}
+
+// LockPOSIX implements FileDescriptionImpl.LockPOSIX.
+func (BadLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
+	return linuxerr.EBADF
+}
+
+// UnlockPOSIX implements FileDescriptionImpl.UnlockPOSIX.
+func (BadLockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	return linuxerr.EBADF
+}
+
+// TestPOSIX implements FileDescriptionImpl.TestPOSIX.
+func (BadLockFD) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	return linux.Flock{}, linuxerr.EBADF
+}

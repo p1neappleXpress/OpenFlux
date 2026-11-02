@@ -80,8 +80,8 @@ func TestLiveMailruDump(t *testing.T) {
 
 	authMsg := map[string]interface{}{
 		"type": "auth", "docid": info.DocKey, "documentCallbackUrl": info.CallbackURL,
-		"token": "fghhfgsjdgfjs",
-		"user":  map[string]interface{}{"id": info.EditorUserID, "username": "dump", "indexUser": -1},
+		"token":      "fghhfgsjdgfjs",
+		"user":       map[string]interface{}{"id": info.EditorUserID, "username": "dump", "indexUser": -1},
 		"editorType": 0, "lastOtherSaveTime": -1, "block": []interface{}{},
 		"documentFormatSave": 65, "view": false, "isCloseCoAuthoring": false,
 		"openCmd": map[string]interface{}{

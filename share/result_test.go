@@ -30,7 +30,7 @@ func TestReadCodes(t *testing.T) {
 	big := `{"name":"` + strings.Repeat("x", maxPayload) + `","transports":[{"type":"yandex","url":"u"}]}`
 	for _, tc := range []struct{ name, link, code string }{
 		{"not a link", "https://example.com", CodeNotLink},
-		{"other version", "openflux://v2/abc", CodeUnsupportedVersion},
+		{"other version", "openflux://v9/abc", CodeUnsupportedVersion},
 		{"case changed", strings.ToUpper(good), CodeCaseChanged},
 		{"not base64", Prefix + "!!!", CodeDamaged},
 		{"cut short", good[:len(good)-12], CodeDamaged},
@@ -88,7 +88,7 @@ func TestMakeIsCanonical(t *testing.T) {
 		{Type: "direct", Dial: "203.0.113.7:9443", Priority: 50},
 	}}
 	want := Make(base)
-	if want.Error != "" || want.Config.Context != "http://#" {
+	if want.Error != "" || want.Config.Context != "openflux_" {
 		t.Fatalf("context is not the fixed placeholder: %+v", want)
 	}
 	spelled := base
@@ -109,6 +109,10 @@ func TestMakeIsCanonical(t *testing.T) {
 		t.Errorf("lone carrier: %+v vs %+v", a, b)
 	}
 	back := Read(want.Link)
+	// Encode stamps the body version it wrote; the config handed in has none.
+	if back.Config != nil {
+		back.Config.V = want.Config.V
+	}
 	if !reflect.DeepEqual(back.Config, want.Config) || back.Context != want.Context {
 		t.Errorf("read back %+v, made %+v", back.Config, want.Config)
 	}
@@ -118,9 +122,9 @@ func TestMakeIsCanonical(t *testing.T) {
 		c       Config
 		context string
 	}{
-		{"classic document with a key", Config{Secret: key, Transports: []Transport{{Type: "mailru", URL: "https://cloud.mail.ru/public/x"}}}, "http://#"},
-		{"cups rooms", Config{Secret: key, Transports: []Transport{{Type: "cupsonline", URL: "WyJhIl0"}}}, "http://#"},
-		{"direct only", Config{Negotiate: true, Secret: key, Transports: []Transport{{Type: "direct", Dial: "203.0.113.7:1"}}}, "http://#"},
+		{"classic document with a key", Config{Secret: key, Transports: []Transport{{Type: "mailru", URL: "https://cloud.mail.ru/public/x"}}}, "openflux_"},
+		{"cups rooms", Config{Secret: key, Transports: []Transport{{Type: "cupsonline", URL: "WyJhIl0"}}}, "openflux_"},
+		{"direct only", Config{Negotiate: true, Secret: key, Transports: []Transport{{Type: "direct", Dial: "203.0.113.7:1"}}}, "openflux_"},
 		{"explicit kept", Config{Negotiate: true, Secret: key, Context: "https://x/y", Transports: []Transport{{Type: "yandex", URL: "https://z"}}}, "https://x/y"},
 		{"no key, no context", Config{Context: "https://x/y", Transports: []Transport{{Type: "yandex", URL: "https://z"}}}, ""},
 	} {

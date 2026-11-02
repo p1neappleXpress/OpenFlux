@@ -26,12 +26,12 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(link, Prefix) {
-		t.Fatalf("link %q lacks %q", link, Prefix)
+	if !strings.HasPrefix(link, PrefixV2) {
+		t.Fatalf("link %q lacks %q", link, PrefixV2)
 	}
 	// Scannable into a URL field or a messenger: no characters that need
 	// escaping.
-	for _, r := range strings.TrimPrefix(link, Prefix) {
+	for _, r := range linkBody(link) {
 		if !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", r) {
 			t.Fatalf("link contains %q", r)
 		}
@@ -42,13 +42,45 @@ func TestRoundTrip(t *testing.T) {
 	}
 	want := sample()
 	if got.Name != want.Name || got.Secret != want.Secret || got.Context != want.Context ||
-		!got.Negotiate || len(got.Transports) != 2 || got.Transports[0] != want.Transports[0] ||
-		got.Transports[1] != want.Transports[1] {
+		!got.Negotiate || len(got.Transports) != 2 || !sameTransport(got.Transports[0], want.Transports[0]) ||
+		!sameTransport(got.Transports[1], want.Transports[1]) {
 		t.Fatalf("round trip changed the config: %+v", got)
 	}
 }
 
 // A Telemost exit without a key shares its conference as a classic link.
+// sameTransport compares two transports field by field: Params made the struct
+// hold a map, so it is no longer comparable with ==.
+// linkPrefix and linkBody split a link of either version, so a test that
+// mangles a link works on the version the core actually writes.
+func linkPrefix(link string) string {
+	if strings.HasPrefix(link, PrefixV2) {
+		return PrefixV2
+	}
+	return Prefix
+}
+
+func linkBody(link string) string { return strings.TrimPrefix(link, linkPrefix(link)) }
+
+func sameTransport(a, b Transport) bool {
+	if a.Type != b.Type || a.Name != b.Name || a.URL != b.URL || a.Priority != b.Priority ||
+		a.Dial != b.Dial || a.Role != b.Role || (a.Enabled == nil) != (b.Enabled == nil) {
+		return false
+	}
+	if a.Enabled != nil && *a.Enabled != *b.Enabled {
+		return false
+	}
+	if len(a.Params) != len(b.Params) {
+		return false
+	}
+	for k, v := range a.Params {
+		if b.Params[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 func TestTelemostLink(t *testing.T) {
 	c := Config{Name: "Телемост", Transports: []Transport{{Type: "telemost", URL: "https://telemost.yandex.ru/j/88936358186517"}}}
 	link, err := Encode(c)
@@ -59,7 +91,7 @@ func TestTelemostLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Negotiate || got.Secret != "" || len(got.Transports) != 1 || got.Transports[0] != c.Transports[0] {
+	if got.Negotiate || got.Secret != "" || len(got.Transports) != 1 || !sameTransport(got.Transports[0], c.Transports[0]) {
 		t.Fatalf("round trip changed the config: %+v", got)
 	}
 }
@@ -141,21 +173,21 @@ func TestDecodeTolerant(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(strings.TrimPrefix(l, Prefix))%4 != 0 {
+		if len(linkBody(l))%4 != 0 {
 			link = l
 			break
 		}
 		c.Name += "x"
 	}
-	body := strings.TrimPrefix(link, Prefix)
+	body := linkBody(link)
 	raw, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	variants := map[string]string{
-		"padded":       Prefix + base64.URLEncoding.EncodeToString(raw),
+		"padded":       linkPrefix(link) + base64.URLEncoding.EncodeToString(raw),
 		"wrapped":      link[:40] + "\n" + link[40:80] + "\r\n  " + link[80:],
-		"std alphabet": Prefix + base64.RawStdEncoding.EncodeToString(raw),
+		"std alphabet": linkPrefix(link) + base64.RawStdEncoding.EncodeToString(raw),
 		"nbsp":         link[:50] + " " + link[50:],
 	}
 	for name, v := range variants {
@@ -182,5 +214,30 @@ func TestSecretCountedInCharacters(t *testing.T) {
 	c.Secret = "ключключключключ"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("16 Cyrillic letters: %v", err)
+	}
+}
+
+// The context is the exit's --url and the KDF hashes it, so it must come back
+// byte for byte: no trimming, no Unicode normalisation, no case folding.
+func TestContextSurvivesUnchanged(t *testing.T) {
+	for _, ctx := range []string{
+		"https://docs.yandex.ru/edit/d/AbC?x=1&y=2",
+		"  spaced at both ends  ",
+		"Кириллица и emoji 🙂",
+		"a+b/c=d&e",
+	} {
+		c := Config{Name: "n", Secret: strings.Repeat("s", 32), Context: ctx,
+			Transports: []Transport{{Type: "mailru", URL: "https://cloud.mail.ru/public/x", Priority: 100}}}
+		link, err := Encode(c)
+		if err != nil {
+			t.Fatalf("%q: %v", ctx, err)
+		}
+		got, err := Decode(link)
+		if err != nil {
+			t.Fatalf("%q: %v", ctx, err)
+		}
+		if got.Context != ctx {
+			t.Fatalf("context changed: %q -> %q (KDF would diverge)", ctx, got.Context)
+		}
 	}
 }

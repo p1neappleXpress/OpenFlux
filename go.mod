@@ -54,3 +54,5 @@ require (
 
 // A one-change copy of pion/sctp (third_party/sctp/OPENFLUX_PATCH.md): the MTU of a data channel's packets can be set.
 replace github.com/pion/sctp => ./third_party/sctp
+
+replace gvisor.dev/gvisor => ./third_party/gvisor

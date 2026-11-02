@@ -95,8 +95,8 @@ func openChatPeer(t *testing.T, wl, username string) *chatPeer {
 	}
 	auth := map[string]interface{}{
 		"type": "auth", "docid": info.DocKey, "documentCallbackUrl": info.CallbackURL,
-		"token": "fghhfgsjdgfjs",
-		"user":  map[string]interface{}{"id": info.EditorUserID, "username": username, "indexUser": -1},
+		"token":      "fghhfgsjdgfjs",
+		"user":       map[string]interface{}{"id": info.EditorUserID, "username": username, "indexUser": -1},
 		"editorType": 0, "lastOtherSaveTime": -1, "block": []interface{}{},
 		"documentFormatSave": 65, "view": false, "isCloseCoAuthoring": false,
 		"openCmd": map[string]interface{}{

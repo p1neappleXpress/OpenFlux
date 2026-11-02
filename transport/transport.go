@@ -2,6 +2,8 @@ package transport
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -140,11 +142,12 @@ func DefaultConfig() TransportConfig {
 }
 
 type BaseTransport struct {
-	config    TransportConfig
-	running   atomic.Int32
-	connected atomic.Int32
-	stats     TransportStats
-	startTime time.Time
+	receiveTaps []func([]byte)
+	config      TransportConfig
+	running     atomic.Int32
+	connected   atomic.Int32
+	stats       TransportStats
+	startTime   time.Time
 
 	receiveCallback func([]byte)
 	Mu              sync.RWMutex
@@ -218,12 +221,40 @@ func (b *BaseTransport) Receive(callback func([]byte)) {
 }
 
 func (b *BaseTransport) CallReceive(data []byte) {
+	if os.Getenv("OPENFLUX_CUPS_FRAMES") != "" && len(data) > 0 {
+		n := len(data)
+		if n > 24 {
+			n = 24
+		}
+		log.Printf("[CUPS] payload in len=%d head=%q", len(data), string(data[:n]))
+	}
 	b.Mu.RLock()
 	cb := b.receiveCallback
+	taps := make([]func([]byte), len(b.receiveTaps))
+	copy(taps, b.receiveTaps)
 	b.Mu.RUnlock()
+	// Taps see every packet before the session does: another transport may ride
+	// this carrier's connection for its own small channel (the cbir pointers
+	// travel over the cups lane), and it must not steal the session's callback.
+	for _, tap := range taps {
+		tap(data)
+	}
 	if cb != nil {
 		cb(data)
 	}
+}
+
+// AddReceiveTap installs a side observer of every received packet. It does
+// not replace the session's callback.
+func (b *BaseTransport) AddReceiveTap(tap func([]byte)) {
+	b.Mu.Lock()
+	b.receiveTaps = append(b.receiveTaps, tap)
+	b.Mu.Unlock()
+}
+
+// TapTransport is a carrier another one can hang its own channel on.
+type TapTransport interface {
+	AddReceiveTap(func([]byte))
 }
 
 func (b *BaseTransport) GetSession(accessor func(interface{})) {
