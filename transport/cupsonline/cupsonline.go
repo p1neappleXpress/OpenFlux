@@ -1717,7 +1717,34 @@ func (t *CupsonlineTransport) Stop() error {
 // order; a whole frame always stays within one room (reassembly is per-room),
 // and TCP above puts the rest back in order. A frame is never split across
 // rooms.
+// cupsSendGate paces publications: the relay answers 429 when a participant
+// sends faster than its per-IP budget, and a single refused handshake frame
+// costs the whole session. OPENFLUX_CUPS_RATE_MS sets the minimum spacing.
+var cupsSendGate struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func cupsWaitTurn() {
+	ms := 0
+	if v := os.Getenv("OPENFLUX_CUPS_RATE_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ms = n
+		}
+	}
+	if ms <= 0 {
+		return
+	}
+	cupsSendGate.mu.Lock()
+	defer cupsSendGate.mu.Unlock()
+	if d := time.Duration(ms)*time.Millisecond - time.Since(cupsSendGate.last); d > 0 {
+		time.Sleep(d)
+	}
+	cupsSendGate.last = time.Now()
+}
+
 func (t *CupsonlineTransport) Send(data []byte) error {
+	cupsWaitTurn()
 	if len(data) > t.config.MaxPayloadBytes {
 		return fmt.Errorf("cups: посылка %d байт больше предела %d", len(data), t.config.MaxPayloadBytes)
 	}
@@ -1735,6 +1762,7 @@ func (t *CupsonlineTransport) Send(data []byte) error {
 // The pointer channel needs this: through the stripe a short id is wrapped as
 // data and the peer's tap never sees it as an announcement.
 func (t *CupsonlineTransport) SendRaw(data []byte) error {
+	cupsWaitTurn()
 	if len(data) > t.config.MaxPayloadBytes {
 		return fmt.Errorf("cups: посылка %d байт больше предела %d", len(data), t.config.MaxPayloadBytes)
 	}

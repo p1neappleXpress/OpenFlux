@@ -19,6 +19,7 @@ import (
 	"github.com/p1neappleXpress/OpenFlux/transport/avito"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/mailru"
+	"github.com/p1neappleXpress/OpenFlux/transport/mtslink"
 	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
 	"github.com/p1neappleXpress/OpenFlux/transport/script"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
@@ -111,10 +112,14 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 			// The control channel joins every room the list names: the relay
 			// rate-limits per participant, so more rooms mean more headroom
 			// for the pointer publications.
-			pc := newCupsPointers(nil, t)
+			// A standalone instance of our own: the session lane wraps
+			// everything it carries, so a tap on it hears nothing and the
+			// exit ends up mute (measured: pub=0, recv=0).
+			cups := cupsonline.NewCupsonlineTransport(rooms, base, true)
+			pc := newCupsPointers(cups, t)
 			pc.rooms = strings.TrimSpace(rooms)
 			t.SetPointerChannel(pc)
-			go pc.bindOrOwn(base)
+			go pc.run()
 			return t, nil
 		}
 		if rooms != "" && false {
@@ -179,6 +184,10 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 		cups := cupsonline.NewCupsonlineTransport(url, base, !roleParam(params, "exit", o.IsExit))
 		rememberCups(url, cups)
 		return cups, nil
+	case "mtslink":
+		// A conference call carries the tunnel: the peer joins the meeting as
+		// a guest and the data rides a WebRTC data channel.
+		return mtslink.NewMTSLinkWebRTCTransport(url, base), nil
 	case "avito":
 		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !roleParam(params, "exit", o.IsExit)), nil
 	case "oneme":

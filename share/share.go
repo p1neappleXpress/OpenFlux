@@ -148,7 +148,7 @@ var knownTypes = map[string]bool{
 	"cupsonline": true, "avito": true, "direct": true, "telemost": true,
 	// yandex-cbir: the app ships it as a JS transport; the core names it so a
 	// link can carry it (the carrier itself is the scripted one).
-	"yandex-cbir": true,
+	"yandex-cbir": true, "yandexpic": true,
 }
 
 // jsTypes are the JS transports the app knows, named by
